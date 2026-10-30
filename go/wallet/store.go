@@ -148,7 +148,7 @@ func (s *Store) UnlockPIN(pin string) ([]byte, error) {
 		return nil, err
 	}
 	key := deriveKey(pin, salt, params)
-	plain, err := open(key, nonce, ciphertext)
+	plain, err := open(key, nonce, ciphertext, nil)
 	if err != nil || string(plain) != canary {
 		return nil, errors.New("wrong pin")
 	}

@@ -258,6 +258,124 @@ void KikoApi::deliverSend(int wallet, const QString &message)
     emit sendFinished(wallet, message);
 }
 
+QString KikoApi::profileBrand()
+{
+    return takeKikoString(KIKO_profile_brand());
+}
+
+QString KikoApi::profileModel()
+{
+    return takeKikoString(KIKO_profile_model());
+}
+
+QString KikoApi::profileColor()
+{
+    return takeKikoString(KIKO_profile_color());
+}
+
+QString KikoApi::profilePlate()
+{
+    return takeKikoString(KIKO_profile_plate());
+}
+
+QString KikoApi::profileYear()
+{
+    return takeKikoString(KIKO_profile_year());
+}
+
+int KikoApi::profileSaveCar(const QString &brand, const QString &model, const QString &color, const QString &plate, const QString &year)
+{
+    QByteArray brandUtf8 = utf8(brand);
+    QByteArray modelUtf8 = utf8(model);
+    QByteArray colorUtf8 = utf8(color);
+    QByteArray plateUtf8 = utf8(plate);
+    QByteArray yearUtf8 = utf8(year);
+    return KIKO_profile_save_car(brandUtf8.data(), modelUtf8.data(), colorUtf8.data(), plateUtf8.data(), yearUtf8.data());
+}
+
+int KikoApi::serverCount()
+{
+    return KIKO_server_count();
+}
+
+QString KikoApi::serverHost(int index)
+{
+    return takeKikoString(KIKO_server_host(index));
+}
+
+int KikoApi::serverCompatible(int index)
+{
+    return KIKO_server_compatible(index);
+}
+
+QString KikoApi::serverWalletName(int index)
+{
+    return takeKikoString(KIKO_server_wallet_name(index));
+}
+
+int KikoApi::serverAdd(const QString &host)
+{
+    QByteArray hostUtf8 = utf8(host);
+    return KIKO_server_add(hostUtf8.data());
+}
+
+int KikoApi::serverUpdate(int index, const QString &host)
+{
+    QByteArray hostUtf8 = utf8(host);
+    return KIKO_server_update(index, hostUtf8.data());
+}
+
+int KikoApi::serverDelete(int index)
+{
+    return KIKO_server_delete(index);
+}
+
+int KikoApi::serverCoin(int index)
+{
+    return KIKO_server_coin(index);
+}
+
+QString KikoApi::serverFeeBase(int index)
+{
+    return takeKikoString(KIKO_server_fee_base(index));
+}
+
+QString KikoApi::serverFeePerKm(int index)
+{
+    return takeKikoString(KIKO_server_fee_per_km(index));
+}
+
+int KikoApi::serverSaveFees(int index, const QString &base, const QString &perKm, const QString &unit)
+{
+    QByteArray baseUtf8 = utf8(base);
+    QByteArray perUtf8 = utf8(perKm);
+    QByteArray unitUtf8 = utf8(unit);
+    return KIKO_server_save_fees(index, baseUtf8.data(), perUtf8.data(), unitUtf8.data());
+}
+
+void KikoApi::applyFeesEur(const QString &base, const QString &perKm)
+{
+    QPointer<KikoApi> self(this);
+    QByteArray baseUtf8 = utf8(base);
+    QByteArray perUtf8 = utf8(perKm);
+    QtConcurrent::run([self, baseUtf8, perUtf8]() mutable {
+        const QMutexLocker lock(&requestGate);
+        const int rc = KIKO_apply_fees_eur(baseUtf8.data(), perUtf8.data());
+        QString message;
+        if (rc != 0)
+            message = takeKikoString(KIKO_last_error());
+        if (!self)
+            return;
+        QMetaObject::invokeMethod(self.data(), "deliverFees", Qt::QueuedConnection,
+                                  Q_ARG(QString, message));
+    });
+}
+
+void KikoApi::deliverFees(const QString &message)
+{
+    emit feesApplied(message);
+}
+
 QString KikoApi::lastError()
 {
     return takeKikoString(KIKO_last_error());

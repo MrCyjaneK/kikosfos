@@ -11,6 +11,14 @@ Page {
                 text: "Wallets"
                 onClicked: pageStack.push(Qt.resolvedUrl("WalletsPage.qml"))
             }
+            MenuItem {
+                text: "Servers"
+                onClicked: pageStack.push(Qt.resolvedUrl("ServersPage.qml"))
+            }
+            MenuItem {
+                text: "Profile"
+                onClicked: pageStack.push(Qt.resolvedUrl("ProfilePage.qml"))
+            }
         }
 
         Column {
@@ -22,7 +30,7 @@ Page {
             Label {
                 width: parent.width
                 horizontalAlignment: Text.AlignHCenter
-                text: "Pull down for wallets"
+                text: "Pull down for wallets, servers, and profile"
                 color: Theme.secondaryColor
             }
         }

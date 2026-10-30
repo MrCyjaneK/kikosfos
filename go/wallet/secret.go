@@ -10,12 +10,13 @@ import (
 )
 
 const (
-	seedMagic = "KSED"
-	pinMagic  = "KPIN"
-	canary    = "kiko-pin-ok"
+	seedMagic    = "KSED"
+	pinMagic     = "KPIN"
+	profileMagic = "KPRF"
+	canary       = "kiko-pin-ok"
 )
 
-func seal(key, plaintext []byte) (nonce, ciphertext []byte, err error) {
+func seal(key, plaintext, additional []byte) (nonce, ciphertext []byte, err error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, nil, err
@@ -28,10 +29,10 @@ func seal(key, plaintext []byte) (nonce, ciphertext []byte, err error) {
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, nil, err
 	}
-	return nonce, gcm.Seal(nil, nonce, plaintext, nil), nil
+	return nonce, gcm.Seal(nil, nonce, plaintext, additional), nil
 }
 
-func open(key, nonce, ciphertext []byte) ([]byte, error) {
+func open(key, nonce, ciphertext, additional []byte) ([]byte, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
@@ -40,7 +41,7 @@ func open(key, nonce, ciphertext []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	plain, err := gcm.Open(nil, nonce, ciphertext, nil)
+	plain, err := gcm.Open(nil, nonce, ciphertext, additional)
 	if err != nil {
 		return nil, err
 	}
@@ -48,7 +49,7 @@ func open(key, nonce, ciphertext []byte) ([]byte, error) {
 }
 
 func encodeSeed(key []byte, mnemonic string) ([]byte, error) {
-	nonce, ciphertext, err := seal(key, []byte(mnemonic))
+	nonce, ciphertext, err := seal(key, []byte(mnemonic), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -65,18 +66,48 @@ func decodeSeed(key, blob []byte) (string, error) {
 		return "", errors.New("seed file is corrupt")
 	}
 	nonce := blob[5:17]
-	plain, err := open(key, nonce, blob[17:])
+	plain, err := open(key, nonce, blob[17:], nil)
 	if err != nil {
 		return "", errors.New("could not decrypt seed")
 	}
 	return string(plain), nil
 }
 
+func profileHeader() []byte {
+	return append([]byte(profileMagic), 1)
+}
+
+func encodeProfile(key, plaintext []byte) ([]byte, error) {
+	header := profileHeader()
+	nonce, ciphertext, err := seal(key, plaintext, header)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, len(header)+len(nonce)+len(ciphertext))
+	out = append(out, header...)
+	out = append(out, nonce...)
+	out = append(out, ciphertext...)
+	return out, nil
+}
+
+func decodeProfile(key, blob []byte) ([]byte, error) {
+	header := profileHeader()
+	if len(blob) < len(header)+12+16 || string(blob[:4]) != profileMagic {
+		return nil, errors.New("profile is corrupt")
+	}
+	nonce := blob[5:17]
+	plain, err := open(key, nonce, blob[17:], blob[:len(header)])
+	if err != nil {
+		return nil, errors.New("could not decrypt profile")
+	}
+	return plain, nil
+}
+
 func encodePIN(p KDFParams, salt, key []byte) ([]byte, error) {
 	if len(salt) != 16 {
 		return nil, errors.New("pin salt must be 16 bytes")
 	}
-	nonce, ciphertext, err := seal(key, []byte(canary))
+	nonce, ciphertext, err := seal(key, []byte(canary), nil)
 	if err != nil {
 		return nil, err
 	}

@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	Name = "Cardano"
-	ID   = "cardano"
+	Name   = "Cardano"
+	ID     = "cardano"
+	Ticker = "ADA"
 )
 
 type Account struct {

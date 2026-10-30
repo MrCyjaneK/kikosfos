@@ -2,18 +2,28 @@ package cardano
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"math/big"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
-// Euro price of one ADA. Cached much longer than the balance.
-var eurRateEndpoint = "https://prices.cakewallet.com/v3/rates?base=crypto.ADA&quote=fiat.EUR"
+// eurRateEndpoint overrides the Cakewallet URL. Empty builds it from Ticker.
+// Tests point it at a local server.
+var eurRateEndpoint string
+
+func eurRateURL() string {
+	if eurRateEndpoint != "" {
+		return eurRateEndpoint
+	}
+	return "https://prices.cakewallet.com/v3/rates?base=crypto." + Ticker + "&quote=fiat.EUR"
+}
 
 const eurRateCacheTTL = 15 * time.Minute
 
@@ -80,7 +90,7 @@ func eurPerADA() (*big.Rat, error) {
 }
 
 func fetchEurPerADA() (*big.Rat, error) {
-	req, err := http.NewRequest(http.MethodGet, eurRateEndpoint, nil)
+	req, err := http.NewRequest(http.MethodGet, eurRateURL(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("cardano: euro price: %w", err)
 	}
@@ -140,4 +150,61 @@ func formatEUR(lovelace string, price *big.Rat) (string, error) {
 		return "< €0.01", nil
 	}
 	return fmt.Sprintf("€%d.%02d", rounded/100, rounded%100), nil
+}
+
+// AmountFromEUR converts a euro amount into lovelace using the ADA price.
+// One euro buys 1/price ADA, and one ADA is 1_000_000 lovelace, rounded
+// to the nearest lovelace.
+func AmountFromEUR(text string) (string, error) {
+	euros, err := parseEUR(text)
+	if err != nil {
+		return "", err
+	}
+	price, err := eurPerADA()
+	if err != nil {
+		return "", err
+	}
+	return lovelaceFromEUR(euros, price)
+}
+
+func parseEUR(text string) (*big.Rat, error) {
+	text = strings.TrimSpace(text)
+	text = strings.TrimPrefix(text, "€")
+	text = strings.TrimSpace(text)
+	text = strings.ReplaceAll(text, " ", "")
+	if text == "" {
+		return nil, errors.New("cardano: amount: enter a euro amount")
+	}
+	if strings.Contains(text, ",") {
+		if strings.Contains(text, ".") {
+			return nil, errors.New("cardano: amount: enter a euro amount")
+		}
+		text = strings.ReplaceAll(text, ",", ".")
+	}
+	if strings.HasPrefix(text, "-") || strings.Count(text, ".") > 1 {
+		return nil, errors.New("cardano: amount: enter a euro amount")
+	}
+	n := new(big.Rat)
+	if _, ok := n.SetString(text); !ok || n.Sign() < 0 {
+		return nil, errors.New("cardano: amount: enter a euro amount")
+	}
+	return n, nil
+}
+
+func lovelaceFromEUR(euros, price *big.Rat) (string, error) {
+	if price.Sign() <= 0 {
+		return "", errors.New("cardano: euro price: bad rate")
+	}
+	n := new(big.Rat).Quo(new(big.Rat).Set(euros), price)
+	n.Mul(n, big.NewRat(1_000_000, 1))
+	// Half away from zero: floor((2*num + den) / (2*den)) for a positive ratio.
+	num := new(big.Int).Mul(n.Num(), big.NewInt(2))
+	den := new(big.Int).Set(n.Denom())
+	num.Add(num, den)
+	den.Mul(den, big.NewInt(2))
+	rounded := new(big.Int).Quo(num, den)
+	if rounded.Sign() < 0 || !rounded.IsUint64() {
+		return "", errors.New("cardano: amount: too large")
+	}
+	return rounded.String(), nil
 }

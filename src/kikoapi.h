@@ -36,6 +36,24 @@ public:
     Q_INVOKABLE QString walletQuote(int wallet, const QString &amount, const QString &unit);
     Q_INVOKABLE void walletWarmEuro(int wallet);
     Q_INVOKABLE void walletSend(int wallet, const QString &to, const QString &amount);
+    Q_INVOKABLE QString profileBrand();
+    Q_INVOKABLE QString profileModel();
+    Q_INVOKABLE QString profileColor();
+    Q_INVOKABLE QString profilePlate();
+    Q_INVOKABLE QString profileYear();
+    Q_INVOKABLE int profileSaveCar(const QString &brand, const QString &model, const QString &color, const QString &plate, const QString &year);
+    Q_INVOKABLE int serverCount();
+    Q_INVOKABLE QString serverHost(int index);
+    Q_INVOKABLE int serverCompatible(int index);
+    Q_INVOKABLE QString serverWalletName(int index);
+    Q_INVOKABLE int serverAdd(const QString &host);
+    Q_INVOKABLE int serverUpdate(int index, const QString &host);
+    Q_INVOKABLE int serverDelete(int index);
+    Q_INVOKABLE int serverCoin(int index);
+    Q_INVOKABLE QString serverFeeBase(int index);
+    Q_INVOKABLE QString serverFeePerKm(int index);
+    Q_INVOKABLE int serverSaveFees(int index, const QString &base, const QString &perKm, const QString &unit);
+    Q_INVOKABLE void applyFeesEur(const QString &base, const QString &perKm);
     Q_INVOKABLE QString lastError();
 
 signals:
@@ -45,6 +63,7 @@ signals:
     void activityReady(int wallet, const QString &message);
     void euroReady(int wallet);
     void sendFinished(int wallet, const QString &message);
+    void feesApplied(const QString &message);
 
 private slots:
     void deliverPin(int rc, const QString &message);
@@ -52,6 +71,7 @@ private slots:
     void deliverActivity(int wallet, const QString &message);
     void deliverEuro(int wallet);
     void deliverSend(int wallet, const QString &message);
+    void deliverFees(const QString &message);
 
 private:
     void runPin(const QByteArray &pin, const QByteArray &again, bool setup);

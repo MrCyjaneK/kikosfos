@@ -35,6 +35,9 @@ type Activity struct {
 type Coin interface {
 	ID() string
 	Name() string
+	// Ticker is the price symbol, such as ADA.
+	// A server's currency matches ID, not Ticker.
+	Ticker() string
 	IconPNG() []byte
 	Create() (Public, string, error)
 	Restore(mnemonic string) (Public, error)
@@ -55,6 +58,9 @@ type Coin interface {
 	Quote(amount, unit string) (ada, lovelace, eur string, err error)
 	// WarmEuro fetches the euro price so a later Quote can show it.
 	WarmEuro() error
+	// AmountFromEUR converts a euro amount into this coin's smallest unit.
+	// It uses the network when the price is not cached.
+	AmountFromEUR(eur string) (string, error)
 	// Send pays amount lovelace to a payment address and broadcasts it.
 	Send(mnemonic, to, amount string) error
 }
@@ -64,6 +70,8 @@ type cardanoCoin struct{}
 func (cardanoCoin) ID() string { return cardano.ID }
 
 func (cardanoCoin) Name() string { return cardano.Name }
+
+func (cardanoCoin) Ticker() string { return cardano.Ticker }
 
 func (cardanoCoin) IconPNG() []byte { return cardano.IconPNG() }
 
@@ -129,6 +137,10 @@ func (cardanoCoin) WarmEuro() error {
 	return err
 }
 
+func (cardanoCoin) AmountFromEUR(eur string) (string, error) {
+	return cardano.AmountFromEUR(eur)
+}
+
 func (cardanoCoin) Send(mnemonic, to, amount string) error {
 	return cardano.Send(mnemonic, to, amount)
 }
@@ -147,4 +159,13 @@ func coinAt(index int) (Coin, error) {
 		return nil, fmt.Errorf("unknown wallet %d", index)
 	}
 	return registry[index], nil
+}
+
+func coinByID(id string) (int, Coin, bool) {
+	for i, c := range registry {
+		if c.ID() == id {
+			return i, c, true
+		}
+	}
+	return 0, nil, false
 }

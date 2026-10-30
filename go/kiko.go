@@ -351,4 +351,187 @@ func KIKO_wallet_send(index C.int, to, amount *C.char) C.int {
 	return 0
 }
 
+//export KIKO_profile_brand
+func KIKO_profile_brand() *C.char {
+	text, err := wallet.ProfileBrand()
+	setErr(err)
+	if err != nil {
+		return nil
+	}
+	return cString(text)
+}
+
+//export KIKO_profile_model
+func KIKO_profile_model() *C.char {
+	text, err := wallet.ProfileModel()
+	setErr(err)
+	if err != nil {
+		return nil
+	}
+	return cString(text)
+}
+
+//export KIKO_profile_color
+func KIKO_profile_color() *C.char {
+	text, err := wallet.ProfileColor()
+	setErr(err)
+	if err != nil {
+		return nil
+	}
+	return cString(text)
+}
+
+//export KIKO_profile_plate
+func KIKO_profile_plate() *C.char {
+	text, err := wallet.ProfilePlate()
+	setErr(err)
+	if err != nil {
+		return nil
+	}
+	return cString(text)
+}
+
+//export KIKO_profile_year
+func KIKO_profile_year() *C.char {
+	text, err := wallet.ProfileYear()
+	setErr(err)
+	if err != nil {
+		return nil
+	}
+	return cString(text)
+}
+
+//export KIKO_profile_save_car
+func KIKO_profile_save_car(brand, model, color, plate, year *C.char) C.int {
+	err := wallet.SaveCar(C.GoString(brand), C.GoString(model), C.GoString(color), C.GoString(plate), C.GoString(year))
+	setErr(err)
+	if err != nil {
+		return -1
+	}
+	return 0
+}
+
+//export KIKO_server_count
+func KIKO_server_count() C.int {
+	n, err := wallet.ServerCount()
+	setErr(err)
+	if err != nil {
+		return -1
+	}
+	return C.int(n)
+}
+
+//export KIKO_server_host
+func KIKO_server_host(index C.int) *C.char {
+	text, err := wallet.ServerHost(int(index))
+	setErr(err)
+	if err != nil {
+		return nil
+	}
+	return cString(text)
+}
+
+//export KIKO_server_compatible
+func KIKO_server_compatible(index C.int) C.int {
+	ok, err := wallet.ServerCompatible(int(index))
+	setErr(err)
+	if err != nil {
+		return -1
+	}
+	if ok {
+		return 1
+	}
+	return 0
+}
+
+//export KIKO_server_wallet_name
+func KIKO_server_wallet_name(index C.int) *C.char {
+	text, err := wallet.ServerWalletName(int(index))
+	setErr(err)
+	if err != nil {
+		return nil
+	}
+	return cString(text)
+}
+
+//export KIKO_server_add
+func KIKO_server_add(host *C.char) C.int {
+	err := wallet.AddServer(C.GoString(host))
+	setErr(err)
+	if err != nil {
+		return -1
+	}
+	return 0
+}
+
+//export KIKO_server_update
+func KIKO_server_update(index C.int, host *C.char) C.int {
+	err := wallet.UpdateServer(int(index), C.GoString(host))
+	setErr(err)
+	if err != nil {
+		return -1
+	}
+	return 0
+}
+
+//export KIKO_server_delete
+func KIKO_server_delete(index C.int) C.int {
+	err := wallet.DeleteServer(int(index))
+	setErr(err)
+	if err != nil {
+		return -1
+	}
+	return 0
+}
+
+//export KIKO_server_coin
+func KIKO_server_coin(index C.int) C.int {
+	n, err := wallet.ServerCoin(int(index))
+	setErr(err)
+	if err != nil {
+		return -1
+	}
+	return C.int(n)
+}
+
+//export KIKO_server_fee_base
+func KIKO_server_fee_base(index C.int) *C.char {
+	text, err := wallet.ServerFeeBase(int(index))
+	setErr(err)
+	if err != nil {
+		return nil
+	}
+	return cString(text)
+}
+
+//export KIKO_server_fee_per_km
+func KIKO_server_fee_per_km(index C.int) *C.char {
+	text, err := wallet.ServerFeePerKm(int(index))
+	setErr(err)
+	if err != nil {
+		return nil
+	}
+	return cString(text)
+}
+
+//export KIKO_server_save_fees
+func KIKO_server_save_fees(index C.int, base, perKm, unit *C.char) C.int {
+	err := wallet.SaveServerFees(int(index), C.GoString(base), C.GoString(perKm), C.GoString(unit))
+	setErr(err)
+	if err != nil {
+		return -1
+	}
+	return 0
+}
+
+//export KIKO_apply_fees_eur
+func KIKO_apply_fees_eur(base, perKm *C.char) C.int {
+	err := wallet.ApplyFeesEUR(C.GoString(base), C.GoString(perKm))
+	setErr(err)
+	if err != nil {
+		return -1
+	}
+	return 0
+}
+
 func main() {}
