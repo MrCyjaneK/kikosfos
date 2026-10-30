@@ -10,6 +10,8 @@ Page {
     property string placeText
     property string registerText
     property string hint
+    property bool syncing: false
+    property int nextIn: 10
     property int count: 0
     property int activeCount: 0
     property int stamp: 0
@@ -40,6 +42,9 @@ Page {
     }
 
     function sync() {
+        if (syncing)
+            return
+        syncing = true
         refreshPlace()
         reloadActive()
         kiko.driveRegister()
@@ -110,6 +115,7 @@ Page {
                 var n = kiko.driveCount()
                 page.count = n < 0 ? 0 : n
                 page.stamp++
+                page.syncing = true
                 kiko.driveRefresh(5)
             }
         }
@@ -122,6 +128,8 @@ Page {
                 page.hint = "No rides"
             else
                 page.hint = ""
+            page.syncing = false
+            page.nextIn = 10
             page.stamp++
             page.warmEuros()
         }
@@ -135,7 +143,8 @@ Page {
 
         PullDownMenu {
             MenuItem {
-                text: "Refresh"
+                text: page.syncing ? "Refreshing" : "Refresh  " + page.nextIn + " s"
+                enabled: !page.syncing
                 onClicked: page.sync()
             }
             MenuItem {
@@ -182,6 +191,14 @@ Page {
                     font.pixelSize: Theme.fontSizeSmall
                     text: page.registerText
                 }
+            }
+
+            Label {
+                x: Theme.horizontalPageMargin
+                width: parent.width - 2 * x
+                font.pixelSize: Theme.fontSizeSmall
+                color: Theme.secondaryColor
+                text: page.syncing ? "Refreshing" : "Refresh  " + page.nextIn + " s"
             }
 
             Column {
@@ -382,14 +399,16 @@ Page {
     Timer {
         interval: 1000
         repeat: true
-        running: page.status === PageStatus.Active
-        onTriggered: page.refreshPlace()
-    }
-
-    Timer {
-        interval: 5 * 60 * 1000
-        repeat: true
         running: true
-        onTriggered: page.sync()
+        onTriggered: {
+            if (page.status === PageStatus.Active)
+                page.refreshPlace()
+            if (page.syncing)
+                return
+            if (page.nextIn > 0)
+                page.nextIn--
+            if (page.nextIn <= 0)
+                page.sync()
+        }
     }
 }

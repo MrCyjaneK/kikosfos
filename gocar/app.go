@@ -15,8 +15,9 @@ const (
 	screenHome
 	screenTrip
 
-	// Home asks the servers again this often. The trip screen does not.
-	refreshEvery = 3
+	// Home registers and reloads rides on this interval while a refresh
+	// is not already running. The trip screen does not.
+	refreshEvery = 10
 	// Unpaid claimed rides re-check the fare on this interval.
 	payEvery = 4
 )
@@ -30,22 +31,24 @@ type hud struct {
 	once   sync.Once
 	opened bool
 
-	api      *kikoLib
-	unlocked bool
-	screen   int
-	pinState int // -1 unavailable, 0 unset, 1 set
-	confirm  bool
-	first    string
-	pin      string
-	notice   string
-	busy     bool
-	status   string
-	active   []ride
-	offers   []ride
-	listKey  string
-	trip     ride
-	nav      Trip
-	odom     odometer
+	api        *kikoLib
+	unlocked   bool
+	screen     int
+	pinState   int // -1 unavailable, 0 unset, 1 set
+	confirm    bool
+	first      string
+	pin        string
+	notice     string
+	busy       bool
+	refreshing bool
+	nextIn     int
+	status     string
+	active     []ride
+	offers     []ride
+	listKey    string
+	trip       ride
+	nav        Trip
+	odom       odometer
 
 	dirtyTree bool
 	dirtyLive bool
@@ -53,18 +56,19 @@ type hud struct {
 	payLabel  string
 	payBusy   bool
 
-	statusLbl *canvas.Text
-	navHead   *canvas.Text
-	navSub    *canvas.Text
-	navTime   *canvas.Text
-	navDist   *canvas.Text
-	drivenLbl *canvas.Text
-	meterCap  *canvas.Text
-	payBtn    *tapButton
+	statusLbl  *canvas.Text
+	refreshBtn *tapButton
+	navHead    *canvas.Text
+	navSub     *canvas.Text
+	navTime    *canvas.Text
+	navDist    *canvas.Text
+	drivenLbl  *canvas.Text
+	meterCap   *canvas.Text
+	payBtn     *tapButton
 }
 
 func newHUD() *hud {
-	return &hud{kit: fynekit.New(), pinState: -1}
+	return &hud{kit: fynekit.New(), pinState: -1, nextIn: refreshEvery}
 }
 
 var gHUD = newHUD()
@@ -80,9 +84,7 @@ func (h *hud) loop() {
 	for range tick.C {
 		n++
 		h.pollTrip()
-		if n%refreshEvery == 0 && h.onHome() {
-			go h.syncIfIdle()
-		}
+		h.tickRefresh()
 		if n%payEvery == 0 && h.onTripUnpaid() {
 			go h.pollPayment()
 		}
@@ -210,29 +212,64 @@ func (h *hud) submit() {
 		h.status = "Looking for rides"
 		h.notice = ""
 		h.confirm = false
+		h.refreshing = true
 		h.dirtyTree = true
 		h.mu.Unlock()
 		h.syncDrives(true)
+		h.endRefresh()
 	}()
 }
 
 func (h *hud) refresh() {
 	h.mu.Lock()
-	if h.busy || !h.unlocked {
+	if h.refreshing || !h.unlocked || h.api == nil {
 		h.mu.Unlock()
 		return
 	}
-	h.busy = true
-	h.status = "Refreshing"
-	h.dirtyTree = true
+	h.refreshing = true
+	h.dirtyLive = true
 	h.mu.Unlock()
-	go func() {
-		h.syncDrives(true)
-		h.mu.Lock()
-		h.busy = false
-		h.dirtyTree = true
+	go h.finishRefresh()
+}
+
+func (h *hud) tickRefresh() {
+	h.mu.Lock()
+	if !h.unlocked || h.screen != screenHome || h.api == nil {
 		h.mu.Unlock()
-	}()
+		return
+	}
+	if h.refreshing {
+		h.dirtyLive = true
+		h.mu.Unlock()
+		return
+	}
+	if h.nextIn > 0 {
+		h.nextIn--
+	}
+	due := h.nextIn <= 0
+	if due {
+		h.refreshing = true
+	}
+	h.dirtyLive = true
+	h.mu.Unlock()
+	if due {
+		go h.finishRefresh()
+	}
+}
+
+func (h *hud) finishRefresh() {
+	h.syncDrives(true)
+	h.endRefresh()
+}
+
+func (h *hud) endRefresh() {
+	h.mu.Lock()
+	h.refreshing = false
+	h.nextIn = refreshEvery
+	if h.screen == screenHome {
+		h.dirtyLive = true
+	}
+	h.mu.Unlock()
 }
 
 // syncDrives reloads offers. register posts the driver first; the
@@ -513,46 +550,50 @@ func (h *hud) pollTrip() {
 }
 
 type snap struct {
-	screen   int
-	pinState int
-	confirm  bool
-	pin      string
-	notice   string
-	busy     bool
-	status   string
-	active   []ride
-	offers   []ride
-	trip     ride
-	nav      Trip
-	km       float64
-	gpsNote  string
-	hasFix   bool
-	payLabel string
-	payBusy  bool
-	unlocked bool
+	screen     int
+	pinState   int
+	confirm    bool
+	pin        string
+	notice     string
+	busy       bool
+	status     string
+	refreshing bool
+	nextIn     int
+	active     []ride
+	offers     []ride
+	trip       ride
+	nav        Trip
+	km         float64
+	gpsNote    string
+	hasFix     bool
+	payLabel   string
+	payBusy    bool
+	unlocked   bool
 }
 
 func (h *hud) copyState() snap {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return snap{
-		screen:   h.screen,
-		pinState: h.pinState,
-		confirm:  h.confirm,
-		pin:      h.pin,
-		notice:   h.notice,
-		busy:     h.busy,
-		status:   h.status,
-		active:   append([]ride(nil), h.active...),
-		offers:   append([]ride(nil), h.offers...),
-		trip:     h.trip,
-		nav:      h.nav,
-		km:       h.odom.km,
-		gpsNote:  h.gpsNote,
-		hasFix:   h.odom.has,
-		payLabel: h.payLabel,
-		payBusy:  h.payBusy,
-		unlocked: h.unlocked,
+		screen:     h.screen,
+		pinState:   h.pinState,
+		confirm:    h.confirm,
+		pin:        h.pin,
+		notice:     h.notice,
+		busy:       h.busy,
+		status:     h.status,
+		refreshing: h.refreshing,
+		nextIn:     h.nextIn,
+		active:     append([]ride(nil), h.active...),
+		offers:     append([]ride(nil), h.offers...),
+		trip:       h.trip,
+		nav:        h.nav,
+		km:         h.odom.km,
+		gpsNote:    h.gpsNote,
+		hasFix:     h.odom.has,
+		payLabel:   h.payLabel,
+		payBusy:    h.payBusy,
+		unlocked:   h.unlocked,
 	}
 }
 
@@ -586,6 +627,8 @@ func (h *hud) flush() {
 	payLabel := h.payLabel
 	payBusy := h.payBusy
 	busy := h.busy
+	refreshing := h.refreshing
+	nextIn := h.nextIn
 	h.mu.Unlock()
 	if h.kit.Canvas() == nil {
 		if tree || live {
@@ -600,12 +643,12 @@ func (h *hud) flush() {
 		h.kit.Canvas().SetContent(h.build())
 	}
 	if tree || live {
-		h.paintLive(nav, km, status, gpsNote, hasFix, payLabel, payBusy, busy)
+		h.paintLive(nav, km, status, gpsNote, hasFix, payLabel, payBusy, busy, refreshing, nextIn)
 		h.kit.MarkDirty()
 	}
 }
 
-func (h *hud) paintLive(nav Trip, km float64, status, gpsNote string, hasFix bool, payLabel string, payBusy, busy bool) {
+func (h *hud) paintLive(nav Trip, km float64, status, gpsNote string, hasFix bool, payLabel string, payBusy, busy bool, refreshing bool, nextIn int) {
 	setCanvas(h.statusLbl, oneLine(status, 64))
 	head, sub, time, dist := bannerParts(nav)
 	setCanvas(h.navHead, shorten(head, 28))
@@ -615,6 +658,17 @@ func (h *hud) paintLive(nav Trip, km float64, status, gpsNote string, hasFix boo
 	setCanvas(h.drivenLbl, formatKm(km))
 	cap, col := meterCaption(gpsNote, hasFix)
 	setCanvasColor(h.meterCap, cap, col)
+	if h.refreshBtn != nil {
+		label := refreshLabel(refreshing, nextIn)
+		if h.refreshBtn.Text != label {
+			h.refreshBtn.SetText(label)
+		}
+		if refreshing && !h.refreshBtn.Disabled() {
+			h.refreshBtn.Disable()
+		} else if !refreshing && h.refreshBtn.Disabled() {
+			h.refreshBtn.Enable()
+		}
+	}
 	if h.payBtn == nil || payLabel == "" {
 		return
 	}

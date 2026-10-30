@@ -16,6 +16,7 @@ import (
 
 func (h *hud) build() fyne.CanvasObject {
 	h.statusLbl = nil
+	h.refreshBtn = nil
 	h.navHead = nil
 	h.navSub = nil
 	h.navTime = nil
@@ -67,8 +68,9 @@ func (h *hud) buildUnlock(s snap) fyne.CanvasObject {
 func (h *hud) buildHome(s snap) fyne.CanvasObject {
 	title := newText("Kiko", 22, colLime, true)
 	h.statusLbl = newText(oneLine(s.status, 64), 14, colMuted, false)
-	refresh := newTap("Refresh", widget.LowImportance, 40, h.refresh)
-	if s.busy {
+	refresh := newTap(refreshLabel(s.refreshing, s.nextIn), widget.LowImportance, 40, h.refresh)
+	h.refreshBtn = refresh
+	if s.refreshing {
 		refresh.Disable()
 	}
 	head := container.New(vstack{2},
@@ -234,6 +236,16 @@ func meterCaption(note string, hasFix bool) (string, color.Color) {
 		return "WAITING FOR GPS", colMuted
 	}
 	return "DRIVEN", colMuted
+}
+
+func refreshLabel(refreshing bool, nextIn int) string {
+	if refreshing {
+		return "Refreshing"
+	}
+	if nextIn < 0 {
+		nextIn = 0
+	}
+	return fmt.Sprintf("Refresh  %d s", nextIn)
 }
 
 func formatKm(km float64) string {
