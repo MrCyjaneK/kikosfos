@@ -232,6 +232,26 @@ func KIKO_wallet_private_key(index C.int) *C.char {
 	return cString(key)
 }
 
+//export KIKO_wallet_multisig_material
+func KIKO_wallet_multisig_material(index C.int) *C.char {
+	key, err := wallet.WalletMultisigMaterial(int(index))
+	setErr(err)
+	if err != nil {
+		return nil
+	}
+	return cString(key)
+}
+
+//export KIKO_wallet_balance
+func KIKO_wallet_balance(index C.int) *C.char {
+	amount, err := wallet.WalletBalance(int(index))
+	setErr(err)
+	if err != nil {
+		return nil
+	}
+	return cString(amount)
+}
+
 //export KIKO_wallet_delete
 func KIKO_wallet_delete(index C.int, pin *C.char) C.int {
 	err := wallet.WalletDelete(int(index), C.GoString(pin))

@@ -9,12 +9,10 @@ type KDFParams struct {
 	Threads uint8
 }
 
-// ProductionKDF uses 1 GiB total, split across the 16 cores on this Mac.
-// Time 40 measured 4.85s here.
 var ProductionKDF = KDFParams{
-	Time:    40,
-	Memory:  1024 * 1024,
-	Threads: 16,
+	Time:    10,
+	Memory:  128 * 1024,
+	Threads: 4,
 }
 
 var activeKDF = ProductionKDF

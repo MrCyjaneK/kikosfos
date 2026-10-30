@@ -181,7 +181,24 @@ func walletPublic(index int) (Public, bool, error) {
 	if err != nil {
 		return Public{}, false, err
 	}
-	return s.Public(c.ID(), key, c.Restore)
+	pub, exists, err := s.Public(c.ID(), key, c.Restore)
+	if err != nil || !exists {
+		return pub, exists, err
+	}
+	pub.Details = omitStakeAddress(pub.Details)
+	return pub, true, nil
+}
+
+// omitStakeAddress drops a stake row stored by earlier builds.
+func omitStakeAddress(details []Detail) []Detail {
+	kept := make([]Detail, 0, len(details))
+	for _, detail := range details {
+		if detail.Label == "Stake address" {
+			continue
+		}
+		kept = append(kept, detail)
+	}
+	return kept
 }
 
 // WalletAddress re-reads the receive address under the coin lock.
@@ -320,6 +337,33 @@ func WalletPrivateKey(index int) (string, error) {
 		return "", err
 	}
 	return c.PrivateKey(mnemonic)
+}
+
+// WalletMultisigMaterial re-reads the seed and returns that coin's multisig material.
+func WalletMultisigMaterial(index int) (string, error) {
+	c, err := coinAt(index)
+	if err != nil {
+		return "", err
+	}
+	mnemonic, err := WalletMnemonic(index)
+	if err != nil {
+		return "", err
+	}
+	return c.MultisigMaterial(mnemonic)
+}
+
+// WalletBalance re-reads the receive address, then asks the coin for its balance.
+// The chain query is not done under the coin lock.
+func WalletBalance(index int) (string, error) {
+	c, err := coinAt(index)
+	if err != nil {
+		return "", err
+	}
+	address, err := WalletAddress(index)
+	if err != nil {
+		return "", err
+	}
+	return c.Balance(address)
 }
 
 // WalletDelete checks the PIN against the one held in this process, then removes the coin's files.

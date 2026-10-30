@@ -2,16 +2,14 @@
 package cardano
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"image"
-	"image/color"
-	"image/png"
 	"strings"
-	"sync"
 
 	"github.com/blinklabs-io/bursa"
+	"github.com/btcsuite/btcd/btcutil/bech32"
+
+	_ "embed"
 )
 
 const (
@@ -19,16 +17,14 @@ const (
 	ID   = "cardano"
 )
 
-// Account is a mainnet CIP-1852 wallet at the default indexes.
-// Address receives ADA. PrivateKey is the payment extended signing key (addr_xsk).
 type Account struct {
-	Mnemonic     string
-	Address      string
-	StakeAddress string
-	PrivateKey   string
+	Mnemonic         string
+	Address          string
+	StakeAddress     string
+	PrivateKey       string
+	AccountSharedXVK string
 }
 
-// Create generates a 24-word mainnet account.
 func Create() (Account, error) {
 	mnemonic, err := bursa.GenerateMnemonic()
 	if err != nil {
@@ -37,69 +33,56 @@ func Create() (Account, error) {
 	return Restore(mnemonic)
 }
 
-// Restore rebuilds the mainnet account from a BIP39 recovery phrase.
-// The BIP39 passphrase is empty.
 func Restore(mnemonic string) (Account, error) {
 	mnemonic = strings.TrimSpace(mnemonic)
 	created, err := bursa.NewWallet(mnemonic, bursa.WithNetwork("mainnet"))
 	if err != nil {
 		return Account{}, fmt.Errorf("cardano: %w", err)
 	}
+	shared, err := accountSharedXVK(mnemonic)
+	if err != nil {
+		return Account{}, err
+	}
 	return Account{
-		Mnemonic:     mnemonic,
-		Address:      created.PaymentAddress,
-		StakeAddress: created.StakeAddress,
-		PrivateKey:   created.PaymentExtendedSKey.String(),
+		Mnemonic:         mnemonic,
+		Address:          created.PaymentAddress,
+		StakeAddress:     created.StakeAddress,
+		PrivateKey:       created.PaymentExtendedSKey.String(),
+		AccountSharedXVK: shared,
 	}, nil
 }
 
-// Send is wired for the generic wallet API and does not build or broadcast.
+func accountSharedXVK(mnemonic string) (string, error) {
+	root, err := bursa.GetRootKeyFromMnemonic(mnemonic, "")
+	if err != nil {
+		return "", fmt.Errorf("cardano: %w", err)
+	}
+	account, err := bursa.GetMultiSigAccountKey(root, 0)
+	if err != nil {
+		return "", fmt.Errorf("cardano: account key: %w", err)
+	}
+	encoded, err := encodeBech32("acct_shared_xvk", account.Public())
+	if err != nil {
+		return "", fmt.Errorf("cardano: account key: %w", err)
+	}
+	return encoded, nil
+}
+
+func encodeBech32(hrp string, payload []byte) (string, error) {
+	converted, err := bech32.ConvertBits(payload, 8, 5, true)
+	if err != nil {
+		return "", err
+	}
+	return bech32.Encode(hrp, converted)
+}
+
 func Send(string, string) error {
 	return errors.New("sending is not available")
 }
 
-// IconPNG is a small mark the wallet list can draw.
 func IconPNG() []byte {
-	iconOnce.Do(func() {
-		iconPNG = drawIcon()
-	})
 	return iconPNG
 }
 
-var (
-	iconOnce sync.Once
-	iconPNG  []byte
-)
-
-func drawIcon() []byte {
-	const n = 96
-	img := image.NewRGBA(image.Rect(0, 0, n, n))
-	blue := color.RGBA{R: 0x00, G: 0x33, B: 0xAD, A: 0xFF}
-	white := color.RGBA{R: 0xFF, G: 0xFF, B: 0xFF, A: 0xFF}
-	for y := 0; y < n; y++ {
-		for x := 0; x < n; x++ {
-			img.SetRGBA(x, y, blue)
-		}
-	}
-	cx, cy, r := n/2, n/2, n/2-14
-	for y := cy - r; y <= cy+r; y++ {
-		for x := cx - r; x <= cx+r; x++ {
-			dx, dy := x-cx, y-cy
-			if dx*dx+dy*dy <= r*r {
-				img.SetRGBA(x, y, white)
-			}
-		}
-	}
-	r2 := r / 2
-	for y := cy - r2; y <= cy+r2; y++ {
-		for x := cx - r2; x <= cx+r2; x++ {
-			dx, dy := x-cx, y-cy
-			if dx*dx+dy*dy <= r2*r2 {
-				img.SetRGBA(x, y, blue)
-			}
-		}
-	}
-	var buf bytes.Buffer
-	_ = png.Encode(&buf, img)
-	return buf.Bytes()
-}
+//go:embed icon.png
+var iconPNG []byte

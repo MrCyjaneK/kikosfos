@@ -1,5 +1,6 @@
 import QtQuick 2.6
 import Sailfish.Silica 1.0
+import "components"
 
 Page {
     id: page
@@ -8,6 +9,9 @@ Page {
     property int exists: -1
     property string address
     property string errorText
+    property string balance
+    property string balanceMessage
+    property int balanceState: 0
 
     onStatusChanged: {
         if (status === PageStatus.Active)
@@ -22,28 +26,49 @@ Page {
             if (address === "") {
                 errorText = kiko.lastError()
                 exists = -1
+                balance = ""
+                balanceMessage = ""
+                balanceState = 0
+            } else {
+                if (balance === "")
+                    balanceState = 0
+                kiko.walletBalance(wallet)
             }
         } else {
             address = ""
+            balance = ""
+            balanceMessage = ""
+            balanceState = 0
             if (exists < 0)
                 errorText = kiko.lastError()
         }
     }
 
-    PullDownMenu {
-        MenuItem {
-            text: "Settings"
-            visible: page.exists === 1
-            onClicked: pageStack.push(Qt.resolvedUrl("SettingsPage.qml"), {
-                wallet: page.wallet,
-                coinPage: page
-            })
+    Connections {
+        target: kiko
+        onBalanceReady: {
+            if (wallet !== page.wallet || page.exists !== 1)
+                return
+            page.balanceState = message === "" ? 1 : -1
+            page.balance = amount
+            page.balanceMessage = message
         }
     }
 
     SilicaFlickable {
         anchors.fill: parent
-        contentHeight: column.height
+        contentHeight: Math.max(column.height, height)
+
+        PullDownMenu {
+            MenuItem {
+                text: "Settings"
+                visible: page.exists === 1
+                onClicked: pageStack.push(Qt.resolvedUrl("SettingsPage.qml"), {
+                    wallet: page.wallet,
+                    coinPage: page
+                })
+            }
+        }
 
         Column {
             id: column
@@ -88,6 +113,45 @@ Page {
                 spacing: Theme.paddingLarge
                 visible: page.exists === 1
 
+                Column {
+                    width: parent.width
+                    spacing: Theme.paddingSmall
+
+                    Label {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: "Balance"
+                        color: Theme.secondaryColor
+                        font.pixelSize: Theme.fontSizeSmall
+                    }
+
+                    BusyIndicator {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        running: page.balanceState === 0
+                        visible: running
+                        width: Theme.itemSizeSmall
+                        height: width
+                    }
+
+                    Label {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        visible: page.balance !== ""
+                        text: page.balance
+                        color: Theme.primaryColor
+                        font.pixelSize: Theme.fontSizeExtraLarge
+                    }
+
+                    Label {
+                        width: parent.width - 2 * Theme.horizontalPageMargin
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        horizontalAlignment: Text.AlignHCenter
+                        wrapMode: Text.Wrap
+                        visible: page.balanceMessage !== ""
+                        text: page.balanceMessage
+                        color: Theme.highlightColor
+                        font.pixelSize: Theme.fontSizeSmall
+                    }
+                }
+
                 Image {
                     anchors.horizontalCenter: parent.horizontalCenter
                     width: parent.width * 0.62
@@ -96,12 +160,9 @@ Page {
                     source: page.exists === 1 ? "image://kiko/qr/" + page.wallet : ""
                 }
 
-                TextArea {
-                    width: parent.width
-                    readOnly: true
-                    text: page.address
-                    wrapMode: TextEdit.Wrap
+                SecretField {
                     label: "Receive"
+                    value: page.address
                 }
 
                 Repeater {
@@ -111,12 +172,9 @@ Page {
                         var n = kiko.walletDetailCount(page.wallet)
                         return n < 0 ? 0 : n
                     }
-                    delegate: TextArea {
-                        width: column.width
-                        readOnly: true
-                        wrapMode: TextEdit.Wrap
+                    delegate: SecretField {
                         label: kiko.walletDetailLabel(page.wallet, index)
-                        text: kiko.walletDetailValue(page.wallet, index)
+                        value: kiko.walletDetailValue(page.wallet, index)
                     }
                 }
 

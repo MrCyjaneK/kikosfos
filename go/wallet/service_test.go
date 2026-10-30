@@ -86,16 +86,8 @@ func TestSetupUnlockCreate(t *testing.T) {
 		t.Fatalf("address = %s %v", address, err)
 	}
 	n, err := WalletDetailCount(0)
-	if err != nil || n != 1 {
+	if err != nil || n != 0 {
 		t.Fatalf("details = %d %v", n, err)
-	}
-	label, err := WalletDetailLabel(0, 0)
-	if err != nil || label != "Stake address" {
-		t.Fatalf("label = %q %v", label, err)
-	}
-	stake, err := WalletDetailValue(0, 0)
-	if err != nil || !strings.HasPrefix(stake, "stake1") {
-		t.Fatalf("stake = %s %v", stake, err)
 	}
 	mnemonic, err := WalletMnemonic(0)
 	if err != nil || len(strings.Fields(mnemonic)) != 24 {
@@ -104,6 +96,10 @@ func TestSetupUnlockCreate(t *testing.T) {
 	key, err := WalletPrivateKey(0)
 	if err != nil || !strings.HasPrefix(key, "addr_xsk") {
 		t.Fatalf("private key %v", err)
+	}
+	material, err := WalletMultisigMaterial(0)
+	if err != nil || !strings.HasPrefix(material, "acct_shared_xvk") {
+		t.Fatalf("multisig material %s %v", material, err)
 	}
 	qr, err := WalletQR(0)
 	if err != nil || string(qr[:8]) != "\x89PNG\r\n\x1a\n" {
@@ -121,6 +117,16 @@ func TestSetupUnlockCreate(t *testing.T) {
 	exists, err = WalletExists(0)
 	if err != nil || exists {
 		t.Fatalf("exists after delete = %v %v", exists, err)
+	}
+}
+
+func TestOmitStoredStakeAddress(t *testing.T) {
+	got := omitStakeAddress([]Detail{
+		{Label: "Stake address", Value: "stake1u"},
+		{Label: "Account", Value: "0"},
+	})
+	if len(got) != 1 || got[0].Label != "Account" {
+		t.Fatalf("details = %+v", got)
 	}
 }
 

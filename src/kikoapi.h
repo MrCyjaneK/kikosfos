@@ -25,6 +25,8 @@ public:
     Q_INVOKABLE int walletRestore(int wallet, const QString &mnemonic);
     Q_INVOKABLE QString walletMnemonic(int wallet);
     Q_INVOKABLE QString walletPrivateKey(int wallet);
+    Q_INVOKABLE QString walletMultisigMaterial(int wallet);
+    Q_INVOKABLE void walletBalance(int wallet);
     Q_INVOKABLE int walletDelete(int wallet, const QString &pin);
     Q_INVOKABLE int walletSend(int wallet, const QString &to, const QString &amount);
     Q_INVOKABLE QString lastError();
@@ -32,9 +34,11 @@ public:
 signals:
     void pinAccepted();
     void pinRejected(const QString &message);
+    void balanceReady(int wallet, const QString &amount, const QString &message);
 
 private slots:
     void deliverPin(int rc, const QString &message);
+    void deliverBalance(int wallet, const QString &amount, const QString &message);
 
 private:
     void runPin(const QByteArray &pin, const QByteArray &again, bool setup);

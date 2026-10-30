@@ -1,5 +1,6 @@
 import QtQuick 2.6
 import Sailfish.Silica 1.0
+import "components"
 
 Page {
     id: page
@@ -7,6 +8,7 @@ Page {
     property var coinPage
     property string mnemonic
     property string privateKey
+    property string multisigMaterial
     property string errorText
 
     onStatusChanged: {
@@ -21,6 +23,9 @@ Page {
             errorText = kiko.lastError()
         privateKey = kiko.walletPrivateKey(wallet)
         if (privateKey === "" && errorText === "")
+            errorText = kiko.lastError()
+        multisigMaterial = kiko.walletMultisigMaterial(wallet)
+        if (multisigMaterial === "" && errorText === "")
             errorText = kiko.lastError()
     }
 
@@ -44,20 +49,19 @@ Page {
                 text: page.errorText
             }
 
-            TextArea {
-                width: parent.width
-                readOnly: true
+            SecretField {
                 label: "Seed phrase"
-                text: page.mnemonic
-                wrapMode: TextEdit.Wrap
+                value: page.mnemonic
             }
 
-            TextArea {
-                width: parent.width
-                readOnly: true
+            SecretField {
                 label: "Private key"
-                text: page.privateKey
-                wrapMode: TextEdit.Wrap
+                value: page.privateKey
+            }
+
+            SecretField {
+                label: "Multisig material"
+                value: page.multisigMaterial
             }
 
             Button {

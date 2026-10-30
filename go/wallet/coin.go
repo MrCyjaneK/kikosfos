@@ -32,6 +32,11 @@ type Coin interface {
 	Create() (Public, string, error)
 	Restore(mnemonic string) (Public, error)
 	PrivateKey(mnemonic string) (string, error)
+	// MultisigMaterial is the shareable key for a multisig setup.
+	// Each coin picks its own encoding. Cardano uses acct_shared_xvk.
+	MultisigMaterial(mnemonic string) (string, error)
+	// Balance is the on-chain amount for an address, formatted for display.
+	Balance(address string) (string, error)
 	Send(to, amount string) error
 }
 
@@ -67,18 +72,24 @@ func (cardanoCoin) PrivateKey(mnemonic string) (string, error) {
 	return account.PrivateKey, nil
 }
 
+func (cardanoCoin) MultisigMaterial(mnemonic string) (string, error) {
+	account, err := cardano.Restore(mnemonic)
+	if err != nil {
+		return "", err
+	}
+	return account.AccountSharedXVK, nil
+}
+
+func (cardanoCoin) Balance(address string) (string, error) {
+	return cardano.Balance(address)
+}
+
 func (cardanoCoin) Send(to, amount string) error {
 	return cardano.Send(to, amount)
 }
 
 func publicFrom(account cardano.Account) Public {
-	return Public{
-		Address: account.Address,
-		Details: []Detail{{
-			Label: "Stake address",
-			Value: account.StakeAddress,
-		}},
-	}
+	return Public{Address: account.Address}
 }
 
 // registry order is the stable wallet index. Do not reorder it.

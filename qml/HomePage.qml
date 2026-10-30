@@ -2,18 +2,29 @@ import QtQuick 2.6
 import Sailfish.Silica 1.0
 
 Page {
-    PullDownMenu {
-        MenuItem {
-            text: "Wallets"
-            onClicked: pageStack.push(Qt.resolvedUrl("WalletsPage.qml"))
+    SilicaFlickable {
+        anchors.fill: parent
+        contentHeight: Math.max(column.height, height)
+
+        PullDownMenu {
+            MenuItem {
+                text: "Wallets"
+                onClicked: pageStack.push(Qt.resolvedUrl("WalletsPage.qml"))
+            }
         }
-    }
 
-    PageHeader { title: "Kiko" }
+        Column {
+            id: column
+            width: parent.width
 
-    Label {
-        anchors.centerIn: parent
-        text: "Pull down for wallets"
-        color: Theme.secondaryColor
+            PageHeader { title: "Kiko" }
+
+            Label {
+                width: parent.width
+                horizontalAlignment: Text.AlignHCenter
+                text: "Pull down for wallets"
+                color: Theme.secondaryColor
+            }
+        }
     }
 }
