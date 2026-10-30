@@ -11,3 +11,8 @@ Makefile
 *.qm
 *.ts
 go/libkiko.h
+*.list
+*.o
+kiko-sfos
+*.rpm
+rpms/
