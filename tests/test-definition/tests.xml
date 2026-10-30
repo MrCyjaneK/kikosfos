@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!--
+SPDX-FileCopyrightText: 2013-2021 Jolla Ltd.
+SPDX-FileCopyrightText: 2025 Jolla Mobile Ltd
+
+SPDX-License-Identifier: BSD-3-Clause
+-->
+
+<testdefinition version="1.0">
+   <suite name="sailfish-gallery-tests" domain="ui">
+       <description>Sailfish Gallery UI Components automatic tests</description>
+       <set name="unit-tests" feature="Sailfish Gallery UI Components">
+           <description>Sailfish Gallery UI component unit tests</description>
+           <pre_steps>
+               <step>/usr/bin/start-ui-test.sh</step>
+           </pre_steps>
+           <case manual="false" name="unittests">
+               <step>qmltestrunner -input /opt/tests/sailfish-components-gallery-qt5/auto</step>
+           </case>
+           <post_steps>
+               <step>/usr/bin/stop-ui-test.sh</step>
+           </post_steps>
+       </set>
+   </suite>
+</testdefinition>

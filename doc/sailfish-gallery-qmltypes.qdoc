@@ -1,0 +1,35 @@
+/*
+ * SPDX-FileCopyrightText: 2022-2023 Jolla Ltd.
+ * SPDX-FileCopyrightText: 2024-2025 Jolla Mobile Ltd
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+/*!
+\qmlmodule Sailfish.Gallery 1.0
+\title Sailfish Gallery QML Types
+
+This module includes the following types:
+
+*/
+
+/*!
+\page sailfish-gallery-qmltypes.html
+\title Sailfish Gallery QML Types
+\brief Provides QML types for Sailfish Gallery
+
+The Sailfish Gallery module includes the following types:
+
+\generatelist{qmltypesbymodule Sailfish.Gallery}
+
+*/
+
+/*!
+\page sailfish-gallery.html
+\title Sailfish Gallery
+
+The Sailfish Gallery module includes the following QML types:
+
+\generatelist{qmltypesbymodule Sailfish.Gallery}
+
+*/
