@@ -10,3 +10,4 @@ moc_*
 Makefile
 *.qm
 *.ts
+go/libkiko.h

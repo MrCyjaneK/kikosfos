@@ -1,13 +1,7 @@
-# Sailfish Gallery UI Components
+# kiko-sfos
 
-## Issue reporting
+Minimal Sailfish application. The page shows the text returned by `KIKOAPI_hello` from `go/`, built as `libkiko.so`.
 
-Please report issues to [Issue Tracker](https://github.com/sailfishos/issue-tracker/issues)
-repository and label issues with 'gallery'. You can also filter by
-[label](https://github.com/sailfishos/issue-tracker/issues?q=state%3Aopen%20label%3Agallery).
-
-Worth noting that GitHub Issues provides a bug report template when creating a new issue.
-
-Find more information from [Issue Tracker](https://github.com/sailfishos/issue-tracker).
-
-Happy hacking.
+```
+sfosbuild 5.1.0.11 aarch64 ./rpm/kiko-sfos.spec
+```
