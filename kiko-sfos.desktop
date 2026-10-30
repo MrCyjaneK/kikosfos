@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 X-Nemo-Application-Type=silica-qt5
-Icon=icon-launcher-default
+Icon=kiko-sfos
 Exec=kiko-sfos
 Name=Kiko
 

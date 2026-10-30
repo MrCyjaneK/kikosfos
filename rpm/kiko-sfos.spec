@@ -31,4 +31,5 @@ CGO_ENABLED=1 go build -C go -buildmode=c-shared -ldflags '-s -w' -o libkiko.so 
 %{_bindir}/kiko-sfos
 %{_datadir}/kiko-sfos/qml
 %{_datadir}/applications/kiko-sfos.desktop
+%{_datadir}/icons/hicolor/*/apps/kiko-sfos.png
 %{_libdir}/libkiko.so
