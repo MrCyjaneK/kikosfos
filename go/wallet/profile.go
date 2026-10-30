@@ -25,10 +25,18 @@ type serverRecord struct {
 	FeePerKm string `json:"fee_per_km,omitempty"`
 }
 
+// savedRide is a ride this driver has accepted. The offer itself is loaded
+// from the server, so a restart still shows it after it leaves the open list.
+type savedRide struct {
+	Server string `json:"server"`
+	ID     string `json:"id"`
+}
+
 type profileFile struct {
 	Car     Car            `json:"car"`
 	Servers []serverRecord `json:"servers"`
 	GPS     string         `json:"gps,omitempty"`
+	Rides   []savedRide    `json:"rides,omitempty"`
 }
 
 func emptyProfile() profileFile {

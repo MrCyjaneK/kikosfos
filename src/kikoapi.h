@@ -85,8 +85,11 @@ public:
     Q_INVOKABLE void driveNavigate(const QString &lat, const QString &lon, const QString &title);
     Q_INVOKABLE void driveClaim(const QString &server, const QString &id, const QString &pickupKm);
     Q_INVOKABLE void driveVerify(const QString &server, const QString &id);
+    Q_INVOKABLE void driveCashOut(const QString &server, const QString &id);
     Q_INVOKABLE int driveClaimed(const QString &server, const QString &id);
     Q_INVOKABLE int drivePaid(const QString &server, const QString &id);
+    Q_INVOKABLE int driveActiveCount();
+    Q_INVOKABLE QString driveActive(int index);
     Q_INVOKABLE QString lastError();
 
 signals:
@@ -102,6 +105,7 @@ signals:
     void navigateFinished(const QString &message);
     void claimFinished(const QString &message);
     void driveVerified(int seen, const QString &message);
+    void cashOutFinished(const QString &message);
 
 private slots:
     void deliverPin(int rc, const QString &message);
@@ -115,6 +119,7 @@ private slots:
     void deliverNavigate(const QString &message);
     void deliverDriveClaimed(const QString &message);
     void deliverDriveVerified(int seen, const QString &message);
+    void deliverCashOut(const QString &message);
 
 private:
     void runPin(const QByteArray &pin, const QByteArray &again, bool setup);

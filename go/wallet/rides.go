@@ -121,6 +121,7 @@ func RegisterDrivers() (string, error) {
 	driveMu.Lock()
 	driveReady = ready
 	driveMu.Unlock()
+	reloadSaved()
 	return strings.Join(lines, "\n"), nil
 }
 

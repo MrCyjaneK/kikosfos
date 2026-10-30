@@ -8,9 +8,16 @@ Page {
     property string registerText
     property string hint
     property int count: 0
+    property int activeCount: 0
     property int stamp: 0
+    property int activeStamp: 0
 
     Component.onCompleted: sync()
+
+    onStatusChanged: {
+        if (status === PageStatus.Active)
+            reloadActive()
+    }
 
     function refreshPlace() {
         var text = kiko.gpsPosition()
@@ -27,7 +34,37 @@ Page {
 
     function sync() {
         refreshPlace()
+        reloadActive()
         kiko.driveRegister()
+    }
+
+    function reloadActive() {
+        var n = kiko.driveActiveCount()
+        activeCount = n < 0 ? 0 : n
+        activeStamp++
+    }
+
+    function openRide(ride) {
+        pageStack.push(Qt.resolvedUrl("RidePage.qml"), {
+            coin: ride.coin,
+            server: ride.server,
+            startAddress: ride.start_address,
+            endAddress: ride.end_address,
+            pickupKm: ride.pickup_km,
+            distanceKm: ride.distance_km,
+            immediate: ride.immediate === 1,
+            whenDay: ride.when_day,
+            whenClock: ride.when_clock,
+            rideId: ride.id,
+            startLat: ride.start_lat,
+            startLon: ride.start_lon,
+            endLat: ride.end_lat,
+            endLon: ride.end_lon,
+            fareLovelace: ride.fare_lovelace,
+            baseLovelace: ride.base_lovelace,
+            perKmLovelace: ride.per_km_lovelace,
+            rideStatus: ride.status
+        })
     }
 
     function quoteParts(coin, lovelace) {
@@ -56,7 +93,18 @@ Page {
         target: kiko
         onDriveRegistered: {
             page.registerText = message
+            page.reloadActive()
             kiko.driveRefresh(5)
+        }
+        onCashOutFinished: page.reloadActive()
+        onClaimFinished: {
+            page.reloadActive()
+            if (message === "") {
+                var n = kiko.driveCount()
+                page.count = n < 0 ? 0 : n
+                page.stamp++
+                kiko.driveRefresh(5)
+            }
         }
         onDrivesReady: {
             var n = kiko.driveCount()
@@ -123,10 +171,82 @@ Page {
                     text: page.registerText
                 }
             }
+
+            Column {
+                width: parent.width
+                visible: page.activeCount > 0
+                height: visible ? implicitHeight : 0
+                spacing: Theme.paddingSmall
+
+                Label {
+                    x: Theme.horizontalPageMargin
+                    width: parent.width - 2 * x
+                    text: "Your ride"
+                    font.pixelSize: Theme.fontSizeMedium
+                    color: Theme.highlightColor
+                }
+
+                Repeater {
+                    model: page.activeCount
+
+                    Item {
+                        id: activeRow
+                        width: list.width
+                        height: activePress.height
+                        property var ride: ({})
+                        property string fare
+                        property string euro
+
+                        function load() {
+                            var text = kiko.driveActive(index)
+                            if (text === "")
+                                return
+                            var parsed = JSON.parse(text)
+                            ride = parsed
+                            var parts = page.quoteParts(parsed.coin, parsed.fare_lovelace)
+                            fare = parts.amount
+                            euro = parts.euro
+                        }
+
+                        Component.onCompleted: load()
+
+                        Connections {
+                            target: page
+                            onActiveStampChanged: activeRow.load()
+                            onStampChanged: activeRow.load()
+                        }
+
+                        MouseArea {
+                            id: activePress
+                            width: parent.width
+                            height: activeCard.height + Theme.paddingMedium
+                            onClicked: page.openRide(activeRow.ride)
+
+                            RideCard {
+                                id: activeCard
+                                x: Theme.horizontalPageMargin
+                                y: Theme.paddingSmall
+                                width: parent.width - 2 * Theme.horizontalPageMargin
+                                highlighted: activePress.pressed
+                                immediate: activeRow.ride.immediate === 1
+                                day: activeRow.ride.when_day || ""
+                                clock: activeRow.ride.when_clock || ""
+                                startAddress: activeRow.ride.start_address || ""
+                                endAddress: activeRow.ride.end_address || ""
+                                pickupKm: activeRow.ride.pickup_km || ""
+                                distanceKm: activeRow.ride.distance_km || ""
+                                fare: activeRow.fare
+                                euro: activeRow.euro
+                                server: activeRow.ride.server || ""
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         ViewPlaceholder {
-            enabled: page.count === 0 && page.hint !== ""
+            enabled: page.count === 0 && page.activeCount === 0 && page.hint !== ""
             text: page.hint
         }
 

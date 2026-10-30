@@ -2,6 +2,7 @@ package wallet
 
 import (
 	"encoding/json"
+	"io"
 	"math"
 	"net/http"
 	"strconv"
@@ -337,7 +338,7 @@ func TestClaimAndVerify(t *testing.T) {
 			}
 			etaMin = body.EtaMinutes
 			etaKm = body.EtaKm
-			_, _ = w.Write([]byte(`{"status":"accepted","pay_to":"addr_test1qx","fare_lovelace":2800000}`))
+			_, _ = w.Write([]byte(`{"status":"accepted","pay_to":"addr_test1qx","fare_lovelace":2800000,"start_address":"Prielmayerstraße","end_address":"Karlsplatz","start":{"lat":48.140833,"lng":11.555},"end":{"lat":48.150833,"lng":11.565},"distance_km":1.6,"pickup_time":"2026-11-01T09:00:00Z"}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -366,7 +367,7 @@ func TestClaimAndVerify(t *testing.T) {
 	if err := ClaimDrive("ready.example.com", "taken", "1.2"); err == nil || !strings.Contains(err.Error(), "no longer available") {
 		t.Fatalf("taken: %v", err)
 	}
-	if DriveClaimed("ready.example.com", "taken") != 0 {
+	if DriveClaimed("ready.example.com", "taken") != 0 || ActiveCount() != 0 {
 		t.Fatal("rejected claim was stored")
 	}
 	if err := ClaimDrive("ready.example.com", "9f2c01", "0.4"); err != nil {
@@ -381,6 +382,32 @@ func TestClaimAndVerify(t *testing.T) {
 	}
 	if DriveClaimed("Ready.example.com", "9f2c01") != 1 || DrivePaid("ready.example.com", "9f2c01") != 0 {
 		t.Fatal("claimed state")
+	}
+	if ActiveCount() != 1 {
+		t.Fatalf("active = %d", ActiveCount())
+	}
+	raw, err := ActiveRide(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var shown struct {
+		ID           string `json:"id"`
+		StartAddress string `json:"start_address"`
+		EndAddress   string `json:"end_address"`
+		PickupKm     string `json:"pickup_km"`
+		DistanceKm   string `json:"distance_km"`
+		Fare         string `json:"fare_lovelace"`
+		StartLat     string `json:"start_lat"`
+		EndLat       string `json:"end_lat"`
+	}
+	if err := json.Unmarshal([]byte(raw), &shown); err != nil {
+		t.Fatal(err)
+	}
+	if shown.ID != "9f2c01" || shown.StartAddress != "Prielmayerstraße" || shown.EndAddress != "Karlsplatz" || shown.PickupKm != "0.4" || shown.DistanceKm != "1.6" || shown.Fare != "2800000" || shown.StartLat != "48.140833" || shown.EndLat != "48.150833" {
+		t.Fatalf("active = %+v", shown)
+	}
+	if _, err := ActiveRide(1); err == nil {
+		t.Fatal("expected no second active ride")
 	}
 	prev := paymentSeen
 	t.Cleanup(func() { paymentSeen = prev })
@@ -409,6 +436,112 @@ func TestClaimAndVerify(t *testing.T) {
 	paid, err = VerifyDrive("ready.example.com", "9f2c01")
 	if err != nil || !paid || calls != 0 {
 		t.Fatalf("remembered = %v %v calls %d", paid, err, calls)
+	}
+}
+
+func TestCashOutAndReload(t *testing.T) {
+	setupTest(t)
+	var payoutBody string
+	var payoutKey string
+	serveKiko(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/v1/currency" && r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`{"currency":"cardano"}`))
+		case r.URL.Path == "/api/v1/driver" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/driver/drive/9f2c01":
+			_, _ = w.Write([]byte(`{"status":"accepted","pay_to":"addr1qy","fare_lovelace":2800000,"start_address":"Prielmayerstraße","end_address":"Karlsplatz","start":{"lat":48.14,"lng":11.55},"end":{"lat":48.15,"lng":11.56},"distance_km":1.6,"pickup_time":"2026-11-01T09:00:00Z","address_index":4,"script":"aabb"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/driver/drive/9f2c01":
+			_, _ = w.Write([]byte(`{"status":"paid","pay_to":"addr1qy","fare_lovelace":2800000,"start_address":"Prielmayerstraße","end_address":"Karlsplatz","start":{"lat":48.14,"lng":11.55},"end":{"lat":48.15,"lng":11.56},"distance_km":1.6,"pickup_time":"2026-11-01T09:00:00Z","eta_km":0.4,"address_index":4,"script":"aabb"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/driver/drive/9f2c01/payout":
+			payoutKey = r.Header.Get("X-Driver-Key")
+			raw, _ := io.ReadAll(r.Body)
+			payoutBody = string(raw)
+			_, _ = w.Write([]byte(`{"status":"paid_out"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	if err := SetupPin("42", "42"); err != nil {
+		t.Fatal(err)
+	}
+	if err := WalletCreate(0); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveCar("VW", "ID.3", "white", "B-KK 402", "2024"); err != nil {
+		t.Fatal(err)
+	}
+	if err := AddServer("ready.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveServerFees(0, "2", "0.5", "ada"); err != nil {
+		t.Fatal(err)
+	}
+	if msg, err := RegisterDrivers(); err != nil || msg != "" {
+		t.Fatalf("register: %q %v", msg, err)
+	}
+	if err := ClaimDrive("ready.example.com", "9f2c01", "0.4"); err != nil {
+		t.Fatal(err)
+	}
+	if err := CashOutDrive("ready.example.com", "9f2c01"); err == nil || err.Error() != "the ride is not paid" {
+		t.Fatalf("unpaid cash out: %v", err)
+	}
+	prevPay := paymentSeen
+	prevBuild := buildPayout
+	t.Cleanup(func() {
+		paymentSeen = prevPay
+		buildPayout = prevBuild
+	})
+	paymentSeen = func(Coin, string, string) (bool, error) { return true, nil }
+	if paid, err := VerifyDrive("ready.example.com", "9f2c01"); err != nil || !paid {
+		t.Fatal(err)
+	}
+	buildPayout = func(mnemonic, payTo, script string, index uint32) (string, error) {
+		if payTo != "addr1qy" || script != "aabb" || index != 4 || mnemonic == "" {
+			t.Fatalf("payout args %q %q %d", payTo, script, index)
+		}
+		return "abcd", nil
+	}
+	if err := CashOutDrive("ready.example.com", "9f2c01"); err != nil {
+		t.Fatal(err)
+	}
+	material, err := WalletMultisigMaterial(0)
+	if err != nil || payoutKey != material || payoutBody != `{"transaction":"abcd"}` {
+		t.Fatalf("posted %s %s", payoutKey, payoutBody)
+	}
+	if ActiveCount() != 0 {
+		t.Fatal("cashed-out ride is still active")
+	}
+
+	if err := ClaimDrive("ready.example.com", "9f2c01", "0.4"); err != nil {
+		t.Fatal(err)
+	}
+	clearHeld()
+	if ActiveCount() != 0 {
+		t.Fatal("clear did not empty the list")
+	}
+	if msg, err := RegisterDrivers(); err != nil || msg != "" {
+		t.Fatalf("reload register: %q %v", msg, err)
+	}
+	if ActiveCount() != 1 || DrivePaid("ready.example.com", "9f2c01") != 1 {
+		t.Fatalf("reloaded count %d paid %d", ActiveCount(), DrivePaid("ready.example.com", "9f2c01"))
+	}
+	raw, err := ActiveRide(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var shown struct {
+		Status   string `json:"status"`
+		PickupKm string `json:"pickup_km"`
+		Paid     int    `json:"paid"`
+	}
+	if err := json.Unmarshal([]byte(raw), &shown); err != nil {
+		t.Fatal(err)
+	}
+	if shown.Status != "paid" || shown.Paid != 1 || shown.PickupKm != "0.4" {
+		t.Fatalf("reloaded = %+v", shown)
 	}
 }
 

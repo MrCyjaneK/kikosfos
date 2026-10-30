@@ -31,14 +31,19 @@ Page {
     property bool working
     property bool claimed
     property bool paid
+    property string rideStatus
     property string notice
 
     Component.onCompleted: {
         refreshQuotes()
         claimed = kiko.driveClaimed(server, rideId) === 1
         paid = kiko.drivePaid(server, rideId) === 1
+        if (rideStatus === "" && paid)
+            rideStatus = "paid"
+        else if (rideStatus === "" && claimed)
+            rideStatus = "accepted"
         if (paid)
-            notice = "Paid"
+            notice = rideStatus === "paid_out" ? "Paid out" : "Paid"
     }
 
     function quoteParts(lovelace) {
@@ -72,7 +77,7 @@ Page {
         if (working)
             return
         working = true
-        notice = paid ? "Paid" : ""
+        notice = page.rideStatus === "paid_out" ? "Paid out" : (paid ? "Paid" : "")
         kiko.driveNavigate(lat, lon, title)
     }
 
@@ -92,6 +97,14 @@ Page {
         kiko.driveVerify(server, rideId)
     }
 
+    function cashOut() {
+        if (working || !paid || rideStatus === "paid_out")
+            return
+        working = true
+        notice = ""
+        kiko.driveCashOut(server, rideId)
+    }
+
     Connections {
         target: kiko
         onEuroReady: {
@@ -107,9 +120,10 @@ Page {
         }
         onClaimFinished: {
             page.working = false
-            if (message === "")
+            if (message === "") {
                 page.claimed = true
-            else
+                page.rideStatus = "accepted"
+            } else
                 page.notice = message
         }
         onDriveVerified: {
@@ -119,7 +133,17 @@ Page {
                 return
             }
             page.paid = seen === 1
+            if (page.paid)
+                page.rideStatus = "paid"
             page.notice = page.paid ? "Paid" : "Payment not seen yet"
+        }
+        onCashOutFinished: {
+            page.working = false
+            if (message === "") {
+                page.rideStatus = "paid_out"
+                page.notice = "Paid out"
+            } else
+                page.notice = message
         }
     }
 
@@ -260,7 +284,7 @@ Page {
             x: Theme.horizontalPageMargin
             wrapMode: Text.Wrap
             horizontalAlignment: Text.AlignHCenter
-            color: page.notice === "Paid" ? Theme.secondaryColor : Theme.highlightColor
+            color: page.notice === "Paid" || page.notice === "Paid out" ? Theme.secondaryColor : Theme.highlightColor
             font.pixelSize: Theme.fontSizeSmall
             text: page.notice
         }
@@ -293,6 +317,14 @@ Page {
             text: "To destination"
             enabled: !page.working
             onClicked: page.openNav(endLat, endLon, endAddress)
+        }
+
+        Button {
+            anchors.horizontalCenter: parent.horizontalCenter
+            visible: page.paid && page.rideStatus !== "paid_out"
+            text: "Cash out"
+            enabled: !page.working
+            onClicked: page.cashOut()
         }
 
         Item {

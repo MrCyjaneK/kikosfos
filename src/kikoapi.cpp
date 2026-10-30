@@ -611,6 +611,26 @@ void KikoApi::deliverDriveVerified(int seen, const QString &message)
     emit driveVerified(seen, message);
 }
 
+void KikoApi::driveCashOut(const QString &server, const QString &id)
+{
+    QPointer<KikoApi> self(this);
+    QByteArray serverUtf8 = utf8(server);
+    QByteArray idUtf8 = utf8(id);
+    QtConcurrent::run([self, serverUtf8, idUtf8]() mutable {
+        const QMutexLocker lock(&requestGate);
+        const QString message = takeKikoString(KIKO_drive_cash_out(serverUtf8.data(), idUtf8.data()));
+        if (!self)
+            return;
+        QMetaObject::invokeMethod(self.data(), "deliverCashOut", Qt::QueuedConnection,
+                                  Q_ARG(QString, message));
+    });
+}
+
+void KikoApi::deliverCashOut(const QString &message)
+{
+    emit cashOutFinished(message);
+}
+
 int KikoApi::driveClaimed(const QString &server, const QString &id)
 {
     QByteArray serverUtf8 = utf8(server);
@@ -623,6 +643,16 @@ int KikoApi::drivePaid(const QString &server, const QString &id)
     QByteArray serverUtf8 = utf8(server);
     QByteArray idUtf8 = utf8(id);
     return KIKO_drive_paid(serverUtf8.data(), idUtf8.data());
+}
+
+int KikoApi::driveActiveCount()
+{
+    return KIKO_drive_active_count();
+}
+
+QString KikoApi::driveActive(int index)
+{
+    return takeKikoString(KIKO_drive_active(index));
 }
 
 QString KikoApi::lastError()

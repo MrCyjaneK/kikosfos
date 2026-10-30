@@ -745,6 +745,16 @@ func KIKO_drive_claim(server, id, pickupKm *C.char) *C.char {
 	return cString("")
 }
 
+//export KIKO_drive_cash_out
+func KIKO_drive_cash_out(server, id *C.char) *C.char {
+	err := wallet.CashOutDrive(C.GoString(server), C.GoString(id))
+	setErr(err)
+	if err != nil {
+		return cString(err.Error())
+	}
+	return cString("")
+}
+
 //export KIKO_drive_verify
 func KIKO_drive_verify(server, id *C.char) *C.char {
 	paid, err := wallet.VerifyDrive(C.GoString(server), C.GoString(id))
@@ -768,6 +778,17 @@ func KIKO_drive_claimed(server, id *C.char) C.int {
 func KIKO_drive_paid(server, id *C.char) C.int {
 	setErr(nil)
 	return C.int(wallet.DrivePaid(C.GoString(server), C.GoString(id)))
+}
+
+//export KIKO_drive_active_count
+func KIKO_drive_active_count() C.int {
+	setErr(nil)
+	return C.int(wallet.ActiveCount())
+}
+
+//export KIKO_drive_active
+func KIKO_drive_active(index C.int) *C.char {
+	return driveText(index, wallet.ActiveRide)
 }
 
 //export KIKO_drive_navigate
