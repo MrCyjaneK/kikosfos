@@ -5,7 +5,10 @@ Page {
     id: page
     property int wallet
     property var coinPage
-    property string unit: lovelaceSwitch.checked ? "lovelace" : "ada"
+    property string whole: kiko.walletWhole(wallet)
+    property string atom: kiko.walletAtom(wallet)
+    property string ticker: kiko.walletTicker(wallet)
+    property string unit: atomSwitch.checked ? atom : whole
     property string ada
     property string lovelace
     property string eur
@@ -66,18 +69,18 @@ Page {
             }
 
             TextSwitch {
-                id: lovelaceSwitch
+                id: atomSwitch
                 width: parent.width
-                text: "Lovelace"
-                description: checked ? "Amount in lovelace" : "Amount in ADA"
+                text: page.atom.charAt(0).toUpperCase() + page.atom.slice(1)
+                description: checked ? "Amount in " + page.atom : "Amount in " + page.ticker
                 onCheckedChanged: page.refreshQuote()
             }
 
             TextField {
                 id: amountField
                 width: parent.width
-                placeholderText: page.unit === "lovelace" ? "Lovelace" : "ADA"
-                inputMethodHints: page.unit === "lovelace" ? Qt.ImhDigitsOnly : Qt.ImhFormattedNumbersOnly
+                placeholderText: page.unit === page.atom ? atomSwitch.text : page.ticker
+                inputMethodHints: page.unit === page.atom ? Qt.ImhDigitsOnly : Qt.ImhFormattedNumbersOnly
                 onTextChanged: page.refreshQuote()
             }
 
@@ -97,7 +100,7 @@ Page {
                 Label {
                     anchors.horizontalCenter: parent.horizontalCenter
                     visible: page.lovelace !== ""
-                    text: page.lovelace + " lovelace"
+                    text: page.lovelace + " " + page.atom
                     color: Theme.secondaryColor
                     font.pixelSize: Theme.fontSizeMedium
                 }
@@ -130,6 +133,7 @@ Page {
                     recipient: recipient.text.trim(),
                     ada: page.ada,
                     lovelace: page.lovelace,
+                    atom: page.atom,
                     eur: page.eur
                 })
             }

@@ -28,6 +28,7 @@ type serverRecord struct {
 type profileFile struct {
 	Car     Car            `json:"car"`
 	Servers []serverRecord `json:"servers"`
+	GPS     string         `json:"gps,omitempty"`
 }
 
 func emptyProfile() profileFile {

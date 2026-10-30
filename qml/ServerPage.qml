@@ -7,6 +7,9 @@ Page {
     property string host
     property string errorText
     property int coin: -1
+    property string whole
+    property string atom
+    property string ticker
     property string feeUnit: "ada"
     property bool euroTried
     property string baseEurLabel
@@ -23,15 +26,21 @@ Page {
         hostField.text = host
         coin = kiko.serverCoin(index)
         compatible = kiko.serverCompatible(index) === 1
+        if (coin >= 0) {
+            whole = kiko.walletWhole(coin)
+            atom = kiko.walletAtom(coin)
+            ticker = kiko.walletTicker(coin)
+            feeUnit = whole
+        }
         baseCrypto.text = fieldFromLovelace(kiko.serverFeeBase(index))
         perKmCrypto.text = fieldFromLovelace(kiko.serverFeePerKm(index))
         if (kiko.lastError() !== "")
             errorText = kiko.lastError()
     }
 
-    function stripAda(text) {
-        var suffix = " ADA"
-        if (text.length >= suffix.length && text.slice(-suffix.length) === suffix)
+    function stripTicker(text) {
+        var suffix = " " + ticker
+        if (ticker !== "" && text.length >= suffix.length && text.slice(-suffix.length) === suffix)
             return text.slice(0, text.length - suffix.length)
         return text
     }
@@ -39,12 +48,12 @@ Page {
     function fieldFromLovelace(lovelace) {
         if (lovelace === "" || coin < 0)
             return lovelace
-        var parts = kiko.walletQuote(coin, lovelace, "lovelace").split("\n")
+        var parts = kiko.walletQuote(coin, lovelace, atom).split("\n")
         if (parts.length > 3 && parts[3] !== "")
             return lovelace
-        if (feeUnit === "lovelace")
+        if (feeUnit === atom)
             return parts[1]
-        return stripAda(parts[0])
+        return stripTicker(parts[0])
     }
 
     function converted(text, fromUnit, toUnit) {
@@ -53,9 +62,9 @@ Page {
         var parts = kiko.walletQuote(coin, text, fromUnit).split("\n")
         if (parts.length > 3 && parts[3] !== "")
             return text
-        if (toUnit === "lovelace")
+        if (toUnit === atom)
             return parts[1]
-        return stripAda(parts[0])
+        return stripTicker(parts[0])
     }
 
     function quoteInto(text, unit, which) {
@@ -142,13 +151,13 @@ Page {
                 SectionHeader { text: "Price" }
 
                 TextSwitch {
-                    id: lovelaceSwitch
+                    id: atomSwitch
                     width: parent.width
-                    text: "Lovelace"
-                    description: checked ? "Amounts in lovelace" : "Amounts in ADA"
+                    text: page.atom.charAt(0).toUpperCase() + page.atom.slice(1)
+                    description: checked ? "Amounts in " + page.atom : "Amounts in " + page.ticker
                     onCheckedChanged: {
-                        var next = checked ? "lovelace" : "ada"
-                        if (next === page.feeUnit)
+                        var next = checked ? page.atom : page.whole
+                        if (next === "" || next === page.feeUnit)
                             return
                         var base = page.converted(baseCrypto.text, page.feeUnit, next)
                         var perKm = page.converted(perKmCrypto.text, page.feeUnit, next)
@@ -162,8 +171,8 @@ Page {
                     id: baseCrypto
                     width: parent.width
                     label: "Base fee"
-                    placeholderText: page.feeUnit === "lovelace" ? "Lovelace" : "ADA"
-                    inputMethodHints: page.feeUnit === "lovelace" ? Qt.ImhDigitsOnly : Qt.ImhFormattedNumbersOnly
+                    placeholderText: page.feeUnit === page.atom ? atomSwitch.text : page.ticker
+                    inputMethodHints: page.feeUnit === page.atom ? Qt.ImhDigitsOnly : Qt.ImhFormattedNumbersOnly
                     onTextChanged: page.quoteInto(text, page.feeUnit, "base")
                 }
 
@@ -188,8 +197,8 @@ Page {
                     id: perKmCrypto
                     width: parent.width
                     label: "Per km"
-                    placeholderText: page.feeUnit === "lovelace" ? "Lovelace" : "ADA"
-                    inputMethodHints: page.feeUnit === "lovelace" ? Qt.ImhDigitsOnly : Qt.ImhFormattedNumbersOnly
+                    placeholderText: page.feeUnit === page.atom ? atomSwitch.text : page.ticker
+                    inputMethodHints: page.feeUnit === page.atom ? Qt.ImhDigitsOnly : Qt.ImhFormattedNumbersOnly
                     onTextChanged: page.quoteInto(text, page.feeUnit, "perKm")
                 }
 

@@ -8,6 +8,7 @@ Page {
     property string recipient
     property string ada
     property string lovelace
+    property string atom
     property string eur
     property bool sending
     property string errorText
@@ -63,7 +64,7 @@ Page {
 
             Label {
                 anchors.horizontalCenter: parent.horizontalCenter
-                text: page.lovelace + " lovelace"
+                text: page.lovelace + " " + page.atom
                 color: Theme.secondaryColor
                 font.pixelSize: Theme.fontSizeMedium
             }

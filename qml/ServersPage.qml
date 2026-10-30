@@ -49,7 +49,7 @@ Page {
             return { amount: "", euro: "" }
         if (coin < 0)
             return { amount: lovelace, euro: "" }
-        var parts = kiko.walletQuote(coin, lovelace, "lovelace").split("\n")
+        var parts = kiko.walletQuote(coin, lovelace, kiko.walletAtom(coin)).split("\n")
         if (parts.length > 3 && parts[3] !== "")
             return { amount: lovelace, euro: "" }
         return { amount: parts[0], euro: parts[2] }

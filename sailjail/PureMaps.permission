@@ -1,0 +1,11 @@
+# -*- mode: sh -*-
+
+# x-sailjail-description = Pure Maps
+# x-sailjail-long-description = Show a pickup in Pure Maps
+
+dbus-user.talk io.github.rinigus.PureMaps
+dbus-user.call io.github.rinigus.PureMaps=io.github.rinigus.PureMaps.*@/io/github/rinigus/PureMaps
+dbus-user.call io.github.rinigus.PureMaps=io.github.rinigus.PureMaps.navigator.*@/io/github/rinigus/PureMaps/navigator
+
+dbus-user.talk com.jolla.lipstick
+dbus-user.call com.jolla.lipstick=org.sailfishos.fileservice.openUrl@/

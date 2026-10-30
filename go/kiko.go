@@ -113,6 +113,36 @@ func KIKO_wallet_name(index C.int) *C.char {
 	return cString(name)
 }
 
+//export KIKO_wallet_ticker
+func KIKO_wallet_ticker(index C.int) *C.char {
+	text, err := wallet.WalletTicker(int(index))
+	setErr(err)
+	if err != nil {
+		return nil
+	}
+	return cString(text)
+}
+
+//export KIKO_wallet_whole
+func KIKO_wallet_whole(index C.int) *C.char {
+	text, err := wallet.WalletWhole(int(index))
+	setErr(err)
+	if err != nil {
+		return nil
+	}
+	return cString(text)
+}
+
+//export KIKO_wallet_atom
+func KIKO_wallet_atom(index C.int) *C.char {
+	text, err := wallet.WalletAtom(int(index))
+	setErr(err)
+	if err != nil {
+		return nil
+	}
+	return cString(text)
+}
+
 //export KIKO_wallet_icon
 func KIKO_wallet_icon(index C.int, length *C.int) *C.uchar {
 	icon, err := wallet.WalletIcon(int(index))
@@ -532,6 +562,177 @@ func KIKO_apply_fees_eur(base, perKm *C.char) C.int {
 		return -1
 	}
 	return 0
+}
+
+//export KIKO_gps_driver
+func KIKO_gps_driver() *C.char {
+	text, err := wallet.GPSDriver()
+	setErr(err)
+	if err != nil {
+		return nil
+	}
+	return cString(text)
+}
+
+//export KIKO_gps_set_driver
+func KIKO_gps_set_driver(kind *C.char) C.int {
+	err := wallet.SetGPSDriver(C.GoString(kind))
+	setErr(err)
+	if err != nil {
+		return -1
+	}
+	return 0
+}
+
+//export KIKO_gps_position
+func KIKO_gps_position() *C.char {
+	text, err := wallet.GPSPosition()
+	setErr(err)
+	if err != nil {
+		return nil
+	}
+	return cString(text)
+}
+
+//export KIKO_gps_release
+func KIKO_gps_release() {
+	wallet.ReleaseGPS()
+	setErr(nil)
+}
+
+func driveText(index C.int, read func(int) (string, error)) *C.char {
+	text, err := read(int(index))
+	setErr(err)
+	if err != nil {
+		return nil
+	}
+	return cString(text)
+}
+
+//export KIKO_drive_register
+func KIKO_drive_register() *C.char {
+	text, err := wallet.RegisterDrivers()
+	setErr(err)
+	if err != nil {
+		return cString(err.Error())
+	}
+	return cString(text)
+}
+
+//export KIKO_drive_refresh
+func KIKO_drive_refresh(rangeKm C.double) *C.char {
+	err := wallet.RefreshDrives(float64(rangeKm))
+	setErr(err)
+	if err != nil {
+		return cString(err.Error())
+	}
+	return cString("")
+}
+
+//export KIKO_drive_count
+func KIKO_drive_count() C.int {
+	setErr(nil)
+	return C.int(wallet.DriveCount())
+}
+
+//export KIKO_drive_id
+func KIKO_drive_id(index C.int) *C.char {
+	return driveText(index, wallet.DriveID)
+}
+
+//export KIKO_drive_server
+func KIKO_drive_server(index C.int) *C.char {
+	return driveText(index, wallet.DriveServer)
+}
+
+//export KIKO_drive_coin
+func KIKO_drive_coin(index C.int) C.int {
+	n, err := wallet.DriveCoin(int(index))
+	setErr(err)
+	if err != nil {
+		return -1
+	}
+	return C.int(n)
+}
+
+//export KIKO_drive_start_address
+func KIKO_drive_start_address(index C.int) *C.char {
+	return driveText(index, wallet.DriveStartAddress)
+}
+
+//export KIKO_drive_end_address
+func KIKO_drive_end_address(index C.int) *C.char {
+	return driveText(index, wallet.DriveEndAddress)
+}
+
+//export KIKO_drive_pickup_km
+func KIKO_drive_pickup_km(index C.int) *C.char {
+	return driveText(index, wallet.DrivePickupKm)
+}
+
+//export KIKO_drive_distance_km
+func KIKO_drive_distance_km(index C.int) *C.char {
+	return driveText(index, wallet.DriveDistanceKm)
+}
+
+//export KIKO_drive_pickup_time
+func KIKO_drive_pickup_time(index C.int) *C.char {
+	return driveText(index, wallet.DrivePickupTime)
+}
+
+//export KIKO_drive_fare_lovelace
+func KIKO_drive_fare_lovelace(index C.int) *C.char {
+	return driveText(index, wallet.DriveFareLovelace)
+}
+
+//export KIKO_drive_base_lovelace
+func KIKO_drive_base_lovelace(index C.int) *C.char {
+	return driveText(index, wallet.DriveBaseLovelace)
+}
+
+//export KIKO_drive_per_km_lovelace
+func KIKO_drive_per_km_lovelace(index C.int) *C.char {
+	return driveText(index, wallet.DrivePerKmLovelace)
+}
+
+//export KIKO_drive_immediate
+func KIKO_drive_immediate(index C.int) C.int {
+	n, err := wallet.DriveImmediate(int(index))
+	setErr(err)
+	if err != nil {
+		return -1
+	}
+	return C.int(n)
+}
+
+//export KIKO_drive_when_day
+func KIKO_drive_when_day(index C.int) *C.char {
+	return driveText(index, wallet.DriveWhenDay)
+}
+
+//export KIKO_drive_when_clock
+func KIKO_drive_when_clock(index C.int) *C.char {
+	return driveText(index, wallet.DriveWhenClock)
+}
+
+//export KIKO_drive_start_lat
+func KIKO_drive_start_lat(index C.int) *C.char {
+	return driveText(index, wallet.DriveStartLat)
+}
+
+//export KIKO_drive_start_lon
+func KIKO_drive_start_lon(index C.int) *C.char {
+	return driveText(index, wallet.DriveStartLon)
+}
+
+//export KIKO_drive_navigate
+func KIKO_drive_navigate(lat, lon, title *C.char) *C.char {
+	err := wallet.StartNavigation(C.GoString(lat), C.GoString(lon), C.GoString(title))
+	setErr(err)
+	if err != nil {
+		return cString(err.Error())
+	}
+	return cString("")
 }
 
 func main() {}

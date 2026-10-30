@@ -1,0 +1,1840 @@
+package transaction
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/hex"
+	"fmt"
+	"io"
+
+	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/bsv-blockchain/go-sdk/transaction/chaintracker"
+	"github.com/bsv-blockchain/go-sdk/util"
+)
+
+// Beef is a set of Transactions and their MerklePaths.
+// Each Transaction can be RawTx, RawTxAndBumpIndex, or TxIDOnly.
+// It's useful when transporting multiple transactions all at once.
+// Txid only can be used in the case that the recipient already has that tx.
+type Beef struct {
+	Version      uint32
+	BUMPs        []*MerklePath
+	Transactions map[chainhash.Hash]*BeefTx
+	NewestTxID   *chainhash.Hash
+
+	// Values derived from the BUMPs, keyed by identity and computed on first
+	// use. Merging a graph asks the same questions of the same proofs over and
+	// over — what root does this prove, does it prove this txid — and answering
+	// them from Path each time dominated the merge.
+	derivedBumps map[*MerklePath]*derivedBump
+}
+
+// derivedBump caches what merging needs to know about one MerklePath.
+type derivedBump struct {
+	root   *chainhash.Hash
+	leaves map[chainhash.Hash]struct{}
+}
+
+func (b *Beef) derivedFor(bump *MerklePath) *derivedBump {
+	if b.derivedBumps == nil {
+		b.derivedBumps = make(map[*MerklePath]*derivedBump)
+	}
+	d, ok := b.derivedBumps[bump]
+	if !ok {
+		d = &derivedBump{}
+		b.derivedBumps[bump] = d
+	}
+	return d
+}
+
+// bumpRoot returns the merkle root bump proves, computing it at most once per
+// BEEF for as long as the proof's Path is unchanged.
+func (b *Beef) bumpRoot(bump *MerklePath) (*chainhash.Hash, error) {
+	d := b.derivedFor(bump)
+	if d.root == nil {
+		root, err := bump.ComputeRoot(nil)
+		if err != nil {
+			return nil, err
+		}
+		d.root = root
+	}
+	return d.root, nil
+}
+
+// bumpProves reports whether bump proves txid, backed by a leaf set built once
+// so that checking every transaction in the graph stays cheap.
+func (b *Beef) bumpProves(bump *MerklePath, txid *chainhash.Hash) bool {
+	if txid == nil || len(bump.Path) == 0 {
+		return false
+	}
+	d := b.derivedFor(bump)
+	if d.leaves == nil {
+		leaves := make(map[chainhash.Hash]struct{}, len(bump.Path[0]))
+		for _, leaf := range bump.Path[0] {
+			if leaf.Hash != nil {
+				leaves[*leaf.Hash] = struct{}{}
+			}
+		}
+		d.leaves = leaves
+	}
+	_, ok := d.leaves[*txid]
+	return ok
+}
+
+func NewBeef() *Beef {
+	return &Beef{
+		Version:      BEEF_V2,
+		BUMPs:        []*MerklePath{},
+		Transactions: make(map[chainhash.Hash]*BeefTx),
+	}
+}
+
+const (
+	BEEF_V1     = uint32(4022206465) // BRC-62
+	BEEF_V2     = uint32(4022206466) // BRC-96
+	ATOMIC_BEEF = uint32(0x01010101) // BRC-95
+)
+
+func (t *Transaction) FromBEEF(beef []byte) error {
+	tx, err := NewTransactionFromBEEF(beef)
+	if err != nil {
+		return fmt.Errorf("failed to parse BEEF bytes: %w", err)
+	}
+	if tx == nil {
+		return fmt.Errorf("BEEF contains no raw transaction")
+	}
+	*t = *tx
+	return nil
+}
+
+func NewBeefV1() *Beef {
+	return newEmptyBeef(BEEF_V1)
+}
+
+func NewBeefV2() *Beef {
+	return newEmptyBeef(BEEF_V2)
+}
+
+func newEmptyBeef(version uint32) *Beef {
+	return &Beef{
+		Version:      version,
+		BUMPs:        []*MerklePath{},
+		Transactions: make(map[chainhash.Hash]*BeefTx),
+	}
+}
+
+func readBeefTxIDOnly(reader *bytes.Reader, beefTx *BeefTx) (*chainhash.Hash, error) {
+	var txid chainhash.Hash
+	if _, err := io.ReadFull(reader, txid[:]); err != nil {
+		return nil, err
+	}
+	beefTx.KnownTxID = &txid
+	return &txid, nil
+}
+
+func readBeefTxFull(reader *bytes.Reader, beefTx *BeefTx, BUMPs []*MerklePath, txs map[chainhash.Hash]*BeefTx) (*chainhash.Hash, error) {
+	bump := beefTx.DataFormat == RawTxAndBumpIndex
+	var bumpIndex util.VarInt
+	if bump {
+		if _, err := bumpIndex.ReadFrom(reader); err != nil {
+			return nil, err
+		}
+		if uint64(bumpIndex) >= uint64(len(BUMPs)) {
+			return nil, fmt.Errorf("BEEF transaction references BUMP index %d but only %d BUMPs are present", uint64(bumpIndex), len(BUMPs))
+		}
+		beefTx.BumpIndex = int(bumpIndex)
+	}
+
+	if _, err := beefTx.Transaction.ReadFrom(reader); err != nil {
+		return nil, err
+	}
+
+	if bump {
+		beefTx.Transaction.MerklePath = BUMPs[int(bumpIndex)]
+	}
+
+	for _, input := range beefTx.Transaction.Inputs {
+		// A source held as a bare txid has no transaction to link to. Linking one
+		// anyway leaves the input pointing at something it cannot spend.
+		if sourceObj, ok := txs[*input.SourceTXID]; ok && sourceObj.Transaction != nil {
+			input.SourceTransaction = sourceObj.Transaction
+		}
+	}
+
+	return beefTx.Transaction.TxID(), nil
+}
+
+func readBeefTx(reader *bytes.Reader, BUMPs []*MerklePath) (*map[chainhash.Hash]*BeefTx, *chainhash.Hash, error) {
+	var numberOfTransactions util.VarInt
+	if _, err := numberOfTransactions.ReadFrom(reader); err != nil {
+		return nil, nil, err
+	}
+	// A V2 entry is at least a data-format byte and a minimal 10-byte raw
+	// transaction. Guarding the count prevents malformed VarInts from driving
+	// excessive parsing before the byte-slice reader can report an EOF.
+	if err := guardParseCount(reader, uint64(numberOfTransactions), 11, "BEEF transactions"); err != nil {
+		return nil, nil, err
+	}
+
+	txs := make(map[chainhash.Hash]*BeefTx, 0)
+	var lastTxID *chainhash.Hash
+	for i := uint64(0); i < uint64(numberOfTransactions); i++ {
+		formatByte, err := reader.ReadByte()
+		if err != nil {
+			return nil, nil, err
+		}
+		beefTx := BeefTx{
+			DataFormat: DataFormat(formatByte),
+		}
+		if beefTx.DataFormat > TxIDOnly {
+			return nil, nil, fmt.Errorf("invalid data format: %d", formatByte)
+		}
+
+		var txid *chainhash.Hash
+		if beefTx.DataFormat == TxIDOnly {
+			// A TxIDOnly entry has no transaction, only a txid. Leave
+			// Transaction nil, matching what MergeTxidOnly builds in memory: an
+			// empty placeholder would be a transaction with no inputs and no
+			// outputs, which every consumer of a raw entry then has to defend
+			// against.
+			txid, err = readBeefTxIDOnly(reader, &beefTx)
+		} else {
+			beefTx.Transaction = &Transaction{}
+			txid, err = readBeefTxFull(reader, &beefTx, BUMPs, txs)
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		txs[*txid] = &beefTx
+		lastTxID = txid
+	}
+
+	return &txs, lastTxID, nil
+}
+
+func NewBeefFromHex(beefHex string) (*Beef, error) {
+	beef, err := hex.DecodeString(beefHex)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode beef hex: %w", err)
+	}
+	return NewBeefFromBytes(beef)
+}
+
+// NewBeefFromBytes parses a BEEF prefix. For AtomicBEEF it also requires the
+// declared subject to be present, but does not validate the complete graph,
+// scripts, proof roots, or trust in txid-only entries.
+func NewBeefFromBytes(beef []byte) (*Beef, error) {
+	if len(beef) >= 4 && binary.LittleEndian.Uint32(beef[:4]) == ATOMIC_BEEF {
+		b, _, err := NewBeefFromAtomicBytes(beef)
+		return b, err
+	}
+	return newBeefFromBytes(beef)
+}
+
+// newBeefFromBytes parses the inner V1/V2 prefix, never another Atomic wrapper.
+func newBeefFromBytes(beef []byte) (*Beef, error) {
+	reader := bytes.NewReader(beef)
+	version, err := readVersion(reader)
+	if err != nil {
+		return nil, err
+	}
+
+	if version == BEEF_V1 {
+		BUMPs, v1Err := readBUMPs(reader)
+		if v1Err != nil {
+			return nil, v1Err
+		}
+
+		txs, lastTx, v1Err := readAllTransactions(reader, BUMPs)
+		if v1Err != nil {
+			return nil, v1Err
+		}
+
+		// Convert the V1 transactions into V2-shaped entries. The parser attaches
+		// the exact BUMP pointer selected by each encoded index, which is the only
+		// reliable way to retain that index when multiple proofs include a txid.
+		beefTxs := make(map[chainhash.Hash]*BeefTx, len(txs))
+		bumpIndexes := make(map[*MerklePath]int, len(BUMPs))
+		for i, bump := range BUMPs {
+			bumpIndexes[bump] = i
+		}
+		for _, tx := range txs {
+			// Compute the txid once per transaction and reuse it; the tx is not
+			// mutated in this loop, and TxID() re-serializes + double-hashes the
+			// whole transaction on every call.
+			txid := tx.TxID()
+			if tx.MerklePath != nil {
+				idx, ok := bumpIndexes[tx.MerklePath]
+				if !ok {
+					return nil, fmt.Errorf("BEEF transaction references an unknown BUMP")
+				}
+				beefTxs[*txid] = &BeefTx{
+					DataFormat:  RawTxAndBumpIndex,
+					Transaction: tx,
+					BumpIndex:   idx,
+				}
+			} else {
+				beefTxs[*txid] = &BeefTx{
+					DataFormat:  RawTx,
+					Transaction: tx,
+				}
+			}
+		}
+
+		var newestTxID *chainhash.Hash
+		if lastTx != nil {
+			newestTxID = lastTx.TxID()
+		}
+
+		return &Beef{
+			Version:      version,
+			BUMPs:        BUMPs,
+			Transactions: beefTxs,
+			NewestTxID:   newestTxID,
+		}, nil
+	}
+
+	BUMPs, err := readBUMPs(reader)
+	if err != nil {
+		return nil, err
+	}
+
+	txs, lastTxID, err := readBeefTx(reader, BUMPs)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Beef{
+		Version:      version,
+		BUMPs:        BUMPs,
+		Transactions: *txs,
+		NewestTxID:   lastTxID,
+	}, nil
+}
+
+// NewBeefFromAtomicBytes parses an AtomicBEEF prefix and binds the subject to
+// an included entry. Presence is not graph validation or SPV verification.
+func NewBeefFromAtomicBytes(beef []byte) (*Beef, *chainhash.Hash, error) {
+	if len(beef) < 36 {
+		return nil, nil, fmt.Errorf("provided atomic BEEF length (%d) is too short", len(beef))
+	}
+	if version := binary.LittleEndian.Uint32(beef[:4]); version != ATOMIC_BEEF {
+		return nil, nil, fmt.Errorf("version %d is not atomic BEEF", version)
+	}
+	txid, err := chainhash.NewHash(beef[4:36])
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid txid: %w", err)
+	}
+	b, err := newBeefFromBytes(beef[36:])
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid BEEF: %w", err)
+	}
+	if _, ok := b.Transactions[*txid]; !ok {
+		return nil, nil, fmt.Errorf("atomic BEEF subject %s is missing", txid.String())
+	}
+	b.NewestTxID = txid
+	return b, txid, nil
+}
+
+func ParseBeef(beefBytes []byte) (*Beef, *Transaction, *chainhash.Hash, error) {
+	if len(beefBytes) < 4 {
+		return nil, nil, nil, fmt.Errorf("invalid-version")
+	}
+	version := binary.LittleEndian.Uint32(beefBytes[:4])
+	switch version {
+	case ATOMIC_BEEF:
+		b, txid, err := NewBeefFromAtomicBytes(beefBytes)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		tx := b.FindTransactionByHash(txid)
+		if tx == nil {
+			return nil, nil, nil, fmt.Errorf("atomic BEEF raw subject %s is unavailable", txid.String())
+		}
+		return b, tx, txid, nil
+	case BEEF_V1:
+		if tx, err := NewTransactionFromBEEF(beefBytes); err != nil {
+			return nil, nil, nil, err
+		} else if tx == nil {
+			return newEmptyBeef(BEEF_V1), nil, nil, nil
+		} else if b, err := NewBeefFromTransaction(tx); err != nil {
+			return nil, nil, nil, err
+		} else {
+			return b, tx, tx.TxID(), nil
+		}
+	case BEEF_V2:
+		if beef, err := NewBeefFromBytes(beefBytes); err != nil {
+			return nil, nil, nil, err
+		} else {
+			tx := beef.FindTransactionByHash(beef.NewestTxID)
+			return beef, tx, beef.NewestTxID, nil
+		}
+	default:
+		return nil, nil, nil, fmt.Errorf("invalid-atomic-beef")
+	}
+}
+
+func NewBeefFromTransaction(t *Transaction) (*Beef, error) {
+	if t == nil {
+		return nil, fmt.Errorf("transaction is nil")
+	}
+	beef := NewBeefV2()
+	bumpMap := map[uint32]int{}
+	txid := t.TxID()
+	txns := map[chainhash.Hash]*Transaction{*txid: t}
+	ancestors, err := t.collectAncestors(txid, txns, false)
+	if err != nil {
+		return nil, err
+	}
+	for _, txid := range ancestors {
+		tx := txns[txid]
+		if tx.MerklePath == nil {
+			continue
+		}
+		if bumpIdx, ok := bumpMap[tx.MerklePath.BlockHeight]; !ok {
+			bumpMap[tx.MerklePath.BlockHeight] = len(beef.BUMPs)
+			beef.BUMPs = append(beef.BUMPs, tx.MerklePath)
+		} else {
+			err = beef.BUMPs[bumpIdx].Combine(tx.MerklePath)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	for _, txid := range ancestors {
+		tx := txns[txid]
+		beefTx := &BeefTx{
+			Transaction: tx,
+		}
+		if tx.MerklePath != nil {
+			beefTx.DataFormat = RawTxAndBumpIndex
+			beefTx.BumpIndex = bumpMap[tx.MerklePath.BlockHeight]
+		} else {
+			beefTx.DataFormat = RawTx
+		}
+		beef.Transactions[txid] = beefTx
+	}
+	return beef, nil
+}
+
+func readVersion(reader *bytes.Reader) (uint32, error) {
+	var version uint32
+	err := binary.Read(reader, binary.LittleEndian, &version)
+	if err != nil {
+		return 0, err
+	}
+	if version != BEEF_V1 && version != BEEF_V2 {
+		return 0, fmt.Errorf("invalid BEEF version. expected %d or %d, received %d", BEEF_V1, BEEF_V2, version)
+	}
+	return version, nil
+}
+
+func readBUMPs(reader *bytes.Reader) ([]*MerklePath, error) {
+	var numberOfBUMPs util.VarInt
+	_, err := numberOfBUMPs.ReadFrom(reader)
+	if err != nil {
+		return nil, err
+	}
+
+	// A BUMP is at least a block-height varint (>=1 byte) plus a tree-height byte.
+	if err = guardParseCount(reader, uint64(numberOfBUMPs), 2, "BEEF BUMPs"); err != nil {
+		return nil, err
+	}
+	BUMPs := make([]*MerklePath, numberOfBUMPs)
+	for i := 0; i < int(numberOfBUMPs); i++ {
+		BUMPs[i], err = NewMerklePathFromReader(reader)
+		if err != nil {
+			return nil, err
+		}
+		if len(BUMPs[i].Path) == 0 {
+			return nil, fmt.Errorf("BEEF BUMP at index %d has no path levels", i)
+		}
+	}
+	return BUMPs, nil
+}
+
+func readTransactionsGetLast(reader *bytes.Reader, BUMPs []*MerklePath) (*Transaction, error) {
+	_, tx, err := readAllTransactions(reader, BUMPs)
+	if err != nil {
+		return nil, err
+	}
+	return tx, nil
+}
+
+func readAllTransactions(reader *bytes.Reader, BUMPs []*MerklePath) (map[string]*Transaction, *Transaction, error) {
+	var numberOfTransactions util.VarInt
+	_, err := numberOfTransactions.ReadFrom(reader)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Each BEEF entry is at least a 10-byte transaction plus a has-bump byte, so
+	// a count larger than the remaining bytes can accommodate is malformed. This
+	// also keeps the uint64 count from being silently truncated by an int loop
+	// bound.
+	if err = guardParseCount(reader, uint64(numberOfTransactions), 10, "BEEF transactions"); err != nil {
+		return nil, nil, err
+	}
+
+	transactions := make(map[string]*Transaction, 0)
+	var tx *Transaction
+	for i := uint64(0); i < uint64(numberOfTransactions); i++ {
+		tx = &Transaction{}
+		_, err = tx.ReadFrom(reader)
+		if err != nil {
+			return nil, nil, err
+		}
+		txid := tx.TxID()
+		hasBump := make([]byte, 1)
+		_, err = reader.Read(hasBump)
+		if err != nil {
+			return nil, nil, err
+		}
+		if hasBump[0] > 1 {
+			return nil, nil, fmt.Errorf("invalid BEEF transaction hasBump value: %d", hasBump[0])
+		}
+		if hasBump[0] == 1 {
+			var pathIndex util.VarInt
+			_, err = pathIndex.ReadFrom(reader)
+			if err != nil {
+				return nil, nil, err
+			}
+			if uint64(pathIndex) >= uint64(len(BUMPs)) {
+				return nil, nil, fmt.Errorf("BEEF transaction references BUMP index %d but only %d BUMPs are present", uint64(pathIndex), len(BUMPs))
+			}
+			tx.MerklePath = BUMPs[int(pathIndex)]
+		}
+		for _, input := range tx.Inputs {
+			sourceTxid := input.SourceTXID.String()
+			if sourceObj, ok := transactions[sourceTxid]; ok {
+				input.SourceTransaction = sourceObj
+			}
+		}
+		transactions[txid.String()] = tx
+	}
+
+	return transactions, tx, nil
+}
+
+func NewTransactionFromBEEFHex(beefHex string) (*Transaction, error) {
+	if beef, err := hex.DecodeString(beefHex); err != nil {
+		return nil, err
+	} else {
+		return NewTransactionFromBEEF(beef)
+	}
+}
+
+func (t *Transaction) BEEF() ([]byte, error) {
+	b := new(bytes.Buffer)
+	err := binary.Write(b, binary.LittleEndian, BEEF_V1)
+	if err != nil {
+		return nil, err
+	}
+	bumps := []*MerklePath{}
+	bumpMap := map[uint32]int{}
+	txns := map[chainhash.Hash]*Transaction{*t.TxID(): t}
+	ancestors, err := t.collectAncestors(nil, txns, false)
+	if err != nil {
+		return nil, err
+	}
+	for _, txid := range ancestors {
+		tx := txns[txid]
+		if tx.MerklePath == nil {
+			continue
+		}
+		if _, ok := bumpMap[tx.MerklePath.BlockHeight]; !ok {
+			bumpMap[tx.MerklePath.BlockHeight] = len(bumps)
+			bumps = append(bumps, tx.MerklePath)
+		} else {
+			err := bumps[bumpMap[tx.MerklePath.BlockHeight]].Combine(tx.MerklePath)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	b.Write(util.VarInt(len(bumps)).Bytes())
+	for _, bump := range bumps {
+		b.Write(bump.Bytes())
+	}
+	b.Write(util.VarInt(len(txns)).Bytes())
+	for _, txid := range ancestors {
+		tx := txns[txid]
+		b.Write(tx.Bytes())
+		if tx.MerklePath != nil {
+			b.Write([]byte{1})
+			b.Write(util.VarInt(bumpMap[tx.MerklePath.BlockHeight]).Bytes()) //nolint:gosec // G115 -- bump index is bounded by number of BUMPs, always non-negative
+		} else {
+			b.Write([]byte{0})
+		}
+	}
+	return b.Bytes(), nil
+}
+
+func (t *Transaction) BEEFHex() (string, error) {
+	if beef, err := t.BEEF(); err != nil {
+		return "", err
+	} else {
+		return hex.EncodeToString(beef), nil
+	}
+}
+
+// collectAncestors returns the txids of t and its unmined ancestors in
+// topological order (parents before children), populating txns along the way.
+// Each transaction is visited once, so shared ancestors in deep unconfirmed
+// chains cost O(txs + inputs) rather than O(paths through the DAG).
+func (t *Transaction) collectAncestors(txid *chainhash.Hash, txns map[chainhash.Hash]*Transaction, allowPartial bool) ([]chainhash.Hash, error) {
+	if txid == nil {
+		txid = t.TxID()
+	}
+	ancestors := make([]chainhash.Hash, 0)
+	visited := make(map[chainhash.Hash]struct{})
+	if err := t.walkAncestors(txid, txns, allowPartial, visited, &ancestors); err != nil {
+		return nil, err
+	}
+	return ancestors, nil
+}
+
+func (t *Transaction) walkAncestors(txid *chainhash.Hash, txns map[chainhash.Hash]*Transaction, allowPartial bool, visited map[chainhash.Hash]struct{}, ancestors *[]chainhash.Hash) error {
+	visited[*txid] = struct{}{}
+	if t.MerklePath != nil {
+		*ancestors = append(*ancestors, *txid)
+		return nil
+	}
+	for _, input := range t.Inputs {
+		if input.SourceTransaction == nil {
+			if allowPartial {
+				continue
+			}
+			return fmt.Errorf("missing previous transaction for %s", txid)
+		}
+		txns[*input.SourceTXID] = input.SourceTransaction
+	}
+	// Later inputs' ancestors are emitted first, matching the historical ordering.
+	for i := len(t.Inputs) - 1; i >= 0; i-- {
+		input := t.Inputs[i]
+		if input.SourceTransaction == nil {
+			continue
+		}
+		if _, ok := visited[*input.SourceTXID]; ok {
+			continue
+		}
+		if err := input.SourceTransaction.walkAncestors(input.SourceTXID, txns, allowPartial, visited, ancestors); err != nil {
+			return err
+		}
+	}
+	*ancestors = append(*ancestors, *txid)
+	return nil
+}
+
+func (b *Beef) FindBumpByHash(txid *chainhash.Hash) *MerklePath {
+	if txid == nil {
+		return nil
+	}
+	for _, bump := range b.BUMPs {
+		if b.bumpProves(bump, txid) {
+			return bump
+		}
+	}
+	return nil
+}
+
+func (b *Beef) FindBump(txid string) *MerklePath {
+	idHash, err := chainhash.NewHashFromHex(txid)
+	if err != nil {
+		return nil
+	}
+	return b.FindBumpByHash(idHash)
+}
+
+func (b *Beef) FindTransactionByHash(txid *chainhash.Hash) *Transaction {
+	if beefTx := b.findTxid(txid); beefTx != nil {
+		return beefTx.Transaction
+	}
+	return nil
+}
+
+func (b *Beef) FindTransaction(txid string) *Transaction {
+	idHash, err := chainhash.NewHashFromHex(txid)
+	if err != nil {
+		return nil
+	}
+	return b.FindTransactionByHash(idHash)
+}
+
+func (b *Beef) FindTransactionForSigningByHash(txid *chainhash.Hash) *Transaction {
+	beefTx := b.findTxid(txid)
+	if beefTx == nil {
+		return nil
+	}
+
+	for _, input := range beefTx.Transaction.Inputs {
+		if input.SourceTransaction == nil {
+			itx := b.findTxid(input.SourceTXID)
+			if itx != nil {
+				input.SourceTransaction = itx.Transaction
+			}
+		}
+	}
+
+	return beefTx.Transaction
+}
+
+func (b *Beef) FindTransactionForSigning(txid string) *Transaction {
+	idHash, err := chainhash.NewHashFromHex(txid)
+	if err != nil {
+		return nil
+	}
+	return b.FindTransactionForSigningByHash(idHash)
+}
+
+func (b *Beef) FindAtomicTransactionByHash(txid *chainhash.Hash) *Transaction {
+	beefTx := b.findTxid(txid)
+	if beefTx == nil || beefTx.DataFormat == TxIDOnly || beefTx.Transaction == nil {
+		return nil
+	}
+
+	// An ancestry is a DAG, so the same parent is reached by many paths. Without
+	// visited, resolving a transaction whose ancestors fan back together walks
+	// the same subgraph once per path.
+	visited := make(map[chainhash.Hash]struct{})
+
+	var addInputProof func(beef *Beef, txid *chainhash.Hash, tx *Transaction)
+	addInputProof = func(beef *Beef, txid *chainhash.Hash, tx *Transaction) {
+		if txid == nil {
+			txid = tx.TxID()
+		}
+		if _, seen := visited[*txid]; seen {
+			return
+		}
+		visited[*txid] = struct{}{}
+
+		// Preserve an explicit wire proof reference when multiple BUMPs contain
+		// this transaction. Proof discovery is only for entries without an index.
+		var mp *MerklePath
+		if entry := beef.findTxid(txid); entry != nil && entry.DataFormat == RawTxAndBumpIndex {
+			if entry.BumpIndex >= 0 && entry.BumpIndex < len(beef.BUMPs) {
+				mp = beef.BUMPs[entry.BumpIndex]
+			}
+		} else {
+			mp = beef.FindBumpByHash(txid)
+		}
+		if mp != nil {
+			tx.MerklePath = mp
+			return
+		}
+
+		for _, input := range tx.Inputs {
+			if input.SourceTransaction == nil {
+				itx := beef.findTxid(input.SourceTXID)
+				if itx != nil {
+					input.SourceTransaction = itx.Transaction
+				}
+			}
+			if input.SourceTransaction == nil {
+				continue
+			}
+			// SourceTXID identifies SourceTransaction, so it stands in for a
+			// TxID() call that would re-serialize and re-hash the parent. The
+			// recursive call attaches the parent's own proof if it has one.
+			addInputProof(beef, input.SourceTXID, input.SourceTransaction)
+		}
+	}
+
+	addInputProof(b, txid, beefTx.Transaction)
+
+	return beefTx.Transaction
+}
+
+func (b *Beef) FindAtomicTransaction(txid string) *Transaction {
+	idHash, err := chainhash.NewHashFromHex(txid)
+	if err != nil {
+		return nil
+	}
+	return b.FindAtomicTransactionByHash(idHash)
+}
+
+func (b *Beef) MergeBump(bump *MerklePath) int {
+	bumpIndex := -1
+	var incomingRoot *chainhash.Hash
+
+	for i, existingBump := range b.BUMPs {
+		if existingBump == bump {
+			return i
+		}
+		if existingBump.BlockHeight == bump.BlockHeight {
+			if incomingRoot == nil {
+				root, err := bump.ComputeRoot(nil)
+				if err != nil {
+					return -1
+				}
+				incomingRoot = root
+			}
+			existingRoot, err := b.bumpRoot(existingBump)
+			if err != nil {
+				return -1
+			}
+			if existingRoot.IsEqual(incomingRoot) {
+				existingBump.combineVerified(bump)
+				b.derivedFor(existingBump).leaves = nil
+				bumpIndex = i
+				break
+			}
+		}
+	}
+
+	if bumpIndex < 0 {
+		bumpIndex = len(b.BUMPs)
+		b.BUMPs = append(b.BUMPs, bump)
+	}
+
+	merged := b.BUMPs[bumpIndex]
+	for txid, tx := range b.Transactions {
+		if tx.Transaction != nil && tx.Transaction.MerklePath == nil && b.bumpProves(merged, &txid) {
+			tx.Transaction.MerklePath = merged
+		}
+	}
+
+	return bumpIndex
+}
+
+func (b *Beef) findTxid(txid *chainhash.Hash) *BeefTx {
+	if txid == nil {
+		return nil
+	}
+	if tx, ok := b.Transactions[*txid]; ok {
+		return tx
+	}
+	return nil
+}
+
+func (b *Beef) MakeTxidOnly(txid *chainhash.Hash) *BeefTx {
+	if txid == nil {
+		return nil
+	}
+	tx, ok := b.Transactions[*txid]
+	if !ok {
+		return nil
+	}
+	if tx.DataFormat == TxIDOnly {
+		return tx
+	}
+	tx = &BeefTx{
+		DataFormat: TxIDOnly,
+		KnownTxID:  txid,
+	}
+	b.Transactions[*txid] = tx
+	return tx
+}
+
+func (b *Beef) MergeRawTx(rawTx []byte, bumpIndex *int) (*BeefTx, error) {
+	tx := &Transaction{}
+	reader := bytes.NewReader(rawTx)
+	_, err := tx.ReadFrom(reader)
+	if err != nil {
+		return nil, err
+	}
+
+	txid := tx.TxID()
+	b.RemoveExistingTxid(txid)
+
+	beefTx := &BeefTx{
+		DataFormat:  RawTx,
+		Transaction: tx,
+	}
+
+	if bumpIndex != nil {
+		if *bumpIndex < 0 || *bumpIndex >= len(b.BUMPs) {
+			return nil, fmt.Errorf("invalid bump index")
+		}
+		beefTx.Transaction.MerklePath = b.BUMPs[*bumpIndex]
+		beefTx.DataFormat = RawTxAndBumpIndex
+		beefTx.BumpIndex = *bumpIndex
+	}
+
+	b.Transactions[*txid] = beefTx
+	b.tryToValidateBumpIndex(beefTx, txid)
+
+	return beefTx, nil
+}
+
+// RemoveExistingTxid removes an existing transaction from the BEEF, given its TXID
+func (b *Beef) RemoveExistingTxid(txid *chainhash.Hash) {
+	if txid != nil {
+		delete(b.Transactions, *txid)
+	}
+}
+
+func (b *Beef) tryToValidateBumpIndex(tx *BeefTx, txid *chainhash.Hash) {
+	if tx.DataFormat == TxIDOnly || tx.Transaction == nil || tx.Transaction.MerklePath == nil {
+		return
+	}
+	for _, node := range tx.Transaction.MerklePath.Path[0] {
+		if node.Hash != nil && node.Hash.Equal(*txid) {
+			return
+		}
+	}
+	tx.Transaction.MerklePath = nil
+}
+
+func (b *Beef) MergeTransaction(tx *Transaction) (*BeefTx, error) {
+	return b.MergeTransactionWithTxid(tx.TxID(), tx)
+}
+
+// MergeTransactionWithTxid merges a transaction when the txid is already known (avoids recomputing TxID)
+func (b *Beef) MergeTransactionWithTxid(txid *chainhash.Hash, tx *Transaction) (*BeefTx, error) {
+	// A transaction ancestry is a DAG, not a tree: the same ancestor is
+	// reachable by many paths, and without this check each path re-merges it
+	// and re-walks everything above it, which is exponential in the depth.
+	if existing := b.findTxid(txid); b.mergeWouldNotChange(existing, tx) {
+		return existing, nil
+	}
+
+	b.RemoveExistingTxid(txid)
+
+	var bumpIndex *int
+	if tx.MerklePath != nil {
+		index := b.MergeBump(tx.MerklePath)
+		bumpIndex = &index
+	}
+
+	newTx := &BeefTx{
+		DataFormat:  RawTx,
+		Transaction: tx,
+	}
+	if bumpIndex != nil {
+		newTx.DataFormat = RawTxAndBumpIndex
+		newTx.BumpIndex = *bumpIndex
+	}
+
+	b.Transactions[*txid] = newTx
+	b.tryToValidateBumpIndex(newTx, txid)
+
+	if bumpIndex == nil {
+		for _, input := range tx.Inputs {
+			if input.SourceTransaction == nil {
+				continue
+			}
+			if _, err := b.MergeTransaction(input.SourceTransaction); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return newTx, nil
+}
+
+// mergeWouldNotChange reports whether merging tx over the already-stored
+// existing entry would leave the graph as it is, making the merge — and the
+// ancestry walk below it — skippable.
+func (b *Beef) mergeWouldNotChange(existing *BeefTx, tx *Transaction) bool {
+	if existing == nil || existing.Transaction == nil || existing.DataFormat == TxIDOnly {
+		return false
+	}
+
+	// The incoming copy carries a proof the stored one lacks.
+	if tx.MerklePath != nil && existing.DataFormat != RawTxAndBumpIndex {
+		return false
+	}
+
+	// A proved transaction is terminal: its ancestry is never walked.
+	if existing.DataFormat == RawTxAndBumpIndex {
+		return true
+	}
+
+	// Otherwise the incoming copy is only worth merging if it can contribute an
+	// ancestor the graph does not already hold as a raw transaction.
+	for _, input := range tx.Inputs {
+		if input.SourceTransaction == nil {
+			continue
+		}
+		if input.SourceTXID == nil {
+			return false
+		}
+		if src := b.findTxid(input.SourceTXID); src == nil || src.DataFormat == TxIDOnly {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (b *Beef) MergeTxidOnly(txid *chainhash.Hash) *BeefTx {
+	if txid == nil {
+		return nil
+	}
+	tx := b.findTxid(txid)
+	if tx == nil {
+		tx = &BeefTx{
+			DataFormat: TxIDOnly,
+			KnownTxID:  txid,
+		}
+		b.Transactions[*txid] = tx
+	}
+	return tx
+}
+
+func (b *Beef) MergeBeefTx(btx *BeefTx) (*BeefTx, error) {
+	if btx == nil || btx.Transaction == nil {
+		return nil, fmt.Errorf("nil transaction")
+	}
+	beefTx := b.findTxid(btx.Transaction.TxID())
+	if btx.DataFormat == TxIDOnly && beefTx == nil {
+		beefTx = b.MergeTxidOnly(btx.KnownTxID)
+	} else if btx.Transaction != nil && (beefTx == nil || beefTx.DataFormat == TxIDOnly) {
+		var err error
+		beefTx, err = b.MergeTransaction(btx.Transaction)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return beefTx, nil
+}
+
+// MergeBeefTxWithTxid merges a BeefTx when the txid is already known (avoids recomputing TxID)
+func (b *Beef) MergeBeefTxWithTxid(txid *chainhash.Hash, btx *BeefTx) (*BeefTx, error) {
+	if btx == nil {
+		return nil, fmt.Errorf("nil BeefTx")
+	}
+	beefTx := b.findTxid(txid)
+	if btx.DataFormat == TxIDOnly && beefTx == nil {
+		beefTx = b.MergeTxidOnly(btx.KnownTxID)
+	} else if btx.Transaction != nil && (beefTx == nil || beefTx.DataFormat == TxIDOnly) {
+		var err error
+		beefTx, err = b.MergeTransactionWithTxid(txid, btx.Transaction)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return beefTx, nil
+}
+
+func (b *Beef) MergeBeefBytes(beef []byte) error {
+	otherBeef, err := NewBeefFromBytes(beef)
+	if err != nil {
+		return err
+	}
+	return b.MergeBeef(otherBeef)
+}
+
+func (b *Beef) MergeBeef(otherBeef *Beef) error {
+	for _, bump := range otherBeef.BUMPs {
+		b.MergeBump(bump)
+	}
+
+	for txid, tx := range otherBeef.Transactions {
+		txidCopy := txid
+		if _, err := b.MergeBeefTxWithTxid(&txidCopy, tx); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+type verifyResult struct {
+	valid bool
+	roots map[uint32]string
+}
+
+func (b *Beef) IsValid(allowTxidOnly bool) bool {
+	r := b.verifyValid(allowTxidOnly)
+	return r.valid
+}
+
+func (b *Beef) Verify(ctx context.Context, chainTracker chaintracker.ChainTracker, allowTxidOnly bool) (bool, error) {
+	r := b.verifyValid(allowTxidOnly)
+	if !r.valid {
+		return false, nil
+	}
+	for height, root := range r.roots {
+		h, err := chainhash.NewHashFromHex(root)
+		if err != nil {
+			return false, err
+		}
+		ok, err := chainTracker.IsValidRootForHeight(ctx, h, height)
+		if err != nil || !ok {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// ValidationResult contains the results of transaction validation
+type ValidationResult struct {
+	Valid             []string // Transactions that are fully validated
+	NotValid          []string // Transactions that cannot be validated
+	TxidOnly          []string // Transactions represented only by txid
+	WithMissingInputs []string // Transactions with inputs not in BEEF
+	MissingInputs     []string // Input txids that are missing
+}
+
+// ValidateTransactions validates the transactions in this BEEF and sorts them by dependency order.
+// It returns a ValidationResult containing the validation status of each transaction.
+//
+// Validation rules:
+// - Transactions with merkle paths are automatically valid
+// - Transactions without merkle paths must have all inputs traceable to transactions with merkle paths
+// - For DataFormat == RawTx or TxIDOnly, checks if the txid appears in BUMPs (has proof)
+// - For DataFormat == RawTxAndBumpIndex, verifies the bump index is accurate
+func (b *Beef) ValidateTransactions() *ValidationResult {
+	// Build a map of txids that appear in BUMPs (have proof)
+	txidsInBumps := make(map[chainhash.Hash]bool)
+	for _, bump := range b.BUMPs {
+		if len(bump.Path) > 0 {
+			// Check level 0 (leaf level) for transaction hashes
+			for _, elem := range bump.Path[0] {
+				if elem.Hash != nil && elem.Txid != nil && *elem.Txid {
+					txidsInBumps[*elem.Hash] = true
+				}
+			}
+		}
+	}
+
+	result := &ValidationResult{
+		MissingInputs:     []string{},
+		NotValid:          []string{},
+		Valid:             []string{},
+		WithMissingInputs: []string{},
+		TxidOnly:          []string{},
+	}
+
+	// Maps for tracking
+	validTxids := make(map[chainhash.Hash]bool)
+	missingInputs := make(map[chainhash.Hash]bool)
+
+	// Lists for processing
+	var hasProof []*BeefTx
+	var txidOnly []*BeefTx
+	var needsValidation []*BeefTx
+	var withMissingInputs []*BeefTx
+
+	// First pass: categorize transactions
+	for txid, beefTx := range b.Transactions {
+		switch beefTx.DataFormat {
+		case TxIDOnly:
+			// TxIDOnly transactions are valid if they appear in BUMPs
+			if beefTx.KnownTxID != nil && txidsInBumps[*beefTx.KnownTxID] {
+				validTxids[*beefTx.KnownTxID] = true
+				txidOnly = append(txidOnly, beefTx)
+			} else {
+				// TxIDOnly without proof - add to txidOnly list but not valid
+				txidOnly = append(txidOnly, beefTx)
+			}
+		case RawTxAndBumpIndex:
+			// Verify the bump index is accurate
+			if beefTx.BumpIndex >= 0 && beefTx.BumpIndex < len(b.BUMPs) {
+				bump := b.BUMPs[beefTx.BumpIndex]
+				// Check if this transaction appears in the specified bump
+				foundInBump := false
+				for _, elem := range bump.Path[0] {
+					if elem.Hash != nil && elem.Hash.Equal(txid) {
+						foundInBump = true
+						break
+					}
+				}
+				if foundInBump {
+					validTxids[txid] = true
+					hasProof = append(hasProof, beefTx)
+				} else {
+					// Invalid bump index - treat as needing validation
+					needsValidation = append(needsValidation, beefTx)
+				}
+			} else {
+				// Invalid bump index - treat as needing validation
+				needsValidation = append(needsValidation, beefTx)
+			}
+		case RawTx:
+			// RawTx is valid if it appears in a BUMP
+			if txidsInBumps[txid] {
+				validTxids[txid] = true
+				hasProof = append(hasProof, beefTx)
+			} else if beefTx.Transaction != nil {
+				// Check if all inputs are available
+				hasMissing := false
+				for _, input := range beefTx.Transaction.Inputs {
+					if _, exists := b.Transactions[*input.SourceTXID]; !exists {
+						missingInputs[*input.SourceTXID] = true
+						hasMissing = true
+					}
+				}
+				if hasMissing {
+					withMissingInputs = append(withMissingInputs, beefTx)
+				} else {
+					needsValidation = append(needsValidation, beefTx)
+				}
+			}
+		}
+	}
+
+	// Iteratively validate transactions that depend on other transactions
+	for len(needsValidation) > 0 {
+		progress := false
+		var stillNeedsValidation []*BeefTx
+
+		for _, beefTx := range needsValidation {
+			// Check if all inputs are valid
+			allInputsValid := true
+			if beefTx.Transaction != nil {
+				for _, input := range beefTx.Transaction.Inputs {
+					if !validTxids[*input.SourceTXID] {
+						allInputsValid = false
+						break
+					}
+				}
+			}
+
+			if allInputsValid {
+				validTxids[*beefTx.Transaction.TxID()] = true
+				hasProof = append(hasProof, beefTx)
+				progress = true
+			} else {
+				stillNeedsValidation = append(stillNeedsValidation, beefTx)
+			}
+		}
+
+		needsValidation = stillNeedsValidation
+		if !progress {
+			// No progress made - remaining transactions are not valid
+			for _, beefTx := range needsValidation {
+				if beefTx.Transaction != nil {
+					result.NotValid = append(result.NotValid, beefTx.Transaction.TxID().String())
+				}
+			}
+			break
+		}
+	}
+
+	// Populate result lists
+	// Add transactions with missing inputs
+	for _, beefTx := range withMissingInputs {
+		if beefTx.Transaction != nil {
+			txid := beefTx.Transaction.TxID().String()
+			result.WithMissingInputs = append(result.WithMissingInputs, txid)
+		}
+	}
+
+	// Add txid-only transactions
+	result.TxidOnly = make([]string, 0, len(txidOnly))
+	for _, beefTx := range txidOnly {
+		var txidHash *chainhash.Hash
+		if beefTx.KnownTxID != nil {
+			txidHash = beefTx.KnownTxID
+		} else if beefTx.Transaction != nil {
+			txidHash = beefTx.Transaction.TxID()
+		} else {
+			continue
+		}
+		result.TxidOnly = append(result.TxidOnly, txidHash.String())
+		if validTxids[*txidHash] {
+			result.Valid = append(result.Valid, txidHash.String())
+		}
+	}
+
+	// Add valid transactions with proofs (in dependency order)
+	for _, beefTx := range hasProof {
+		if beefTx.Transaction != nil {
+			result.Valid = append(result.Valid, beefTx.Transaction.TxID().String())
+		}
+	}
+
+	// Populate missing inputs list
+	result.MissingInputs = make([]string, 0, len(missingInputs))
+	for txid := range missingInputs {
+		result.MissingInputs = append(result.MissingInputs, txid.String())
+	}
+
+	return result
+}
+
+func (b *Beef) verifyValid(allowTxidOnly bool) verifyResult {
+	r := verifyResult{valid: false, roots: map[uint32]string{}}
+
+	// Validate and sort transactions
+	vr := b.ValidateTransactions()
+
+	// Check if validation passed
+	if len(vr.MissingInputs) > 0 ||
+		len(vr.NotValid) > 0 ||
+		(len(vr.TxidOnly) > 0 && !allowTxidOnly) ||
+		len(vr.WithMissingInputs) > 0 {
+		return r
+	}
+
+	// Build valid txids set
+	txids := make(map[string]bool)
+	for _, txid := range vr.Valid {
+		txids[txid] = true
+	}
+
+	confirmComputedRoot := func(mp *MerklePath, txid string) bool {
+		h, err := chainhash.NewHashFromHex(txid)
+		if err != nil {
+			return false
+		}
+		root, err := mp.ComputeRoot(h)
+		if err != nil {
+			return false
+		}
+		if existing, ok := r.roots[mp.BlockHeight]; ok && existing != root.String() {
+			return false
+		}
+		r.roots[mp.BlockHeight] = root.String()
+		return true
+	}
+
+	// Verify all BUMPs have consistent roots
+	for _, mp := range b.BUMPs {
+		for _, n := range mp.Path[0] {
+			if n.Txid != nil && *n.Txid && n.Hash != nil {
+				if !confirmComputedRoot(mp, n.Hash.String()) {
+					return r
+				}
+			}
+		}
+	}
+
+	// Verify all transactions with BumpIndex have matching txid in the BUMP
+	for txid, beefTx := range b.Transactions {
+		if beefTx.DataFormat == RawTxAndBumpIndex {
+			if beefTx.BumpIndex < 0 || beefTx.BumpIndex >= len(b.BUMPs) {
+				return r
+			}
+			bump := b.BUMPs[beefTx.BumpIndex]
+			found := false
+			for _, leaf := range bump.Path[0] {
+				if leaf.Hash != nil && *leaf.Hash == txid {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return r
+			}
+		}
+	}
+
+	r.valid = true
+	return r
+}
+
+// ToLogString returns a summary of `Beef` contents as multi-line string for debugging purposes.
+func (b *Beef) ToLogString() string {
+	var log string
+	log += fmt.Sprintf(
+		"BEEF with %d BUMPs and %d Transactions, isValid %t\n", len(b.BUMPs),
+		len(b.Transactions),
+		b.IsValid(true),
+	)
+	for i, bump := range b.BUMPs {
+		log += fmt.Sprintf("  BUMP %d\n    block: %d\n    txids: [\n", i, bump.BlockHeight)
+		for _, node := range bump.Path[0] {
+			if node.Txid != nil {
+				log += fmt.Sprintf("      '%s',\n", node.Hash.String())
+			}
+		}
+		log += "    ]\n"
+	}
+
+txLoop:
+	for i, tx := range b.Transactions {
+		switch tx.DataFormat {
+		case RawTx:
+			log += fmt.Sprintf("  TX %d\n    txid: %s\n", i, tx.Transaction.TxID().String())
+			log += fmt.Sprintf("    rawTx length=%d\n", len(tx.Transaction.Bytes()))
+		case RawTxAndBumpIndex:
+			log += fmt.Sprintf("  TX %d\n    txid: %s\n", i, tx.Transaction.TxID().String())
+			log += fmt.Sprintf("    bumpIndex: %d\n", tx.Transaction.MerklePath.BlockHeight)
+			log += fmt.Sprintf("    rawTx length=%d\n", len(tx.Transaction.Bytes()))
+		case TxIDOnly:
+			log += fmt.Sprintf("  TX %d\n    txid: %s\n", i, tx.KnownTxID.String())
+			log += "    txidOnly\n"
+			continue txLoop
+		}
+
+		if len(tx.Transaction.Inputs) > 0 {
+			log += "    inputs: [\n"
+			for _, input := range tx.Transaction.Inputs {
+				log += fmt.Sprintf("      '%s',\n", input.SourceTXID.String())
+			}
+			log += fmt.Sprintf("    rawTx length=%d\n", len(tx.Transaction.Bytes()))
+			if len(tx.Transaction.Inputs) > 0 {
+				log += "    inputs: [\n"
+				for _, input := range tx.Transaction.Inputs {
+					log += fmt.Sprintf("      '%s',\n", input.SourceTXID.String())
+				}
+				log += "    ]\n"
+			}
+		}
+	}
+	return log
+}
+
+// Clone creates a deep copy of the Beef object.
+// All nested structures are copied, so modifications to the clone
+// will not affect the original.
+func (b *Beef) Clone() *Beef {
+	c := &Beef{
+		Version:      b.Version,
+		BUMPs:        make([]*MerklePath, len(b.BUMPs)),
+		Transactions: make(map[chainhash.Hash]*BeefTx, len(b.Transactions)),
+	}
+
+	// Deep clone BUMPs
+	for i, mp := range b.BUMPs {
+		c.BUMPs[i] = mp.Clone()
+	}
+
+	// First pass: ShallowClone all Transactions
+	for txid, beefTx := range b.Transactions {
+		cloned := &BeefTx{
+			DataFormat: beefTx.DataFormat,
+			BumpIndex:  beefTx.BumpIndex,
+		}
+
+		if beefTx.KnownTxID != nil {
+			id := *beefTx.KnownTxID
+			cloned.KnownTxID = &id
+		}
+
+		if beefTx.InputTxids != nil {
+			cloned.InputTxids = make([]*chainhash.Hash, len(beefTx.InputTxids))
+			for i, inputTxid := range beefTx.InputTxids {
+				if inputTxid != nil {
+					id := *inputTxid
+					cloned.InputTxids[i] = &id
+				}
+			}
+		}
+
+		if beefTx.Transaction != nil {
+			cloned.Transaction = beefTx.Transaction.ShallowClone()
+			// Link to cloned BUMP
+			if beefTx.DataFormat == RawTxAndBumpIndex && beefTx.BumpIndex >= 0 && beefTx.BumpIndex < len(c.BUMPs) {
+				cloned.Transaction.MerklePath = c.BUMPs[beefTx.BumpIndex]
+			}
+		}
+
+		c.Transactions[txid] = cloned
+	}
+
+	// Second pass: wire up SourceTransaction references
+	for _, beefTx := range c.Transactions {
+		if beefTx.Transaction != nil {
+			for _, input := range beefTx.Transaction.Inputs {
+				if input.SourceTXID != nil {
+					if sourceBeefTx, ok := c.Transactions[*input.SourceTXID]; ok && sourceBeefTx.Transaction != nil {
+						input.SourceTransaction = sourceBeefTx.Transaction
+					}
+				}
+			}
+		}
+	}
+
+	return c
+}
+
+func (b *Beef) TrimknownTxIDs(knownTxIDs []string) {
+	knownTxIDSet := make(map[string]struct{}, len(knownTxIDs))
+	for _, txid := range knownTxIDs {
+		knownTxIDSet[txid] = struct{}{}
+	}
+
+	for txid, tx := range b.Transactions {
+		if tx.DataFormat == TxIDOnly {
+			if _, ok := knownTxIDSet[txid.String()]; ok {
+				delete(b.Transactions, txid)
+			}
+		}
+	}
+
+	// Trim unreferenced BUMP proofs
+	b.trimUnreferencedBumps()
+}
+
+// trimUnreferencedBumps removes BUMP proofs that are no longer referenced by any remaining transactions
+func (b *Beef) trimUnreferencedBumps() {
+	if len(b.BUMPs) == 0 {
+		return
+	}
+
+	// Track which BUMP indices are still referenced by remaining transactions
+	usedBumpIndices := make(map[int]bool)
+
+	// Build a set of transaction IDs that need BUMPs
+	txidsNeedingBumps := make(map[chainhash.Hash]bool)
+
+	for txid, tx := range b.Transactions {
+		switch tx.DataFormat {
+		case RawTxAndBumpIndex:
+			// Direct BUMP reference
+			usedBumpIndices[tx.BumpIndex] = true
+		case RawTx:
+			// Raw transaction without explicit BUMP - we need to check if any BUMP references this txid
+			txidsNeedingBumps[txid] = true
+		case TxIDOnly:
+			// Known transaction ID - we need to check if any BUMP references this txid
+			if tx.KnownTxID != nil {
+				txidsNeedingBumps[*tx.KnownTxID] = true
+			}
+		}
+	}
+
+	// Check each BUMP to see if it's needed for any of the txids
+	for bumpIndex, bump := range b.BUMPs {
+		if bump != nil && len(bump.Path) > 0 && len(bump.Path[0]) > 0 {
+			// Get the transaction ID from the first path element (leaf level)
+			for _, leaf := range bump.Path[0] {
+				if leaf.Hash != nil {
+					if txidsNeedingBumps[*leaf.Hash] {
+						usedBumpIndices[bumpIndex] = true
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// If all BUMPs are still in use, no trimming needed
+	if len(usedBumpIndices) == len(b.BUMPs) {
+		return
+	}
+
+	// Build new BUMP slice with only referenced BUMPs
+	newBumps := make([]*MerklePath, 0, len(usedBumpIndices))
+	bumpIndexMapping := make(map[int]int) // old index -> new index
+
+	for oldIndex := 0; oldIndex < len(b.BUMPs); oldIndex++ {
+		if usedBumpIndices[oldIndex] {
+			newIndex := len(newBumps)
+			newBumps = append(newBumps, b.BUMPs[oldIndex])
+			bumpIndexMapping[oldIndex] = newIndex
+		}
+	}
+
+	// Update BUMP indices in remaining transactions
+	for _, tx := range b.Transactions {
+		if tx.DataFormat == RawTxAndBumpIndex {
+			if newIndex, exists := bumpIndexMapping[tx.BumpIndex]; exists {
+				tx.BumpIndex = newIndex
+			}
+		}
+	}
+
+	// Replace the BUMP slice
+	b.BUMPs = newBumps
+}
+
+func (b *Beef) GetValidTxids() []string {
+	r := b.ValidateTransactions()
+	return r.Valid
+}
+
+// AddComputedLeaves adds leaves that can be computed from row zero to the BUMP MerklePaths.
+func (b *Beef) AddComputedLeaves() {
+	for _, bump := range b.BUMPs {
+		bump.ComputeMissingHashes()
+	}
+}
+
+// Bytes serializes BEEF using b.Version (BRC-62 for V1, BRC-96 for V2).
+// V1 cannot represent txid-only entries; callers must explicitly select V2.
+func (b *Beef) Bytes() ([]byte, error) {
+	if b.Version != BEEF_V1 && b.Version != BEEF_V2 {
+		return nil, fmt.Errorf("invalid BEEF version: %d", b.Version)
+	}
+	// Check map keys before using them to resolve dependency edges. The identity
+	// of a raw entry is always derived from its transaction bytes.
+	for id, tx := range b.Transactions {
+		actual, err := beefEntryID(tx)
+		if err != nil {
+			return nil, err
+		}
+		if id != *actual {
+			return nil, fmt.Errorf("BEEF map key %s does not match transaction %s", id.String(), actual.String())
+		}
+		if tx.DataFormat == TxIDOnly && b.Version == BEEF_V1 {
+			return nil, fmt.Errorf("BEEF V1 cannot serialize txid-only transaction %s", id.String())
+		}
+		if tx.DataFormat == RawTxAndBumpIndex && (tx.BumpIndex < 0 || tx.BumpIndex >= len(b.BUMPs)) {
+			return nil, fmt.Errorf("invalid BEEF BUMP index: %d", tx.BumpIndex)
+		}
+	}
+
+	visited := make(map[chainhash.Hash]bool, len(b.Transactions))
+	visiting := make(map[chainhash.Hash]bool, len(b.Transactions))
+	var orderedTxBytes [][]byte
+	var collectTx func(id chainhash.Hash) error
+	collectTx = func(id chainhash.Hash) error {
+		if visited[id] {
+			return nil
+		}
+		if visiting[id] {
+			return fmt.Errorf("cyclic BEEF transaction dependency: %s", id.String())
+		}
+		visiting[id] = true
+		tx := b.Transactions[id]
+		if tx.DataFormat != TxIDOnly {
+			for _, input := range tx.Transaction.Inputs {
+				if _, ok := b.Transactions[*input.SourceTXID]; ok {
+					if err := collectTx(*input.SourceTXID); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		orderedTxBytes = append(orderedTxBytes, tx.beefBytes(b.Version))
+		visited[id] = true
+		delete(visiting, id)
+		return nil
+	}
+	// Retain the parsed subject as the final entry whenever dependency ordering
+	// permits it. A map's iteration order must not change the implicit V1 target.
+	for id := range b.Transactions {
+		if b.NewestTxID != nil && id == *b.NewestTxID {
+			continue
+		}
+		if err := collectTx(id); err != nil {
+			return nil, err
+		}
+	}
+	if b.NewestTxID != nil {
+		if _, ok := b.Transactions[*b.NewestTxID]; ok {
+			if err := collectTx(*b.NewestTxID); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	bumpBytes := make([][]byte, len(b.BUMPs))
+	totalLen := 4 + util.VarInt(len(b.BUMPs)).Length() + util.VarInt(len(orderedTxBytes)).Length()
+	for i, bump := range b.BUMPs {
+		if err := validateBeefBump(bump); err != nil {
+			return nil, fmt.Errorf("BEEF BUMP %d: %w", i, err)
+		}
+		bumpBytes[i] = bump.Bytes()
+		totalLen += len(bumpBytes[i])
+	}
+	for _, txBytes := range orderedTxBytes {
+		totalLen += len(txBytes)
+	}
+
+	beef := make([]byte, 0, totalLen)
+	beef = binary.LittleEndian.AppendUint32(beef, b.Version)
+	beef = append(beef, util.VarInt(len(b.BUMPs)).Bytes()...)
+	for _, bb := range bumpBytes {
+		beef = append(beef, bb...)
+	}
+	beef = append(beef, util.VarInt(len(orderedTxBytes)).Bytes()...)
+	for _, txBytes := range orderedTxBytes {
+		beef = append(beef, txBytes...)
+	}
+	return beef, nil
+}
+
+// beefEntryID validates the representation before serialization or selection.
+func beefEntryID(tx *BeefTx) (*chainhash.Hash, error) {
+	if tx == nil {
+		return nil, fmt.Errorf("BEEF transaction is nil")
+	}
+	switch tx.DataFormat {
+	case TxIDOnly:
+		if tx.KnownTxID == nil {
+			return nil, fmt.Errorf("txid is nil")
+		}
+		return tx.KnownTxID, nil
+	case RawTx, RawTxAndBumpIndex:
+		if tx.Transaction == nil {
+			return nil, fmt.Errorf("transaction is nil")
+		}
+		if err := validateBeefTxIO(tx.Transaction); err != nil {
+			return nil, err
+		}
+		return tx.Transaction.TxID(), nil
+	default:
+		return nil, fmt.Errorf("invalid BEEF data format: %d", tx.DataFormat)
+	}
+}
+
+func validateBeefTxIO(tx *Transaction) error {
+	for _, input := range tx.Inputs {
+		if input == nil || input.SourceTXID == nil {
+			return fmt.Errorf("BEEF transaction input or source txid is nil")
+		}
+	}
+	for _, output := range tx.Outputs {
+		if output == nil || output.LockingScript == nil {
+			return fmt.Errorf("BEEF transaction output or locking script is nil")
+		}
+	}
+	return nil
+}
+
+// validateBeefBump checks representability only, not Merkle proof validity.
+func validateBeefBump(bump *MerklePath) error {
+	if bump == nil || len(bump.Path) == 0 || len(bump.Path) > 255 {
+		return fmt.Errorf("BUMP must have between 1 and 255 path levels")
+	}
+	for _, level := range bump.Path {
+		for _, leaf := range level {
+			if leaf == nil || (leaf.Hash == nil && (leaf.Duplicate == nil || !*leaf.Duplicate)) {
+				return fmt.Errorf("BUMP leaf or non-duplicate hash is nil")
+			}
+		}
+	}
+	return nil
+}
+
+// beefBytes requires a validated entry and a supported version.
+func (tx *BeefTx) beefBytes(version uint32) []byte {
+	if tx.DataFormat == TxIDOnly {
+		return append([]byte{byte(TxIDOnly)}, tx.KnownTxID[:]...)
+	}
+	raw := tx.Transaction.Bytes()
+	var flags []byte
+	if tx.DataFormat == RawTxAndBumpIndex {
+		flags = append([]byte{1}, util.VarInt(tx.BumpIndex).Bytes()...) //nolint:gosec // G115 -- Bytes validates the non-negative BUMP index
+	} else {
+		flags = []byte{0}
+	}
+	if version == BEEF_V1 {
+		return append(raw, flags...)
+	}
+	return append(flags, raw...)
+}
+
+// AtomicBytes serializes the subject and its available ancestry, stopping at
+// txid-only entries or a matching BUMP. The caller's BEEF is not modified.
+// This is structural serialization; it does not validate scripts, header roots,
+// or the receiver's trust in txid-only entries, and can contain missing inputs.
+func (b *Beef) AtomicBytes(txid *chainhash.Hash) ([]byte, error) {
+	if txid == nil {
+		return nil, fmt.Errorf("atomic BEEF txid is nil")
+	}
+	selected, err := b.selectAtomicBeef(txid)
+	if err != nil {
+		return nil, err
+	}
+	beef, err := selected.Bytes()
+	if err != nil {
+		return nil, err
+	}
+	result := make([]byte, 4+chainhash.HashSize+len(beef))
+	binary.LittleEndian.PutUint32(result[0:4], ATOMIC_BEEF)
+	copy(result[4:4+chainhash.HashSize], txid[:])
+	copy(result[4+chainhash.HashSize:], beef)
+	return result, nil
+}
+
+// selectAtomicBeef copies the subject and available ancestry, remapping BUMP
+// indexes and stopping at txid-only entries or a matching BUMP leaf.
+func (b *Beef) selectAtomicBeef(txid *chainhash.Hash) (*Beef, error) {
+	if _, ok := b.Transactions[*txid]; !ok {
+		return nil, fmt.Errorf("atomic BEEF subject %s is missing", txid.String())
+	}
+	selected := newEmptyBeef(b.Version)
+	selected.NewestTxID = txid
+	bumpIndexes := make(map[int]int)
+	stack := []chainhash.Hash{*txid}
+	for len(stack) > 0 {
+		id := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if _, ok := selected.Transactions[id]; ok {
+			continue
+		}
+		tx, err := b.beefTxAt(id)
+		if err != nil {
+			return nil, err
+		}
+		copyTx := *tx
+		selected.Transactions[id] = &copyTx
+		stop, err := b.includeAtomicBump(&copyTx, id, selected, bumpIndexes)
+		if err != nil {
+			return nil, err
+		}
+		if !stop {
+			stack = b.appendAtomicAncestry(tx, stack)
+		}
+	}
+	return selected, nil
+}
+
+func (b *Beef) beefTxAt(id chainhash.Hash) (*BeefTx, error) {
+	tx := b.Transactions[id]
+	actual, err := beefEntryID(tx)
+	if err != nil {
+		return nil, err
+	}
+	if id != *actual {
+		return nil, fmt.Errorf("BEEF map key %s does not match transaction %s", id.String(), actual.String())
+	}
+	return tx, nil
+}
+
+// includeAtomicBump remaps a referenced BUMP into selected. stop is true for
+// txid-only entries and for a matching non-duplicate leaf.
+func (b *Beef) includeAtomicBump(tx *BeefTx, id chainhash.Hash, selected *Beef, bumpIndexes map[int]int) (bool, error) {
+	if tx.DataFormat == TxIDOnly {
+		return true, nil
+	}
+	if tx.DataFormat != RawTxAndBumpIndex {
+		return false, nil
+	}
+	if tx.BumpIndex < 0 || tx.BumpIndex >= len(b.BUMPs) || b.BUMPs[tx.BumpIndex] == nil {
+		return false, fmt.Errorf("invalid BEEF BUMP index: %d", tx.BumpIndex)
+	}
+	bump := b.BUMPs[tx.BumpIndex]
+	if err := validateBeefBump(bump); err != nil {
+		return false, err
+	}
+	index, ok := bumpIndexes[tx.BumpIndex]
+	if !ok {
+		index = len(selected.BUMPs)
+		bumpIndexes[tx.BumpIndex] = index
+		selected.BUMPs = append(selected.BUMPs, bump)
+	}
+	tx.BumpIndex = index
+	return bumpHasMatchingLeaf(bump, id), nil
+}
+
+func bumpHasMatchingLeaf(bump *MerklePath, id chainhash.Hash) bool {
+	if len(bump.Path) == 0 {
+		return false
+	}
+	for _, leaf := range bump.Path[0] {
+		if leaf.Hash != nil && (leaf.Duplicate == nil || !*leaf.Duplicate) && *leaf.Hash == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *Beef) appendAtomicAncestry(tx *BeefTx, stack []chainhash.Hash) []chainhash.Hash {
+	for _, input := range tx.Transaction.Inputs {
+		if _, ok := b.Transactions[*input.SourceTXID]; ok {
+			stack = append(stack, *input.SourceTXID)
+		}
+	}
+	return stack
+}
+
+func (b *Beef) TxidOnly() (*Beef, error) {
+	c := &Beef{
+		Version:      b.Version,
+		BUMPs:        append([]*MerklePath(nil), b.BUMPs...),
+		Transactions: make(map[chainhash.Hash]*BeefTx, len(b.Transactions)),
+	}
+	for txid, tx := range b.Transactions {
+		idOnly := &BeefTx{
+			DataFormat: TxIDOnly,
+		}
+		if tx.DataFormat == TxIDOnly {
+			idOnly.KnownTxID = tx.KnownTxID
+		} else {
+			idOnly.KnownTxID = tx.Transaction.TxID()
+		}
+		c.Transactions[txid] = idOnly
+	}
+	return c, nil
+}

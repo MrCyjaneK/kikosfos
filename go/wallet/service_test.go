@@ -19,6 +19,8 @@ func setupTest(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
+		resetGPS()
+		resetDrives()
 		clearSession()
 		storeMu.Lock()
 		currentStore = nil
@@ -28,7 +30,7 @@ func setupTest(t *testing.T) {
 }
 
 func TestRegistry(t *testing.T) {
-	if WalletCount() != 1 {
+	if WalletCount() != 2 {
 		t.Fatalf("count = %d", WalletCount())
 	}
 	name, err := WalletName(0)
@@ -39,8 +41,45 @@ func TestRegistry(t *testing.T) {
 	if err != nil || len(icon) < 8 || string(icon[:8]) != "\x89PNG\r\n\x1a\n" {
 		t.Fatal(err)
 	}
-	if _, err := WalletName(1); err == nil {
+	whole, err := WalletWhole(0)
+	if err != nil || whole != "ada" {
+		t.Fatalf("whole = %q %v", whole, err)
+	}
+	atom, err := WalletAtom(0)
+	if err != nil || atom != "lovelace" {
+		t.Fatalf("atom = %q %v", atom, err)
+	}
+	name, err = WalletName(1)
+	if err != nil || name != "Bitcoin SV" {
+		t.Fatalf("name = %q %v", name, err)
+	}
+	icon, err = WalletIcon(1)
+	if err != nil || len(icon) < 8 || string(icon[:8]) != "\x89PNG\r\n\x1a\n" {
+		t.Fatal(err)
+	}
+	if _, err := WalletName(2); err == nil {
 		t.Fatal("expected unknown wallet")
+	}
+}
+
+func TestBSVQuoteUnits(t *testing.T) {
+	text, sats, eur, err := WalletQuote(1, "1.5", "bsv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "1.5 BSV" || sats != "150000000" || eur != "" {
+		t.Fatalf("quote = %s %s %s", text, sats, eur)
+	}
+	_, sats, _, err = WalletQuote(1, "2", "satoshi")
+	if err != nil || sats != "2" {
+		t.Fatalf("satoshi quote = %s %v", sats, err)
+	}
+	if _, _, _, err := WalletQuote(1, "1", "ada"); err == nil {
+		t.Fatal("expected ada unit to fail")
+	}
+	text, sats, _, err = WalletQuote(0, "1.5", "ada")
+	if err != nil || text != "1.5 ADA" || sats != "1500000" {
+		t.Fatalf("cardano quote = %s %s %v", text, sats, err)
 	}
 }
 

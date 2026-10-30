@@ -25,6 +25,7 @@ CGO_ENABLED=1 go build -C go -buildmode=c-shared -ldflags '-s -w' -o libkiko.so 
 
 %install
 %qmake5_install
+install -Dm 644 sailjail/PureMaps.permission %{buildroot}%{_sysconfdir}/sailjail/permissions/PureMaps.permission
 
 %files
 %license LICENSES/BSD-3-Clause.txt
@@ -33,3 +34,4 @@ CGO_ENABLED=1 go build -C go -buildmode=c-shared -ldflags '-s -w' -o libkiko.so 
 %{_datadir}/applications/kiko-sfos.desktop
 %{_datadir}/icons/hicolor/*/apps/kiko-sfos.png
 %{_libdir}/libkiko.so
+%{_sysconfdir}/sailjail/permissions/PureMaps.permission

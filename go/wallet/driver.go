@@ -23,7 +23,8 @@ type driverCar struct {
 }
 
 // postDriver pretends POST /api/v1/driver. The body is not sent.
-func postDriver([]byte) ([]byte, error) {
+// Tests replace it with a server error object.
+var postDriver = func([]byte) ([]byte, error) {
 	return []byte("{}"), nil
 }
 

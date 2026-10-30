@@ -65,6 +65,25 @@ github.com/blinklabs-io/plutigo/data
 github.com/blinklabs-io/plutigo/lang
 github.com/blinklabs-io/plutigo/syn
 github.com/blinklabs-io/plutigo/syn/lex
+# github.com/bsv-blockchain/go-sdk v1.7.3
+## explicit; go 1.26.0
+github.com/bsv-blockchain/go-sdk/chainhash
+github.com/bsv-blockchain/go-sdk/compat/base58
+github.com/bsv-blockchain/go-sdk/compat/bip32
+github.com/bsv-blockchain/go-sdk/compat/bip39
+github.com/bsv-blockchain/go-sdk/compat/bip39/wordlists
+github.com/bsv-blockchain/go-sdk/primitives/aesgcm
+github.com/bsv-blockchain/go-sdk/primitives/ec
+github.com/bsv-blockchain/go-sdk/primitives/hash
+github.com/bsv-blockchain/go-sdk/primitives/keyshares
+github.com/bsv-blockchain/go-sdk/script
+github.com/bsv-blockchain/go-sdk/script/interpreter/scriptflag
+github.com/bsv-blockchain/go-sdk/transaction
+github.com/bsv-blockchain/go-sdk/transaction/chaincfg
+github.com/bsv-blockchain/go-sdk/transaction/chaintracker
+github.com/bsv-blockchain/go-sdk/transaction/sighash
+github.com/bsv-blockchain/go-sdk/transaction/template/p2pkh
+github.com/bsv-blockchain/go-sdk/util
 # github.com/btcsuite/btcd/btcec/v2 v2.5.0
 ## explicit; go 1.25
 github.com/btcsuite/btcd/btcec/v2
@@ -124,9 +143,15 @@ github.com/mattn/go-isatty
 # github.com/minio/sha256-simd v1.0.1
 ## explicit; go 1.17
 github.com/minio/sha256-simd
+# github.com/mrz1836/go-whatsonchain v1.3.0
+## explicit; go 1.24.0
+github.com/mrz1836/go-whatsonchain
 # github.com/ncruces/go-strftime v1.1.0
 ## explicit; go 1.24
 github.com/ncruces/go-strftime
+# github.com/pkg/errors v0.9.1
+## explicit
+github.com/pkg/errors
 # github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec
 ## explicit; go 1.12
 github.com/remyoudompheng/bigfft

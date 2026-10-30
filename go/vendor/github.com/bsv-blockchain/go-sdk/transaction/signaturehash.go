@@ -1,0 +1,556 @@
+package transaction
+
+import (
+	"bytes"
+	"encoding/binary"
+
+	crypto "github.com/bsv-blockchain/go-sdk/primitives/hash"
+	script "github.com/bsv-blockchain/go-sdk/script"
+	sighash "github.com/bsv-blockchain/go-sdk/transaction/sighash"
+	"github.com/bsv-blockchain/go-sdk/util"
+)
+
+// defaultHex is used to fix a bug in the original client (see if statement in the CalcInputSignatureHash func)
+var defaultHex = []byte{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+
+// usesBip143Preimage mirrors ts-stack's TransactionSignature.formatBytes: the
+// BIP143 preimage is used only when SIGHASH_FORKID is set and the historical
+// SIGHASH_CHRONICLE bit (0x20) is not treated as set — either because it is
+// clear, or because ignoreChronicle is true, mirroring formatBytes'
+// ignoreChronicle parameter ("Supports running bitcoin-abc test vectors which
+// reuses the CHRONICLE bit"). Every other combination uses the legacy/OTDA
+// preimage, exactly as formatBytes does:
+//
+//	hasForkId && !hasChronicle -> bip143
+//	otherwise                  -> OTDA
+func usesBip143Preimage(shf sighash.Flag, ignoreChronicle bool) bool {
+	hasForkID := shf.Has(sighash.ForkID)
+	hasChronicle := !ignoreChronicle && shf.Has(sighash.Chronicle)
+	return hasForkID && !hasChronicle
+}
+
+// CalcInputSignatureHash serialized the transaction and returns the hash digest
+// to be signed. BitCoin (SV) uses a different signature hashing algorithm
+// after the UAHF fork for replay protection.
+//
+// see https://github.com/bitcoin-sv/bitcoin-sv/blob/master/doc/abc/replay-protected-sighash.md#digest-algorithm
+func (tx *Transaction) CalcInputSignatureHash(inputNumber uint32, sigHashFlag sighash.Flag) ([]byte, error) {
+	return tx.calcInputSignatureHash(inputNumber, uint32(sigHashFlag), false)
+}
+
+// CalcInputSignatureHashFull is CalcInputSignatureHash using the complete
+// original 32-bit sighash type ("nHashType") rather than sighash.Flag's
+// well-known low-byte combinations. It matches ts-stack's
+// TransactionSignature.format/formatBytes exactly: the trailing 4-byte
+// nHashType field of the preimage carries hashType verbatim (the historical
+// Satoshi-client behaviour ts-stack's reference SDK reproduces), while the
+// BIP143-vs-legacy decision and all other flag-driven branching still uses
+// only hashType's low byte (every relevant bit — the base ALL/NONE/SINGLE
+// mask, ForkID, Chronicle, and AnyOneCanPay — fits within it).
+//
+// ignoreChronicle mirrors TransactionSignature.formatBytes' ignoreChronicle
+// parameter: when true, the historical SIGHASH_CHRONICLE bit (0x20) is not
+// treated as forcing the legacy/OTDA preimage, matching ts-stack's handling
+// of bitcoin-abc-derived fixtures that reuse that bit for an unrelated
+// purpose.
+//
+// Every sighash.Flag combination is below 256, so
+// CalcInputSignatureHash(idx, flag) is exactly
+// CalcInputSignatureHashFull(idx, uint32(flag), false).
+func (tx *Transaction) CalcInputSignatureHashFull(inputNumber, hashType uint32, ignoreChronicle bool) ([]byte, error) {
+	return tx.calcInputSignatureHash(inputNumber, hashType, ignoreChronicle)
+}
+
+func (tx *Transaction) calcInputSignatureHash(inputNumber, hashType uint32, ignoreChronicle bool) ([]byte, error) {
+	// CalcInputSignatureHash's historical behavior is unchanged: it is
+	// exactly calcInputSignatureHashForkIDEnabled with forkIDEnabled=true,
+	// matching every pre-existing (non-interpreter) caller, none of which
+	// ever validated a signature under a flag word that disables
+	// SIGHASH_FORKID.
+	return tx.calcInputSignatureHashForkIDEnabled(inputNumber, hashType, ignoreChronicle, true)
+}
+
+// CalcInputSignatureHashWithForkIDEnabled is CalcInputSignatureHash, except
+// the BIP143-vs-legacy digest selection also requires forkIDEnabled -- the
+// spending interpreter's own SCRIPT_ENABLE_SIGHASH_FORKID flag state --
+// ANDed with the signature's own ForkID bit, exactly as node's
+// SignatureHash(..., enabledSighashForkid) does (interpreter.cpp:2112-2124),
+// fed by checker.CheckSig's engine-flag parameter (interpreter.cpp:1487,
+// 1619). Without this, a hash type that merely carries the ForkID bit is
+// hashed BIP143-style even under a flag word that never enables ForkID (a
+// pre-UAHF-shaped word, which historical validation can hit).
+//
+// CalcInputSignatureHash keeps its existing behavior unchanged; it is
+// equivalent to calling this with forkIDEnabled = true.
+func (tx *Transaction) CalcInputSignatureHashWithForkIDEnabled(inputNumber uint32, sigHashFlag sighash.Flag, forkIDEnabled bool) ([]byte, error) {
+	return tx.calcInputSignatureHashForkIDEnabled(inputNumber, uint32(sigHashFlag), false, forkIDEnabled)
+}
+
+func (tx *Transaction) calcInputSignatureHashForkIDEnabled(inputNumber, hashType uint32, ignoreChronicle, forkIDEnabled bool) ([]byte, error) {
+	flag := sighash.Flag(uint8(hashType)) //nolint:gosec // G115 -- intentional narrowing: only the low byte carries flag semantics, see CalcInputSignatureHashFull
+
+	var buf []byte
+	var err error
+	if forkIDEnabled && usesBip143Preimage(flag, ignoreChronicle) {
+		buf, err = tx.preimage(inputNumber, hashType, nil)
+	} else {
+		buf, err = tx.calcInputPreimageLegacy(inputNumber, hashType)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// A bug in the original Satoshi client implementation means specifying
+	// an index that is out of range results in a signature hash of 1 (as an
+	// uint256 little endian).  The original intent appeared to be to
+	// indicate failure, but unfortunately, it was never checked and thus is
+	// treated as the actual signature hash.  This buggy behavior is now
+	// part of the consensus and a hard fork would be required to fix it.
+	//
+	// Due to this, if the tx signature returned matches this special case value,
+	// we skip the double hashing as to not interfere.
+	if bytes.Equal(defaultHex, buf) {
+		return buf, nil
+	}
+
+	return crypto.Sha256d(buf), nil
+}
+
+// SigHashCache holds the BIP143 intermediate hashes (hashPrevouts, hashSequence,
+// hashOutputs) that are identical across every input of a transaction for the
+// common SIGHASH_ALL|FORKID case. Computing them once and reusing them for each
+// input turns signing an N-input transaction from O(N^2) into O(N).
+//
+// A SigHashCache is a transient, caller-owned value produced by
+// Transaction.NewSigHashCache(): nothing is stored on the Transaction, so a
+// cache can never silently go stale against a mutated transaction. Build one at
+// the start of a signing pass and pass it to CalcInputPreimageWithCache /
+// CalcInputSignatureHashWithCache for each input; discard it if the
+// transaction's inputs or outputs change.
+type SigHashCache struct {
+	prevoutsHash []byte
+	sequenceHash []byte
+	outputsHash  []byte
+}
+
+// NewSigHashCache pre-computes the BIP143 intermediate hashes for the current
+// state of tx so they can be reused across inputs during a single signing pass.
+func (tx *Transaction) NewSigHashCache() *SigHashCache {
+	return &SigHashCache{
+		prevoutsHash: tx.SourceOutHash().CloneBytes(),
+		sequenceHash: tx.SequenceHash(),
+		outputsHash:  tx.OutputsHash(-1),
+	}
+}
+
+// CalcInputSignatureHashWithCache is CalcInputSignatureHash using pre-computed
+// BIP143 midstate hashes from cache (see SigHashCache), giving O(N) signing
+// across a transaction's inputs. The legacy (pre-fork) algorithm cannot reuse
+// the cache, so non-FORKID flags fall back to CalcInputSignatureHash. The
+// returned digest is byte-identical to CalcInputSignatureHash for the same input
+// and flag; a nil cache is equivalent to CalcInputSignatureHash.
+func (tx *Transaction) CalcInputSignatureHashWithCache(inputNumber uint32, sigHashFlag sighash.Flag, cache *SigHashCache) ([]byte, error) {
+	if !usesBip143Preimage(sigHashFlag, false) {
+		return tx.CalcInputSignatureHash(inputNumber, sigHashFlag)
+	}
+
+	buf, err := tx.CalcInputPreimageWithCache(inputNumber, sigHashFlag, cache)
+	if err != nil {
+		return nil, err
+	}
+	// The FORKID preimage is always a full buffer (>=157 bytes), never the
+	// 32-byte legacy defaultHex sentinel, so unlike CalcInputSignatureHash no
+	// special-case check is needed before double-hashing.
+	return crypto.Sha256d(buf), nil
+}
+
+// CalcInputPreimage serializes the transaction based on the input index and the
+// SIGHASH flag and returns the preimage before double hashing (SHA256d).
+//
+// For signing many inputs of the same transaction, prefer
+// CalcInputPreimageWithCache with a shared SigHashCache so the BIP143 midstate
+// hashes are computed once rather than per input (O(N) instead of O(N^2)).
+//
+// see https://github.com/bitcoin-sv/bitcoin-sv/blob/master/doc/abc/replay-protected-sighash.md#digest-algorithm
+func (tx *Transaction) CalcInputPreimage(inputNumber uint32, sigHashFlag sighash.Flag) ([]byte, error) {
+	return tx.preimage(inputNumber, uint32(sigHashFlag), nil)
+}
+
+// CalcInputPreimageWithCache is CalcInputPreimage using pre-computed BIP143
+// midstate hashes from cache. A nil cache is equivalent to CalcInputPreimage.
+// The returned preimage is byte-identical to CalcInputPreimage for the same
+// input and flag.
+func (tx *Transaction) CalcInputPreimageWithCache(inputNumber uint32, sigHashFlag sighash.Flag, cache *SigHashCache) ([]byte, error) {
+	return tx.preimage(inputNumber, uint32(sigHashFlag), cache)
+}
+
+// CalcInputPreimageFull is CalcInputPreimage using the complete original
+// 32-bit sighash type ("nHashType") rather than sighash.Flag's well-known
+// low-byte combinations: the trailing 4-byte nHashType field of the preimage
+// carries hashType verbatim, matching ts-stack's TransactionSignature.formatBip143.
+// All other flag-driven branching still uses only hashType's low byte (see
+// CalcInputSignatureHashFull). Every sighash.Flag combination is below 256,
+// so CalcInputPreimage(idx, flag) is exactly
+// CalcInputPreimageFull(idx, uint32(flag)).
+func (tx *Transaction) CalcInputPreimageFull(inputNumber, hashType uint32) ([]byte, error) {
+	return tx.preimage(inputNumber, hashType, nil)
+}
+
+// preimage builds the BIP143 sighash preimage for inputNumber. When cache is
+// non-nil its pre-computed midstate hashes are used; otherwise they are computed
+// on demand exactly as the flags require, so the nil path is identical in both
+// bytes and work to the historical implementation. hashType is the full
+// 32-bit sighash type; only its low byte (as sighash.Flag) drives branching,
+// but the complete value is what gets written into the preimage trailer by
+// assemblePreimage.
+func (tx *Transaction) preimage(inputNumber, hashType uint32, cache *SigHashCache) ([]byte, error) {
+	in := tx.InputIdx(int(inputNumber))
+	if in == nil {
+		return nil, ErrInputNoExist
+	}
+	if len(in.SourceTXID) == 0 {
+		return nil, ErrEmptyPreviousTxID
+	}
+	if in.SourceTxOutput() == nil {
+		return nil, ErrEmptyPreviousTx
+	}
+
+	sigHashFlag := sighash.Flag(uint8(hashType)) //nolint:gosec // G115 -- intentional narrowing; only the low byte carries flag semantics, see CalcInputSignatureHashFull
+
+	var zero [32]byte
+	hashPreviousOuts, hashSequence, hashOutputs := zero[:], zero[:], zero[:]
+
+	masked := sigHashFlag & 31
+	notSingleOrNone := masked != sighash.Single && masked != sighash.None
+
+	// Usual BSV case is SIGHASH_ALL|FORKID: all three midstates are used.
+	if sigHashFlag&sighash.AnyOneCanPay == 0 {
+		hashPreviousOuts = tx.prevoutsMidstate(cache)
+		if notSingleOrNone {
+			hashSequence = tx.sequenceMidstate(cache)
+		}
+	}
+
+	if notSingleOrNone {
+		hashOutputs = tx.outputsMidstate(cache)
+	} else if masked == sighash.Single && inputNumber < uint32(tx.OutputCount()) { //nolint:gosec // G115 -- output count is bounded well within uint32
+		hashOutputs = tx.OutputsHash(int32(inputNumber)) //nolint:gosec // G115 -- inputNumber is bounded by the number of transaction outputs (checked above)
+	}
+
+	return tx.assemblePreimage(in, hashType, hashPreviousOuts, hashSequence, hashOutputs), nil
+}
+
+// prevoutsMidstate returns the BIP143 hashPrevouts, reusing the cache when set.
+func (tx *Transaction) prevoutsMidstate(cache *SigHashCache) []byte {
+	if cache != nil {
+		return cache.prevoutsHash
+	}
+	return tx.SourceOutHash().CloneBytes()
+}
+
+// sequenceMidstate returns the BIP143 hashSequence, reusing the cache when set.
+func (tx *Transaction) sequenceMidstate(cache *SigHashCache) []byte {
+	if cache != nil {
+		return cache.sequenceHash
+	}
+	return tx.SequenceHash()
+}
+
+// outputsMidstate returns the BIP143 hashOutputs over all outputs, reusing the
+// cache when set.
+func (tx *Transaction) outputsMidstate(cache *SigHashCache) []byte {
+	if cache != nil {
+		return cache.outputsHash
+	}
+	return tx.OutputsHash(-1)
+}
+
+// assemblePreimage writes the BIP143 preimage for a single input into one
+// pre-sized buffer. hashPreviousOuts, hashSequence and hashOutputs must each be
+// 32 bytes. The byte layout is identical to the historical CalcInputPreimage;
+// the change is that the per-field scratch slices are gone and the buffer is
+// sized up front. hashType is written verbatim into the trailing 4-byte
+// nHashType field (see CalcInputPreimageFull); for Flag-based callers this is
+// always uint32(flag), so the trailer is byte-identical to the historical
+// implementation.
+func (tx *Transaction) assemblePreimage(in *TransactionInput, hashType uint32, hashPreviousOuts, hashSequence, hashOutputs []byte) []byte {
+	scriptCode := *in.SourceTxScript()
+
+	// 4 (version) + 32 (prevouts) + 32 (sequence) + 32 (outpoint txid) +
+	// 4 (outpoint index) + varint(scriptLen) + scriptLen + 8 (value) +
+	// 4 (nSequence) + 32 (outputs) + 4 (locktime) + 4 (sighashType) = 156 + script
+	buf := make([]byte, 0, 156+util.VarInt(uint64(len(scriptCode))).Length()+len(scriptCode))
+
+	buf = binary.LittleEndian.AppendUint32(buf, tx.Version)
+	buf = append(buf, hashPreviousOuts...)
+	buf = append(buf, hashSequence...)
+	buf = append(buf, in.SourceTXID[:]...)
+	buf = binary.LittleEndian.AppendUint32(buf, in.SourceTxOutIndex)
+	buf = appendVarInt(buf, uint64(len(scriptCode)))
+	buf = append(buf, scriptCode...)
+	prevSats := uint64(0)
+	if in.SourceTxSatoshis() != nil {
+		prevSats = *in.SourceTxSatoshis()
+	}
+	buf = binary.LittleEndian.AppendUint64(buf, prevSats)
+	buf = binary.LittleEndian.AppendUint32(buf, in.SequenceNumber)
+	buf = append(buf, hashOutputs...)
+	buf = binary.LittleEndian.AppendUint32(buf, tx.LockTime)
+	buf = binary.LittleEndian.AppendUint32(buf, hashType)
+
+	return buf
+}
+
+// CalcInputPreimageLegacy serializes the transaction based on the input index and the SIGHASH flag
+// and returns the preimage before double hashing (SHA256d), in the legacy format.
+//
+// see https://wiki.bitcoinsv.io/index.php/Legacy_Sighash_Algorithm
+func (tx *Transaction) CalcInputPreimageLegacy(inputNumber uint32, shf sighash.Flag) ([]byte, error) {
+	return tx.calcInputPreimageLegacy(inputNumber, uint32(shf))
+}
+
+// CalcInputPreimageLegacyFull is CalcInputPreimageLegacy using the complete
+// original 32-bit sighash type ("nHashType") rather than sighash.Flag's
+// well-known low-byte combinations: the trailing 4-byte nHashType field of
+// the preimage carries hashType verbatim, matching ts-stack's
+// TransactionSignature.formatOTDA. All other flag-driven branching still
+// uses only hashType's low byte (see CalcInputSignatureHashFull). Every
+// sighash.Flag combination is below 256, so
+// CalcInputPreimageLegacy(idx, flag) is exactly
+// CalcInputPreimageLegacyFull(idx, uint32(flag)).
+func (tx *Transaction) CalcInputPreimageLegacyFull(inputNumber, hashType uint32) ([]byte, error) {
+	return tx.calcInputPreimageLegacy(inputNumber, hashType)
+}
+
+func (tx *Transaction) calcInputPreimageLegacy(inputNumber, hashType uint32) ([]byte, error) {
+	shf := sighash.Flag(uint8(hashType)) //nolint:gosec // G115 -- intentional narrowing; only the low byte carries flag semantics, see CalcInputSignatureHashFull
+	if tx.InputIdx(int(inputNumber)) == nil {
+		return nil, ErrInputNoExist
+	}
+	in := tx.InputIdx(int(inputNumber))
+
+	if len(in.SourceTXID) == 0 {
+		return nil, ErrEmptyPreviousTxID
+	}
+	if in.SourceTxOutput() == nil {
+		return nil, ErrEmptyPreviousTx
+	}
+
+	// The SigHashSingle signature type signs only the corresponding input
+	// and output (the output with the same index number as the input).
+	//
+	// Since transactions can have more inputs than outputs, this means it
+	// is improper to use SigHashSingle on input indices that don't have a
+	// corresponding output.
+	//
+	// A bug in the original Satoshi client implementation means specifying
+	// an index that is out of range results in a signature hash of 1 (as an
+	// uint256 little endian).  The original intent appeared to be to
+	// indicate failure, but unfortunately, it was never checked and thus is
+	// treated as the actual signature hash.  This buggy behavior is now
+	// part of the consensus and a hard fork would be required to fix it.
+	//
+	// Due to this, care must be taken by software that creates transactions
+	// which make use of SigHashSingle because it can lead to an extremely
+	// dangerous situation where the invalid inputs will end up signing a
+	// hash of 1.  This in turn presents an opportunity for attackers to
+	// cleverly construct transactions which can steal those coins provided
+	// they can reuse signatures.
+	if shf.HasWithMask(sighash.Single) && int(inputNumber) > len(tx.Outputs)-1 {
+		return defaultHex, nil
+	}
+
+	// The signing input's subscript is written by appendLegacyScriptCode,
+	// which strips its OP_CODESEPARATORs the way node does (and ts-stack's
+	// TransactionSignature.formatOTDA does for well-formed scripts) -- unlike
+	// the BIP143 preimage, which embeds the subscript as given.
+	subscript := in.SourceTxScript()
+
+	txCopy := tx.ShallowClone()
+	signingInput := txCopy.Inputs[inputNumber]
+
+	for i := range txCopy.Inputs {
+		if i == int(inputNumber) {
+			txCopy.Inputs[i].sourceOutput = &TransactionOutput{LockingScript: subscript}
+		} else {
+			txCopy.Inputs[i].UnlockingScript = &script.Script{}
+			txCopy.Inputs[i].sourceOutput = &TransactionOutput{}
+		}
+	}
+
+	if shf.HasWithMask(sighash.None) {
+		txCopy.Outputs = txCopy.Outputs[0:0]
+		for i := range txCopy.Inputs {
+			if i != int(inputNumber) {
+				txCopy.Inputs[i].SequenceNumber = 0
+			}
+		}
+	} else if shf.HasWithMask(sighash.Single) {
+		txCopy.Outputs = txCopy.Outputs[:inputNumber+1]
+		for i := 0; i < int(inputNumber); i++ {
+			txCopy.Outputs[i].Satoshis = 18446744073709551615 // -1 but underflowed
+			txCopy.Outputs[i].LockingScript = &script.Script{}
+		}
+
+		for i := range txCopy.Inputs {
+			if i != int(inputNumber) {
+				txCopy.Inputs[i].SequenceNumber = 0
+			}
+		}
+	}
+
+	if shf&sighash.AnyOneCanPay != 0 {
+		txCopy.Inputs = txCopy.Inputs[inputNumber : inputNumber+1]
+	}
+
+	// Pre-size the buffer to the exact preimage length, then append with the
+	// shared zero-alloc writers (as the FORKID path does). The input script field
+	// carries each input's SourceTxScript (the subscript for the signing input,
+	// empty for the others), so the length is computed from those scripts rather
+	// than from txCopy.Size(), which measures the unlocking scripts. The trailing
+	// 4 bytes are the sighash flag.
+	size := 4 + util.VarInt(uint64(len(txCopy.Inputs))).Length()
+	for _, in := range txCopy.Inputs {
+		scriptLen := 0
+		if s := in.SourceTxScript(); s != nil {
+			scriptLen = len(*s)
+		}
+		size += 32 + 4 + util.VarInt(uint64(scriptLen)).Length() + scriptLen + 4
+	}
+	size += util.VarInt(uint64(len(txCopy.Outputs))).Length()
+	for _, out := range txCopy.Outputs {
+		scriptLen := len(*out.LockingScript)
+		size += 8 + util.VarInt(uint64(scriptLen)).Length() + scriptLen
+	}
+	size += 4 + 4 // locktime + sighash flag
+
+	buf := make([]byte, 0, size)
+	buf = binary.LittleEndian.AppendUint32(buf, tx.Version)
+	buf = appendVarInt(buf, uint64(len(txCopy.Inputs)))
+	for _, in := range txCopy.Inputs {
+		buf = append(buf, in.SourceTXID[:]...)
+		buf = binary.LittleEndian.AppendUint32(buf, in.SourceTxOutIndex)
+		if s := in.SourceTxScript(); in == signingInput && s != nil {
+			buf = appendLegacyScriptCode(buf, *s)
+		} else {
+			buf = appendVarInt(buf, 0)
+		}
+		buf = binary.LittleEndian.AppendUint32(buf, in.SequenceNumber)
+	}
+	buf = appendVarInt(buf, uint64(len(txCopy.Outputs)))
+	for _, out := range txCopy.Outputs {
+		buf = binary.LittleEndian.AppendUint64(buf, out.Satoshis)
+		buf = appendVarInt(buf, uint64(len(*out.LockingScript)))
+		buf = append(buf, *out.LockingScript...)
+	}
+	buf = binary.LittleEndian.AppendUint32(buf, tx.LockTime)
+	buf = binary.LittleEndian.AppendUint32(buf, hashType)
+	return buf, nil
+}
+
+// appendLegacyScriptCode appends scriptCode to buf exactly as bitcoin-sv's
+// CTransactionSignatureSerializer::SerializeScriptCode writes it into the
+// legacy (original) signature preimage (interpreter.cpp:1862-1892): the
+// OP_CODESEPARATORs found while decoding it are left out, and the length
+// prefix is the script's full length minus their number. Decoding stops at
+// the first instruction that cannot be decoded (a push running past the end
+// of the script); the bytes read up to that point -- including the opcode
+// and any length bytes of the undecodable push -- are written, while the
+// length prefix still counts the whole script. A malformed scriptCode is
+// therefore never an error: it only yields node's (odd) serialization.
+func appendLegacyScriptCode(buf, scriptCode []byte) []byte {
+	nCodeSeparators := 0
+	for pc := 0; ; {
+		op, next, ok := legacyGetOp(scriptCode, pc)
+		if !ok {
+			break
+		}
+		if op == script.OpCODESEPARATOR {
+			nCodeSeparators++
+		}
+		pc = next
+	}
+	buf = appendVarInt(buf, uint64(len(scriptCode)-nCodeSeparators))
+
+	begin, pc := 0, 0
+	for {
+		op, next, ok := legacyGetOp(scriptCode, pc)
+		pc = next
+		if !ok {
+			break
+		}
+		if op == script.OpCODESEPARATOR {
+			buf = append(buf, scriptCode[begin:pc-1]...)
+			begin = pc
+		}
+	}
+	if begin != len(scriptCode) {
+		buf = append(buf, scriptCode[begin:pc]...)
+	}
+
+	return buf
+}
+
+// legacyGetOp reads the instruction at scr[pc] like CScript::GetOp2
+// (script.h:163-198). It returns the opcode and the position after the
+// instruction, or ok=false with the position GetOp2 leaves its iterator at
+// when it fails: unchanged at the end of the script, otherwise just past the
+// opcode byte and whatever length bytes of the push it could read.
+func legacyGetOp(scr []byte, pc int) (op byte, next int, ok bool) {
+	if pc >= len(scr) {
+		return 0, pc, false
+	}
+	op = scr[pc]
+	pc++
+	if op > script.OpPUSHDATA4 {
+		return op, pc, true
+	}
+
+	var size uint64
+	switch op {
+	case script.OpPUSHDATA1:
+		if len(scr)-pc < 1 {
+			return op, pc, false
+		}
+		size = uint64(scr[pc])
+		pc++
+	case script.OpPUSHDATA2:
+		if len(scr)-pc < 2 {
+			return op, pc, false
+		}
+		size = uint64(binary.LittleEndian.Uint16(scr[pc:]))
+		pc += 2
+	case script.OpPUSHDATA4:
+		if len(scr)-pc < 4 {
+			return op, pc, false
+		}
+		size = uint64(binary.LittleEndian.Uint32(scr[pc:]))
+		pc += 4
+	default:
+		size = uint64(op)
+	}
+	if uint64(len(scr)-pc) < size { //nolint:gosec // G115 -- pc <= len(scr), checked above
+		return op, pc, false
+	}
+
+	return op, pc + int(size), true
+}
+
+// OutputsHash returns a bytes slice of the requested output, used for generating
+// the txs signature hash. If n is -1, it will create the byte slice from all outputs.
+func (tx *Transaction) OutputsHash(n int32) []byte {
+	if n != -1 {
+		out := tx.Outputs[n]
+		return crypto.Sha256d(out.appendTo(make([]byte, 0, out.size())))
+	}
+
+	size := 0
+	for _, out := range tx.Outputs {
+		size += out.size()
+	}
+	buf := make([]byte, 0, size)
+	for _, out := range tx.Outputs {
+		buf = out.appendTo(buf)
+	}
+	return crypto.Sha256d(buf)
+}

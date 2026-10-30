@@ -9,6 +9,38 @@ import (
 	"testing"
 )
 
+func TestGPSDriver(t *testing.T) {
+	setupTest(t)
+	if err := SetupPin("42", "42"); err != nil {
+		t.Fatal(err)
+	}
+	kind, err := GPSDriver()
+	if err != nil || kind != "geoclue" {
+		t.Fatalf("driver %q %v", kind, err)
+	}
+	if err := SetGPSDriver("mock"); err != nil {
+		t.Fatal(err)
+	}
+	kind, err = GPSDriver()
+	if err != nil || kind != "mock" {
+		t.Fatalf("driver %q %v", kind, err)
+	}
+	text, err := GPSPosition()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "48.140833\n11.555000\n15" {
+		t.Fatalf("position %q", text)
+	}
+	if err := SetGPSDriver("nope"); err != nil {
+		t.Fatal(err)
+	}
+	kind, err = GPSDriver()
+	if err != nil || kind != "geoclue" {
+		t.Fatalf("driver %q %v", kind, err)
+	}
+}
+
 func TestProfileRoundTrip(t *testing.T) {
 	setupTest(t)
 	if _, err := ProfileBrand(); err == nil {

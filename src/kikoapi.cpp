@@ -83,6 +83,21 @@ QString KikoApi::walletName(int wallet)
     return takeKikoString(KIKO_wallet_name(wallet));
 }
 
+QString KikoApi::walletTicker(int wallet)
+{
+    return takeKikoString(KIKO_wallet_ticker(wallet));
+}
+
+QString KikoApi::walletWhole(int wallet)
+{
+    return takeKikoString(KIKO_wallet_whole(wallet));
+}
+
+QString KikoApi::walletAtom(int wallet)
+{
+    return takeKikoString(KIKO_wallet_atom(wallet));
+}
+
 int KikoApi::walletExists(int wallet)
 {
     return KIKO_wallet_exists(wallet);
@@ -374,6 +389,169 @@ void KikoApi::applyFeesEur(const QString &base, const QString &perKm)
 void KikoApi::deliverFees(const QString &message)
 {
     emit feesApplied(message);
+}
+
+QString KikoApi::gpsDriver()
+{
+    return takeKikoString(KIKO_gps_driver());
+}
+
+int KikoApi::gpsSetDriver(const QString &kind)
+{
+    QByteArray kindUtf8 = utf8(kind);
+    return KIKO_gps_set_driver(kindUtf8.data());
+}
+
+QString KikoApi::gpsPosition()
+{
+    return takeKikoString(KIKO_gps_position());
+}
+
+void KikoApi::gpsRelease()
+{
+    KIKO_gps_release();
+}
+
+void KikoApi::driveRegister()
+{
+    QPointer<KikoApi> self(this);
+    QtConcurrent::run([self]() {
+        const QMutexLocker lock(&requestGate);
+        const QString message = takeKikoString(KIKO_drive_register());
+        if (!self)
+            return;
+        QMetaObject::invokeMethod(self.data(), "deliverDriveRegistered", Qt::QueuedConnection,
+                                  Q_ARG(QString, message));
+    });
+}
+
+void KikoApi::deliverDriveRegistered(const QString &message)
+{
+    emit driveRegistered(message);
+}
+
+void KikoApi::driveRefresh(double rangeKm)
+{
+    QPointer<KikoApi> self(this);
+    QtConcurrent::run([self, rangeKm]() {
+        const QMutexLocker lock(&requestGate);
+        const QString message = takeKikoString(KIKO_drive_refresh(rangeKm));
+        if (!self)
+            return;
+        QMetaObject::invokeMethod(self.data(), "deliverDrivesReady", Qt::QueuedConnection,
+                                  Q_ARG(QString, message));
+    });
+}
+
+void KikoApi::deliverDrivesReady(const QString &message)
+{
+    emit drivesReady(message);
+}
+
+int KikoApi::driveCount()
+{
+    return KIKO_drive_count();
+}
+
+QString KikoApi::driveId(int index)
+{
+    return takeKikoString(KIKO_drive_id(index));
+}
+
+QString KikoApi::driveServer(int index)
+{
+    return takeKikoString(KIKO_drive_server(index));
+}
+
+int KikoApi::driveCoin(int index)
+{
+    return KIKO_drive_coin(index);
+}
+
+QString KikoApi::driveStartAddress(int index)
+{
+    return takeKikoString(KIKO_drive_start_address(index));
+}
+
+QString KikoApi::driveEndAddress(int index)
+{
+    return takeKikoString(KIKO_drive_end_address(index));
+}
+
+QString KikoApi::drivePickupKm(int index)
+{
+    return takeKikoString(KIKO_drive_pickup_km(index));
+}
+
+QString KikoApi::driveDistanceKm(int index)
+{
+    return takeKikoString(KIKO_drive_distance_km(index));
+}
+
+QString KikoApi::drivePickupTime(int index)
+{
+    return takeKikoString(KIKO_drive_pickup_time(index));
+}
+
+QString KikoApi::driveFareLovelace(int index)
+{
+    return takeKikoString(KIKO_drive_fare_lovelace(index));
+}
+
+QString KikoApi::driveBaseLovelace(int index)
+{
+    return takeKikoString(KIKO_drive_base_lovelace(index));
+}
+
+QString KikoApi::drivePerKmLovelace(int index)
+{
+    return takeKikoString(KIKO_drive_per_km_lovelace(index));
+}
+
+int KikoApi::driveImmediate(int index)
+{
+    return KIKO_drive_immediate(index);
+}
+
+QString KikoApi::driveWhenDay(int index)
+{
+    return takeKikoString(KIKO_drive_when_day(index));
+}
+
+QString KikoApi::driveWhenClock(int index)
+{
+    return takeKikoString(KIKO_drive_when_clock(index));
+}
+
+QString KikoApi::driveStartLat(int index)
+{
+    return takeKikoString(KIKO_drive_start_lat(index));
+}
+
+QString KikoApi::driveStartLon(int index)
+{
+    return takeKikoString(KIKO_drive_start_lon(index));
+}
+
+void KikoApi::driveNavigate(const QString &lat, const QString &lon, const QString &title)
+{
+    QPointer<KikoApi> self(this);
+    QByteArray latUtf8 = utf8(lat);
+    QByteArray lonUtf8 = utf8(lon);
+    QByteArray titleUtf8 = utf8(title);
+    QtConcurrent::run([self, latUtf8, lonUtf8, titleUtf8]() mutable {
+        const QMutexLocker lock(&requestGate);
+        const QString message = takeKikoString(KIKO_drive_navigate(latUtf8.data(), lonUtf8.data(), titleUtf8.data()));
+        if (!self)
+            return;
+        QMetaObject::invokeMethod(self.data(), "deliverNavigate", Qt::QueuedConnection,
+                                  Q_ARG(QString, message));
+    });
+}
+
+void KikoApi::deliverNavigate(const QString &message)
+{
+    emit navigateFinished(message);
 }
 
 QString KikoApi::lastError()

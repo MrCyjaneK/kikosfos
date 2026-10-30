@@ -149,6 +149,33 @@ func WalletName(index int) (string, error) {
 	return c.Name(), nil
 }
 
+// WalletTicker is the price symbol for a wallet index.
+func WalletTicker(index int) (string, error) {
+	c, err := coinAt(index)
+	if err != nil {
+		return "", err
+	}
+	return c.Ticker(), nil
+}
+
+// WalletWhole is the typed unit id for a wallet index, such as "ada".
+func WalletWhole(index int) (string, error) {
+	c, err := coinAt(index)
+	if err != nil {
+		return "", err
+	}
+	return c.Whole(), nil
+}
+
+// WalletAtom is the smallest unit id for a wallet index, such as "lovelace".
+func WalletAtom(index int) (string, error) {
+	c, err := coinAt(index)
+	if err != nil {
+		return "", err
+	}
+	return c.Atom(), nil
+}
+
 // WalletIcon is the PNG mark for a wallet index.
 func WalletIcon(index int) ([]byte, error) {
 	c, err := coinAt(index)

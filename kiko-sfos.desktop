@@ -8,4 +8,4 @@ Name=Kiko
 [X-Sailjail]
 OrganizationName=wtf.kiko
 ApplicationName=kiko
-Permissions=Internet
+Permissions=Internet;PureMaps
