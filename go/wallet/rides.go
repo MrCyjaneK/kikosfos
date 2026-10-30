@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,13 +43,7 @@ type readyServer struct {
 	Coin  int
 	Base  uint64
 	PerKm uint64
-}
-
-type catalogRide struct {
-	id, startAddress, endAddress string
-	after                        time.Duration
-	tripM                        uint64
-	startLat, startLon           float64
+	Key   string
 }
 
 var (
@@ -152,7 +148,11 @@ func rememberServer(index int, host string) (readyServer, error) {
 	if coin < 0 {
 		return readyServer{}, errIncompatible
 	}
-	return readyServer{Host: host, Coin: coin, Base: base, PerKm: perKm}, nil
+	key, err := WalletMultisigMaterial(coin)
+	if err != nil {
+		return readyServer{}, err
+	}
+	return readyServer{Host: host, Coin: coin, Base: base, PerKm: perKm, Key: key}, nil
 }
 
 // fareLovelace is max(base + ceil(perKm * km), 1_000_000).
@@ -171,9 +171,10 @@ func fareLovelace(base, perKm, meters uint64) uint64 {
 	return sum.Uint64()
 }
 
-// RefreshDrives keeps the requested rides whose pickup is within rangeKm
-// of the current fix. rangeKm <= 0 means 5. The list is empty when no
-// server registered. No fix clears the list and returns that error.
+// RefreshDrives loads requested rides from each registered server.
+// rangeKm <= 0 means 5. The server keeps pickups inside that radius.
+// The list is empty when no server registered. No fix, or a server that
+// does not answer, clears the list and returns that error.
 func RefreshDrives(rangeKm float64) error {
 	if rangeKm <= 0 {
 		rangeKm = 5
@@ -188,7 +189,12 @@ func RefreshDrives(rangeKm float64) error {
 		setOffers(nil)
 		return err
 	}
-	setOffers(offersAround(readyCopy(), lat, lon, rangeKm))
+	rows, err := offersFrom(readyCopy(), lat, lon, rangeKm)
+	if err != nil {
+		setOffers(nil)
+		return err
+	}
+	setOffers(rows)
 	return nil
 }
 
@@ -222,36 +228,32 @@ func setOffers(rows []driveOffer) {
 	driveMu.Unlock()
 }
 
-func offersAround(ready []readyServer, lat, lon, rangeKm float64) []driveOffer {
+// remoteRide is one row of GET /api/v1/driver/drive/available.
+type remoteRide struct {
+	ID           string `json:"id"`
+	StartAddress string `json:"start_address"`
+	EndAddress   string `json:"end_address"`
+	Start        struct {
+		Lat float64 `json:"lat"`
+		Lng float64 `json:"lng"`
+	} `json:"start"`
+	DistanceKm       float64 `json:"distance_km"`
+	PickupDistanceKm float64 `json:"pickup_distance_km"`
+	PickupTime       string  `json:"pickup_time"`
+}
+
+func offersFrom(ready []readyServer, lat, lon, rangeKm float64) ([]driveOffer, error) {
 	if len(ready) == 0 {
-		return nil
+		return nil, nil
 	}
-	catalog := mockCatalog()
 	now := time.Now()
-	rows := make([]driveOffer, 0, len(catalog))
-	for i, ride := range catalog {
-		pickup := haversineKm(lat, lon, ride.startLat, ride.startLon)
-		if pickup > rangeKm {
-			continue
+	var rows []driveOffer
+	for _, server := range ready {
+		part, err := ridesFrom(server, lat, lon, rangeKm, now)
+		if err != nil {
+			return nil, err
 		}
-		server := ready[i%len(ready)]
-		when := now.Add(ride.after)
-		rows = append(rows, driveOffer{
-			ID:           ride.id,
-			Server:       server.Host,
-			Coin:         server.Coin,
-			StartAddress: ride.startAddress,
-			EndAddress:   ride.endAddress,
-			PickupKm:     pickup,
-			TripM:        ride.tripM,
-			When:         when,
-			StartLat:     ride.startLat,
-			StartLon:     ride.startLon,
-			Immediate:    !when.After(now.Add(nowWindow)),
-			Fare:         fareLovelace(server.Base, server.PerKm, ride.tripM),
-			Base:         server.Base,
-			PerKm:        server.PerKm,
-		})
+		rows = append(rows, part...)
 	}
 	for i := 1; i < len(rows); i++ {
 		row := rows[i]
@@ -262,7 +264,65 @@ func offersAround(ready []readyServer, lat, lon, rangeKm float64) []driveOffer {
 		}
 		rows[j] = row
 	}
-	return rows
+	return rows, nil
+}
+
+func ridesFrom(server readyServer, lat, lon, rangeKm float64, now time.Time) ([]driveOffer, error) {
+	query := url.Values{}
+	query.Set("location", strconv.FormatFloat(lat, 'f', -1, 64)+","+strconv.FormatFloat(lon, 'f', -1, 64))
+	query.Set("range", strconv.FormatFloat(rangeKm, 'f', -1, 64))
+	status, body, err := kikoDo(http.MethodGet, server.Host, "/api/v1/driver/drive/available?"+query.Encode(), nil, map[string]string{
+		"X-Driver-Key": server.Key,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, errors.New(server.Host + ": " + apiError(status, body))
+	}
+	var listed []remoteRide
+	if json.Unmarshal(body, &listed) != nil {
+		return nil, errors.New(server.Host + ": bad ride list")
+	}
+	rows := make([]driveOffer, 0, len(listed))
+	for _, ride := range listed {
+		when, err := time.Parse(time.RFC3339, ride.PickupTime)
+		if err != nil {
+			when, err = time.Parse(time.RFC3339Nano, ride.PickupTime)
+		}
+		if err != nil {
+			return nil, errors.New(server.Host + ": bad pickup time")
+		}
+		meters := kmToMeters(ride.DistanceKm)
+		rows = append(rows, driveOffer{
+			ID:           ride.ID,
+			Server:       server.Host,
+			Coin:         server.Coin,
+			StartAddress: ride.StartAddress,
+			EndAddress:   ride.EndAddress,
+			PickupKm:     ride.PickupDistanceKm,
+			TripM:        meters,
+			When:         when,
+			StartLat:     ride.Start.Lat,
+			StartLon:     ride.Start.Lng,
+			Immediate:    !when.After(now.Add(nowWindow)),
+			Fare:         fareLovelace(server.Base, server.PerKm, meters),
+			Base:         server.Base,
+			PerKm:        server.PerKm,
+		})
+	}
+	return rows, nil
+}
+
+func kmToMeters(km float64) uint64 {
+	if math.IsNaN(km) || math.IsInf(km, 0) || km <= 0 {
+		return 0
+	}
+	meters := math.Round(km * 1000)
+	if meters >= math.MaxUint64 {
+		return math.MaxUint64
+	}
+	return uint64(meters)
 }
 
 // driveBefore orders rides for now ahead of later ones, nearest pickup first.
@@ -274,60 +334,6 @@ func driveBefore(a, b driveOffer) bool {
 		return a.PickupKm < b.PickupKm
 	}
 	return a.When.Before(b.When)
-}
-
-func mockCatalog() []catalogRide {
-	specs := []struct {
-		id, start, end string
-		after          time.Duration
-		pickupM, tripM uint64
-		bearing        float64
-	}{
-		{"9f2c01", "Prielmayerstraße", "Karlsplatz", 5 * time.Minute, 400, 1600, 0},
-		{"9f2c02", "Stachus", "Odeonsplatz", 12 * time.Minute, 1200, 3000, 90},
-		{"9f2c03", "Sendlinger Tor", "Münchner Freiheit", 3 * time.Hour, 2500, 4200, 45},
-		{"9f2c04", "Theresienwiese", "Hauptbahnhof", 26 * time.Hour, 4800, 2100, 180},
-		{"9f2c05", "Nymphenburg", "Marienplatz", 8 * time.Minute, 7000, 8000, 270},
-		{"9f2c06", "Garching", "Hauptbahnhof", 50 * time.Hour, 12000, 15000, 10},
-	}
-	out := make([]catalogRide, len(specs))
-	for i, spec := range specs {
-		lat, lon := destination(gps.MockLat, gps.MockLon, spec.bearing, float64(spec.pickupM)/1000)
-		out[i] = catalogRide{
-			id:           spec.id,
-			startAddress: spec.start,
-			endAddress:   spec.end,
-			after:        spec.after,
-			tripM:        spec.tripM,
-			startLat:     lat,
-			startLon:     lon,
-		}
-	}
-	return out
-}
-
-func destination(lat, lon, bearingDeg, distKm float64) (float64, float64) {
-	const earth = 6371.0
-	angular := distKm / earth
-	bearing := bearingDeg * math.Pi / 180
-	lat1 := lat * math.Pi / 180
-	lon1 := lon * math.Pi / 180
-	lat2 := math.Asin(math.Sin(lat1)*math.Cos(angular) + math.Cos(lat1)*math.Sin(angular)*math.Cos(bearing))
-	lon2 := lon1 + math.Atan2(
-		math.Sin(bearing)*math.Sin(angular)*math.Cos(lat1),
-		math.Cos(angular)-math.Sin(lat1)*math.Sin(lat2),
-	)
-	return lat2 * 180 / math.Pi, lon2 * 180 / math.Pi
-}
-
-func haversineKm(lat1, lon1, lat2, lon2 float64) float64 {
-	const earth = 6371.0
-	rad := func(d float64) float64 { return d * math.Pi / 180 }
-	lat1r, lat2r := rad(lat1), rad(lat2)
-	dLat := rad(lat2 - lat1)
-	dLon := rad(lon2 - lon1)
-	h := math.Sin(dLat/2)*math.Sin(dLat/2) + math.Cos(lat1r)*math.Cos(lat2r)*math.Sin(dLon/2)*math.Sin(dLon/2)
-	return 2 * earth * math.Asin(math.Min(1, math.Sqrt(h)))
 }
 
 func formatMeters(meters uint64) string {

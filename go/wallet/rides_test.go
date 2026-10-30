@@ -1,12 +1,20 @@
 package wallet
 
 import (
+	"encoding/json"
 	"math"
+	"net/http"
 	"strconv"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestFareLovelace(t *testing.T) {
+	if got := kmToMeters(3.01); got != 3010 {
+		t.Fatalf("meters = %d", got)
+	}
 	if got := fareLovelace(2000000, 500000, 3010); got != 3505000 {
 		t.Fatalf("fare = %d", got)
 	}
@@ -33,6 +41,14 @@ func TestRegistrationFailure(t *testing.T) {
 
 func TestRegisterDriversSkipAndList(t *testing.T) {
 	setupTest(t)
+	seen := &rideQuery{}
+	inner := kikoHandler(availableWithin(munichRides, seen))
+	serveKiko(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/api/v1/driver" {
+			seen.addPost()
+		}
+		inner.ServeHTTP(w, r)
+	}))
 	if err := SetupPin("42", "42"); err != nil {
 		t.Fatal(err)
 	}
@@ -82,8 +98,14 @@ func TestRegisterDriversSkipAndList(t *testing.T) {
 	if n := DriveCount(); n != 4 {
 		t.Fatalf("default range = %d", n)
 	}
+	if got := seen.rangeKm(); got != "5" {
+		t.Fatalf("default range query = %s", got)
+	}
 	if err := RefreshDrives(8); err != nil {
 		t.Fatal(err)
+	}
+	if got := seen.rangeKm(); got != "8" {
+		t.Fatalf("range query = %s", got)
 	}
 	if n := DriveCount(); n != 5 {
 		t.Fatalf("within 8 km = %d", n)
@@ -151,10 +173,28 @@ func TestRegisterDriversSkipAndList(t *testing.T) {
 	if _, err := DriveID(99); err == nil || err.Error() != "unknown ride" {
 		t.Fatalf("unknown ride: %v", err)
 	}
+	if seen.posts() != 1 {
+		t.Fatalf("driver posts = %d", seen.posts())
+	}
+	material, err := WalletMultisigMaterial(0)
+	if err != nil || seen.key() != material {
+		t.Fatalf("driver key = %s %v", seen.key(), err)
+	}
+	pos, err := GPSPosition()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameFix(t, seen.location(), pos) {
+		t.Fatalf("location = %s want %s", seen.location(), pos)
+	}
 }
 
 func TestRegisterDriversSplitFares(t *testing.T) {
 	setupTest(t)
+	serveKikoHosts(t, map[string]http.Handler{
+		"a.example.com": kikoHandler(availableFixed(aRides)),
+		"b.example.com": kikoHandler(availableFixed(bRides)),
+	})
 	if err := SetupPin("42", "42"); err != nil {
 		t.Fatal(err)
 	}
@@ -218,6 +258,16 @@ func TestRegisterDriversSplitFares(t *testing.T) {
 
 func TestRegisterDriversServerError(t *testing.T) {
 	setupTest(t)
+	serveKiko(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/currency" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"currency":"cardano"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"driver rejected"}`))
+	}))
 	if err := SetupPin("42", "42"); err != nil {
 		t.Fatal(err)
 	}
@@ -242,11 +292,6 @@ func TestRegisterDriversServerError(t *testing.T) {
 	if err := SaveServerFees(1, "3", "1", "ada"); err != nil {
 		t.Fatal(err)
 	}
-	prev := postDriver
-	postDriver = func([]byte) ([]byte, error) {
-		return []byte(`{"error":"driver rejected"}`), nil
-	}
-	t.Cleanup(func() { postDriver = prev })
 	msg, err := RegisterDrivers()
 	if err != nil {
 		t.Fatal(err)
@@ -261,6 +306,137 @@ func TestRegisterDriversServerError(t *testing.T) {
 	if n := DriveCount(); n != 0 {
 		t.Fatalf("rejected servers still listed %d", n)
 	}
+}
+
+type sampleRide struct {
+	id, start, end string
+	after          time.Duration
+	pickup, trip   float64
+	lat, lng       float64
+}
+
+func (ride sampleRide) payload(now time.Time) remoteRide {
+	row := remoteRide{
+		ID:               ride.id,
+		StartAddress:     ride.start,
+		EndAddress:       ride.end,
+		DistanceKm:       ride.trip,
+		PickupDistanceKm: ride.pickup,
+		PickupTime:       now.Add(ride.after).UTC().Format(time.RFC3339),
+	}
+	row.Start.Lat = ride.lat
+	row.Start.Lng = ride.lng
+	return row
+}
+
+var munichRides = []sampleRide{
+	{"9f2c01", "Prielmayerstraße", "Karlsplatz", 5 * time.Minute, 0.4, 1.6, 48.140833, 11.555},
+	{"9f2c02", "Stachus", "Odeonsplatz", 12 * time.Minute, 1.2, 3, 48.15, 11.57},
+	{"9f2c03", "Sendlinger Tor", "Münchner Freiheit", 3 * time.Hour, 2.5, 4.2, 48.13, 11.56},
+	{"9f2c04", "Theresienwiese", "Hauptbahnhof", 26 * time.Hour, 4.8, 2.1, 48.12, 11.54},
+	{"9f2c05", "Nymphenburg", "Marienplatz", 8 * time.Minute, 7, 8, 48.16, 11.5},
+	{"9f2c06", "Garching", "Hauptbahnhof", 50 * time.Hour, 12, 15, 48.25, 11.65},
+}
+
+var aRides = []sampleRide{munichRides[0], munichRides[2]}
+var bRides = []sampleRide{munichRides[1], munichRides[3]}
+
+type rideQuery struct {
+	mu       sync.Mutex
+	rangeTxt string
+	loc      string
+	driver   string
+	postN    int
+}
+
+func (q *rideQuery) note(r *http.Request) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.rangeTxt = r.URL.Query().Get("range")
+	q.loc = r.URL.Query().Get("location")
+	q.driver = r.Header.Get("X-Driver-Key")
+}
+
+func (q *rideQuery) addPost() {
+	q.mu.Lock()
+	q.postN++
+	q.mu.Unlock()
+}
+
+func (q *rideQuery) rangeKm() string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.rangeTxt
+}
+
+func (q *rideQuery) location() string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.loc
+}
+
+func (q *rideQuery) key() string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.driver
+}
+
+func (q *rideQuery) posts() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.postN
+}
+
+func availableWithin(catalog []sampleRide, seen *rideQuery) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Driver-Key") == "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"missing key"}`))
+			return
+		}
+		rangeKm, err := strconv.ParseFloat(r.URL.Query().Get("range"), 64)
+		if err != nil || rangeKm <= 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"range must be a positive number of km"}`))
+			return
+		}
+		if seen != nil {
+			seen.note(r)
+		}
+		now := time.Now()
+		out := []remoteRide{}
+		for _, ride := range catalog {
+			if ride.pickup <= rangeKm {
+				out = append(out, ride.payload(now))
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out)
+	}
+}
+
+func availableFixed(catalog []sampleRide) http.HandlerFunc {
+	return availableWithin(catalog, nil)
+}
+
+func sameFix(t *testing.T, location, position string) bool {
+	t.Helper()
+	halves := strings.Split(location, ",")
+	if len(halves) != 2 {
+		return false
+	}
+	lines := strings.Split(position, "\n")
+	if len(lines) < 2 {
+		return false
+	}
+	lat, err := strconv.ParseFloat(halves[0], 64)
+	lon, err2 := strconv.ParseFloat(halves[1], 64)
+	wantLat, err3 := strconv.ParseFloat(lines[0], 64)
+	wantLon, err4 := strconv.ParseFloat(lines[1], 64)
+	if err != nil || err2 != nil || err3 != nil || err4 != nil {
+		return false
+	}
+	return math.Abs(lat-wantLat) < 1e-5 && math.Abs(lon-wantLon) < 1e-5
 }
 
 func parseKm(t *testing.T, text string) float64 {

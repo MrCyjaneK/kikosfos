@@ -1,16 +1,32 @@
 package wallet
 
 import (
+	"encoding/json"
 	"errors"
+	"net/http"
+	"strconv"
 	"strings"
 )
 
 var errIncompatible = errors.New("server is incompatible")
 
-// discoverCurrency pretends GET https://<host>/api/v1/currency.
-// There is no Kiko server yet, so every host is cardano.
-func discoverCurrency(string) (string, error) {
-	return "cardano", nil
+// discoverCurrency reads GET /api/v1/currency. The value is the coin id,
+// such as "cardano".
+func discoverCurrency(host string) (string, error) {
+	status, body, err := kikoDo(http.MethodGet, host, "/api/v1/currency", nil, nil)
+	if err != nil {
+		return "", err
+	}
+	if status != http.StatusOK {
+		return "", errors.New(host + ": " + apiError(status, body))
+	}
+	var payload struct {
+		Currency string `json:"currency"`
+	}
+	if json.Unmarshal(body, &payload) != nil || strings.TrimSpace(payload.Currency) == "" {
+		return "", errors.New(host + " did not name a currency")
+	}
+	return payload.Currency, nil
 }
 
 func normalizeHost(host string) (string, error) {
@@ -18,8 +34,14 @@ func normalizeHost(host string) (string, error) {
 	if host == "" {
 		return "", errors.New("enter a host")
 	}
-	if strings.Contains(host, "://") || strings.ContainsAny(host, "/?#:@ ") {
+	if strings.Contains(host, "://") || strings.ContainsAny(host, "/?#@ ") {
 		return "", errors.New("enter a host without a scheme or path")
+	}
+	if i := strings.LastIndex(host, ":"); i >= 0 {
+		port, err := strconv.Atoi(host[i+1:])
+		if err != nil || port < 1 || port > 65535 || i == 0 || strings.Contains(host[:i], ":") {
+			return "", errors.New("enter a host without a scheme or path")
+		}
 	}
 	return host, nil
 }

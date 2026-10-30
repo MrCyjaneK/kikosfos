@@ -102,6 +102,7 @@ func TestProfileRoundTrip(t *testing.T) {
 
 func TestServersFeesAndDriver(t *testing.T) {
 	setupTest(t)
+	serveKiko(t, nil)
 	if err := SetupPin("42", "42"); err != nil {
 		t.Fatal(err)
 	}
@@ -266,8 +267,15 @@ func TestServersFeesAndDriver(t *testing.T) {
 		t.Fatalf("car = %+v", body.Car)
 	}
 	resp, err := RegisterDriver("ride.example.com")
-	if err != nil || string(resp) != "{}" {
+	if err != nil {
+		t.Fatal(err)
+	}
+	var echoed driverBody
+	if err := json.Unmarshal(resp, &echoed); err != nil {
 		t.Fatalf("register = %s %v", resp, err)
+	}
+	if echoed.PublicKey != material || echoed.BaseFee != 3000000 || echoed.FeePerKm != 1500000 || echoed.Car.Brand != "VW" {
+		t.Fatalf("register = %+v", echoed)
 	}
 
 	if err := SaveCar("", "ID.3", "white", "B-KK 402", "2024"); err != nil {

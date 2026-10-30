@@ -3,6 +3,7 @@ package wallet
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strconv"
 	"strings"
 )
@@ -20,12 +21,6 @@ type driverCar struct {
 	Color        string `json:"color"`
 	LicensePlate string `json:"license_plate_number"`
 	Year         int    `json:"year"`
-}
-
-// postDriver pretends POST /api/v1/driver. The body is not sent.
-// Tests replace it with a server error object.
-var postDriver = func([]byte) ([]byte, error) {
-	return []byte("{}"), nil
 }
 
 // DriverRequest is the JSON body for POST /api/v1/driver.
@@ -95,12 +90,29 @@ func carComplete(car Car) bool {
 		car.Year > 0
 }
 
-// RegisterDriver builds the driver body and pretends to post it.
-// The mock response is an empty JSON object.
+// RegisterDriver posts the driver to POST /api/v1/driver.
+// A driver who is already registered is success: the server has no update.
 func RegisterDriver(host string) ([]byte, error) {
 	body, err := DriverRequest(host)
 	if err != nil {
 		return nil, err
 	}
-	return postDriver(body)
+	host, err = normalizeHost(host)
+	if err != nil {
+		return nil, err
+	}
+	status, resp, err := kikoDo(http.MethodPost, host, "/api/v1/driver", body, nil)
+	if err != nil {
+		return nil, err
+	}
+	if status == http.StatusConflict {
+		return []byte("{}"), nil
+	}
+	if status != http.StatusCreated && status != http.StatusOK {
+		return errorObject(status, resp), nil
+	}
+	if len(resp) == 0 {
+		return []byte("{}"), nil
+	}
+	return resp, nil
 }
