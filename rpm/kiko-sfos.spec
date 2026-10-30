@@ -20,12 +20,14 @@ Kiko for Sailfish.
 
 %build
 CGO_ENABLED=1 go build -C go -buildmode=c-shared -ldflags '-s -w' -o libkiko.so .
+CGO_ENABLED=1 go build -C gocar -mod=vendor -buildmode=c-shared -ldflags '-s -w' -o libcargadgetd_app_gocar.so .
 %qmake5
 %make_build
 
 %install
 %qmake5_install
 install -Dm 644 sailjail/PureMaps.permission %{buildroot}%{_sysconfdir}/sailjail/permissions/PureMaps.permission
+install -Dm 755 gocar/libcargadgetd_app_gocar.so %{buildroot}/usr/lib/cargadgetd/plugins/libcargadgetd_app_gocar.so
 
 %files
 %license LICENSES/BSD-3-Clause.txt
@@ -34,4 +36,5 @@ install -Dm 644 sailjail/PureMaps.permission %{buildroot}%{_sysconfdir}/sailjail
 %{_datadir}/applications/kiko-sfos.desktop
 %{_datadir}/icons/hicolor/*/apps/kiko-sfos.png
 %{_libdir}/libkiko.so
+/usr/lib/cargadgetd/plugins/libcargadgetd_app_gocar.so
 %{_sysconfdir}/sailjail/permissions/PureMaps.permission

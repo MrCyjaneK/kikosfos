@@ -20,14 +20,17 @@ Page {
             id: row
             contentHeight: Theme.itemSizeLarge
             property int exists: -1
-            property string balance
+            property string amountText
+            property string fiatText
 
             function reload() {
                 exists = kiko.walletExists(index)
                 if (exists === 1)
                     kiko.walletBalance(index)
-                else
-                    balance = ""
+                else {
+                    amountText = ""
+                    fiatText = ""
+                }
             }
 
             Component.onCompleted: reload()
@@ -42,12 +45,13 @@ Page {
                 onBalanceReady: {
                     if (wallet !== index || row.exists !== 1)
                         return
-                    if (message !== "")
-                        row.balance = message
-                    else if (fiat !== "")
-                        row.balance = amount + " · " + fiat
-                    else
-                        row.balance = amount
+                    if (message !== "") {
+                        row.amountText = message
+                        row.fiatText = ""
+                    } else {
+                        row.amountText = amount
+                        row.fiatText = fiat
+                    }
                 }
             }
 
@@ -75,25 +79,43 @@ Page {
                     text: kiko.walletName(index)
                 }
 
-                Label {
+                Item {
                     width: parent.width
-                    visible: row.balance !== ""
-                    truncationMode: TruncationMode.Fade
-                    text: row.balance
-                    color: Theme.secondaryColor
-                    font.pixelSize: Theme.fontSizeSmall
+                    height: amountLabel.implicitHeight
+                    visible: row.amountText !== "" || row.fiatText !== ""
+
+                    Label {
+                        id: amountLabel
+                        anchors.left: parent.left
+                        anchors.right: fiatLabel.visible ? fiatLabel.left : parent.right
+                        anchors.rightMargin: fiatLabel.visible ? Theme.paddingMedium : 0
+                        text: row.amountText
+                        font.pixelSize: Theme.fontSizeSmall
+                        color: Theme.secondaryColor
+                        truncationMode: TruncationMode.Fade
+                    }
+
+                    Label {
+                        id: fiatLabel
+                        anchors.right: parent.right
+                        anchors.baseline: amountLabel.baseline
+                        visible: row.fiatText !== ""
+                        text: row.fiatText
+                        font.pixelSize: Theme.fontSizeExtraSmall
+                        color: Theme.secondaryColor
+                    }
                 }
             }
 
-            Label {
+            Image {
                 id: statusMark
                 anchors.right: parent.right
                 anchors.rightMargin: Theme.horizontalPageMargin
                 anchors.verticalCenter: parent.verticalCenter
+                width: Theme.iconSizeSmall
+                height: width
                 visible: row.exists >= 0
-                text: row.exists === 1 ? "✓" : "✗"
-                color: row.exists === 1 ? "#3DDC84" : "#FF5252"
-                font.pixelSize: Theme.fontSizeLarge
+                source: row.exists === 1 ? "image://theme/icon-m-accept" : "image://theme/icon-m-cancel"
             }
 
             onClicked: pageStack.push(Qt.resolvedUrl("CoinPage.qml"), { wallet: index })

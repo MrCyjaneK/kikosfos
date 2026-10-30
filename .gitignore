@@ -11,6 +11,7 @@ Makefile
 *.qm
 *.ts
 go/libkiko.h
+gocar/libcargadgetd_app_gocar.h
 *.list
 *.o
 kiko-sfos

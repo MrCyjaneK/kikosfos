@@ -31,6 +31,8 @@ Page {
     property bool working
     property bool claimed
     property bool paid
+    property bool payChecking
+    property string payLabel: "Checking payment"
     property string rideStatus
     property string notice
 
@@ -42,8 +44,16 @@ Page {
             rideStatus = "paid"
         else if (rideStatus === "" && claimed)
             rideStatus = "accepted"
-        if (paid)
-            notice = rideStatus === "paid_out" ? "Paid out" : "Paid"
+        if (claimed && !paid)
+            checkPayment()
+    }
+
+    function checkPayment() {
+        if (payChecking || working || !claimed || paid)
+            return
+        payChecking = true
+        payLabel = "Checking payment"
+        kiko.driveVerify(server, rideId)
     }
 
     function quoteParts(lovelace) {
@@ -77,7 +87,7 @@ Page {
         if (working)
             return
         working = true
-        notice = page.rideStatus === "paid_out" ? "Paid out" : (paid ? "Paid" : "")
+        notice = ""
         kiko.driveNavigate(lat, lon, title)
     }
 
@@ -87,14 +97,6 @@ Page {
         working = true
         notice = ""
         kiko.driveClaim(server, rideId, pickupKm)
-    }
-
-    function checkPayment() {
-        if (working || !claimed || paid)
-            return
-        working = true
-        notice = ""
-        kiko.driveVerify(server, rideId)
     }
 
     function cashOut() {
@@ -115,33 +117,36 @@ Page {
             page.working = false
             if (message !== "")
                 page.notice = message
-            else if (page.paid)
-                page.notice = "Paid"
         }
         onClaimFinished: {
             page.working = false
             if (message === "") {
                 page.claimed = true
                 page.rideStatus = "accepted"
+                page.payLabel = "Checking payment"
+                page.checkPayment()
             } else
                 page.notice = message
         }
         onDriveVerified: {
-            page.working = false
+            page.payChecking = false
             if (message !== "") {
+                page.payLabel = "Check failed"
                 page.notice = message
                 return
             }
+            page.notice = ""
             page.paid = seen === 1
             if (page.paid)
                 page.rideStatus = "paid"
-            page.notice = page.paid ? "Paid" : "Payment not seen yet"
+            else
+                page.payLabel = "Unpaid"
         }
         onCashOutFinished: {
             page.working = false
             if (message === "") {
                 page.rideStatus = "paid_out"
-                page.notice = "Paid out"
+                page.notice = ""
             } else
                 page.notice = message
         }
@@ -174,8 +179,43 @@ Page {
                     clock: page.whenClock
                 }
 
+                Item {
+                    id: rail
+                    width: Theme.paddingMedium
+                    height: stops.height
+
+                    Rectangle {
+                        width: 2
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        anchors.top: parent.top
+                        anchors.topMargin: Theme.paddingSmall / 2
+                        anchors.bottom: parent.bottom
+                        anchors.bottomMargin: Theme.paddingSmall / 2
+                        color: Theme.rgba(Theme.highlightColor, 0.45)
+                    }
+
+                    Rectangle {
+                        width: Theme.paddingSmall
+                        height: width
+                        radius: width / 2
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        anchors.top: parent.top
+                        color: Theme.highlightColor
+                    }
+
+                    Rectangle {
+                        width: Theme.paddingSmall
+                        height: width
+                        radius: 2
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        anchors.bottom: parent.bottom
+                        color: Theme.highlightColor
+                    }
+                }
+
                 Column {
-                    width: parent.width - mark.width - Theme.paddingLarge
+                    id: stops
+                    width: parent.width - mark.width - rail.width - 2 * Theme.paddingLarge
                     spacing: Theme.paddingMedium
 
                     Label {
@@ -307,8 +347,8 @@ Page {
         Button {
             anchors.horizontalCenter: parent.horizontalCenter
             visible: page.claimed && !page.paid
-            text: "Check payment"
-            enabled: !page.working
+            text: page.payLabel
+            enabled: !page.working && !page.payChecking
             onClicked: page.checkPayment()
         }
 
@@ -321,9 +361,9 @@ Page {
 
         Button {
             anchors.horizontalCenter: parent.horizontalCenter
-            visible: page.paid && page.rideStatus !== "paid_out"
-            text: "Cash out"
-            enabled: !page.working
+            visible: page.paid
+            text: page.rideStatus === "paid_out" ? "Paid out" : "Cash out"
+            enabled: !page.working && page.rideStatus !== "paid_out"
             onClicked: page.cashOut()
         }
 
@@ -331,5 +371,12 @@ Page {
             width: 1
             height: Theme.paddingLarge
         }
+    }
+
+    Timer {
+        interval: 4000
+        repeat: true
+        running: page.status === PageStatus.Active && page.claimed && !page.paid
+        onTriggered: page.checkPayment()
     }
 }

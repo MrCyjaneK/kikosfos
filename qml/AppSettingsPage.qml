@@ -1,9 +1,13 @@
 import QtQuick 2.6
 import Sailfish.Silica 1.0
+import "components"
 
 Page {
     id: page
     property string errorText
+    property string latText
+    property string lonText
+    property string accText
     property string placeText
     property bool ready
 
@@ -19,13 +23,17 @@ Page {
             return
         var text = kiko.gpsPosition()
         if (text === "") {
+            latText = ""
+            lonText = ""
+            accText = ""
             placeText = kiko.lastError()
             return
         }
         var parts = text.split("\n")
-        placeText = parts[0] + ", " + parts[1]
-        if (parts.length > 2 && parts[2] !== "")
-            placeText += "  ±" + parts[2] + " m"
+        latText = parts[0]
+        lonText = parts.length > 1 ? parts[1] : ""
+        accText = parts.length > 2 ? parts[2] : ""
+        placeText = ""
     }
 
     function load() {
@@ -70,13 +78,12 @@ Page {
                 }
             }
 
-            Label {
-                width: parent.width - 2 * Theme.horizontalPageMargin
-                x: Theme.horizontalPageMargin
-                wrapMode: Text.Wrap
-                color: Theme.highlightColor
-                font.pixelSize: Theme.fontSizeSmall
-                text: page.placeText
+            GpsFix {
+                width: parent.width
+                lat: page.latText
+                lon: page.lonText
+                accuracy: page.accText
+                message: page.placeText
             }
 
             Label {

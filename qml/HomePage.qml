@@ -4,6 +4,9 @@ import "components"
 
 Page {
     id: page
+    property string latText
+    property string lonText
+    property string accText
     property string placeText
     property string registerText
     property string hint
@@ -22,14 +25,18 @@ Page {
     function refreshPlace() {
         var text = kiko.gpsPosition()
         if (text === "") {
+            latText = ""
+            lonText = ""
+            accText = ""
             var err = kiko.lastError()
             placeText = err !== "" ? err : "Establishing GPS"
             return
         }
         var parts = text.split("\n")
-        placeText = parts[0] + ", " + parts[1]
-        if (parts.length > 2 && parts[2] !== "")
-            placeText += "  ±" + parts[2] + " m"
+        latText = parts[0]
+        lonText = parts.length > 1 ? parts[1] : ""
+        accText = parts.length > 2 ? parts[2] : ""
+        placeText = ""
     }
 
     function sync() {
@@ -152,9 +159,14 @@ Page {
         header: Column {
             width: list.width
 
-            PageHeader {
-                title: "Kiko"
-                description: page.placeText
+            PageHeader { title: "Kiko" }
+
+            GpsFix {
+                width: parent.width
+                lat: page.latText
+                lon: page.lonText
+                accuracy: page.accText
+                message: page.placeText
             }
 
             Item {
