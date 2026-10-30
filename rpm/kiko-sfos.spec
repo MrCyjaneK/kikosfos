@@ -8,6 +8,7 @@ BuildRequires:  pkgconfig(Qt5Core)
 BuildRequires:  pkgconfig(Qt5Gui)
 BuildRequires:  pkgconfig(Qt5Qml)
 BuildRequires:  pkgconfig(Qt5Quick)
+BuildRequires:  pkgconfig(Qt5Concurrent)
 BuildRequires:  pkgconfig(sailfishapp)
 Requires:       sailfishsilica-qt5
 
@@ -28,6 +29,6 @@ CGO_ENABLED=1 go build -C go -buildmode=c-shared -ldflags '-s -w' -o libkiko.so 
 %files
 %license LICENSES/BSD-3-Clause.txt
 %{_bindir}/kiko-sfos
-%{_datadir}/kiko-sfos/qml/kiko-sfos.qml
+%{_datadir}/kiko-sfos/qml
 %{_datadir}/applications/kiko-sfos.desktop
 %{_libdir}/libkiko.so

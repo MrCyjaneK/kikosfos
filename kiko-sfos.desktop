@@ -4,3 +4,7 @@ X-Nemo-Application-Type=silica-qt5
 Icon=icon-launcher-default
 Exec=kiko-sfos
 Name=Kiko
+
+[X-Sailjail]
+OrganizationName=wtf.kiko
+ApplicationName=kiko
