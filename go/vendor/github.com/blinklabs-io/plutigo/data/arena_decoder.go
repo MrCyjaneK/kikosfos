@@ -1,0 +1,804 @@
+// Copyright 2026 Blink Labs Software
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package data
+
+import (
+	"errors"
+	"fmt"
+	"math"
+	"math/big"
+)
+
+const (
+	dataDecodeChunkSize = 64
+	dataDecodeRetainCap = 2
+	dataSliceRetainCap  = 4
+)
+
+type arenaChunks[S any] struct {
+	chunks      [][]S
+	chunkIdx    int
+	offset      int
+	activeChunk []S // cached pointer to chunks[chunkIdx]; nil when uninitialized
+}
+
+func (a *arenaChunks[S]) used() int {
+	if len(a.chunks) == 0 {
+		return 0
+	}
+	return a.chunkIdx*dataDecodeChunkSize + a.offset
+}
+
+// alloc returns the next free slot. The fast path uses the cached
+// activeChunk so we avoid reloading chunks[chunkIdx] on every call.
+func (a *arenaChunks[S]) alloc() *S {
+	if a.offset < len(a.activeChunk) {
+		slot := &a.activeChunk[a.offset]
+		a.offset++
+		return slot
+	}
+	return a.allocSlow()
+}
+
+//go:noinline
+func (a *arenaChunks[S]) allocSlow() *S {
+	if nextIdx := a.chunkIdx + 1; nextIdx < len(a.chunks) {
+		chunk := a.chunks[nextIdx]
+		if chunk != nil {
+			a.chunkIdx = nextIdx
+			a.activeChunk = chunk
+			a.offset = 1
+			return &chunk[0]
+		}
+	}
+
+	chunk := make([]S, dataDecodeChunkSize)
+	a.chunks = append(a.chunks, chunk)
+	a.chunkIdx = len(a.chunks) - 1
+	a.activeChunk = chunk
+	a.offset = 1
+	return &chunk[0]
+}
+
+func (a *arenaChunks[S]) setActiveChunkAfterReset() {
+	if len(a.chunks) > 0 {
+		a.activeChunk = a.chunks[0]
+	} else {
+		a.activeChunk = nil
+	}
+}
+
+func (a *arenaChunks[S]) reset(retainCap int) {
+	used := a.used()
+	retained := len(a.chunks)
+	if retained > retainCap {
+		retained = retainCap
+	}
+	if used > 0 && retained > 0 {
+		remaining := used
+		maxRetained := retained * dataDecodeChunkSize
+		if remaining > maxRetained {
+			remaining = maxRetained
+		}
+		for i := 0; i < retained && remaining > 0; i++ {
+			chunk := a.chunks[i]
+			if chunk == nil {
+				continue
+			}
+			clearCount := len(chunk)
+			if remaining < clearCount {
+				clearCount = remaining
+			}
+			clear(chunk[:clearCount])
+			remaining -= clearCount
+		}
+	}
+	if len(a.chunks) > retainCap {
+		for i := retainCap; i < len(a.chunks); i++ {
+			a.chunks[i] = nil
+		}
+		a.chunks = a.chunks[:retainCap]
+	}
+	a.chunkIdx = 0
+	a.offset = 0
+	a.setActiveChunkAfterReset()
+}
+
+func resetBigIntChunks(a *arenaChunks[big.Int], retainCap int) {
+	// Keep big.Int word backing arrays across decoder reuse; integer decode
+	// overwrites every allocated value before returning it.
+	if len(a.chunks) > retainCap {
+		for i := retainCap; i < len(a.chunks); i++ {
+			a.chunks[i] = nil
+		}
+		a.chunks = a.chunks[:retainCap]
+	}
+	a.chunkIdx = 0
+	a.offset = 0
+	a.setActiveChunkAfterReset()
+}
+
+type arenaSlices[S any] struct {
+	chunks [][]S
+	pos    int
+	// cur is the chunk holding pos and curBase the total length of the chunks
+	// before it. Nothing behind pos is reused before reset, so alloc resumes
+	// at cur: walking from the first chunk makes a decode quadratic in its
+	// allocation count.
+	cur     int
+	curBase int
+}
+
+// alloc returns n elements whose capacity equals n, so an append by a caller
+// of a decoded value reallocates instead of writing into the neighbouring
+// live allocation.
+func (a *arenaSlices[S]) alloc(n int) []S {
+	if n == 0 {
+		return make([]S, 0)
+	}
+
+	for a.cur < len(a.chunks) {
+		chunk := a.chunks[a.cur]
+		start := a.pos - a.curBase
+		if start+n <= len(chunk) {
+			a.pos += n
+			return chunk[start : start+n : start+n]
+		}
+		a.curBase += len(chunk)
+		a.pos = a.curBase
+		a.cur++
+	}
+
+	size := dataDecodeChunkSize
+	if n > size {
+		size = n
+	}
+	chunk := make([]S, size)
+	a.chunks = append(a.chunks, chunk)
+	a.pos += n
+	return chunk[:n:n]
+}
+
+func (a *arenaSlices[S]) reset(retainCap int) {
+	retainedUsed := a.pos
+	if len(a.chunks) > retainCap {
+		maxRetained := 0
+		for i := range retainCap {
+			maxRetained += len(a.chunks[i])
+		}
+		if retainedUsed > maxRetained {
+			retainedUsed = maxRetained
+		}
+	}
+	remaining := retainedUsed
+	for i := range a.chunks {
+		if remaining <= 0 {
+			break
+		}
+		chunk := a.chunks[i]
+		if chunk == nil {
+			continue
+		}
+		clearCount := len(chunk)
+		if remaining < clearCount {
+			clearCount = remaining
+		}
+		clear(chunk[:clearCount])
+		remaining -= clearCount
+	}
+	if len(a.chunks) > retainCap {
+		for i := retainCap; i < len(a.chunks); i++ {
+			a.chunks[i] = nil
+		}
+		a.chunks = a.chunks[:retainCap]
+	}
+	a.pos = 0
+	a.cur = 0
+	a.curBase = 0
+}
+
+// Decoder reuses arena-backed storage for decoded PlutusData values.
+//
+// Memory model: each Decode call bump-allocates from the internal arenas and
+// NEVER frees on its own. Every value returned by Decode (and all of its
+// nested children) stays valid until the next Reset, which is what lets a
+// single program containing many Data constants share one Decoder. The flip
+// side is that arena memory grows with the TOTAL number of bytes ever decoded,
+// not with the size of the largest single input.
+//
+// Therefore a long-lived Decoder reused across many independent inputs (e.g.
+// one Decoder pooled per connection) MUST call Reset between batches once it is
+// done with the previously returned values; otherwise memory grows without
+// bound (an OOM DoS on attacker-controlled input streams). If you do not need
+// to retain decoded values across calls, prefer the package-level Decode, which
+// does not retain anything between calls.
+type Decoder struct {
+	bigInts     arenaChunks[big.Int]
+	integers    arenaChunks[Integer]
+	byteStrings arenaChunks[ByteString]
+	values      arenaChunks[Value]
+	constrs     arenaChunks[Constr]
+	lists       arenaChunks[List]
+	maps        arenaChunks[Map]
+	items       arenaSlices[PlutusData]
+	pairs       arenaSlices[[2]PlutusData]
+	bytes       arenaSlices[byte]
+}
+
+// NewDecoder returns a ready-to-use Decoder with empty internal pools.
+func NewDecoder() *Decoder {
+	return &Decoder{}
+}
+
+// Reset clears all internal arena pools so the Decoder can be reused; previously returned values become invalid.
+func (d *Decoder) Reset() {
+	resetBigIntChunks(&d.bigInts, dataDecodeRetainCap)
+	d.integers.reset(dataDecodeRetainCap)
+	d.byteStrings.reset(dataDecodeRetainCap)
+	d.values.reset(dataDecodeRetainCap)
+	d.constrs.reset(dataDecodeRetainCap)
+	d.lists.reset(dataDecodeRetainCap)
+	d.maps.reset(dataDecodeRetainCap)
+	d.items.reset(dataSliceRetainCap)
+	d.pairs.reset(dataSliceRetainCap)
+	d.bytes.reset(dataSliceRetainCap)
+}
+
+// Decode decodes CBOR bytes into PlutusData; the Decoder is not safe for
+// concurrent use. Decode does not free arena memory — see the Decoder type
+// docs for the accumulate-until-Reset memory model and when callers must Reset.
+func (d *Decoder) Decode(data []byte) (PlutusData, error) {
+	v, err := d.decode(data, newDecodeState())
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode CBOR: %w", err)
+	}
+	return v, nil
+}
+
+func (d *Decoder) decode(data []byte, state *decodeState) (PlutusData, error) {
+	v, rest, err := d.decodeNextPlutusData(data, state)
+	if err != nil {
+		return nil, err
+	}
+	if len(rest) > 0 {
+		return nil, fmt.Errorf("unexpected %d trailing bytes", len(rest))
+	}
+	return v, nil
+}
+
+func (d *Decoder) decodePrimitive(data []byte, state *decodeState) (PlutusData, error) {
+	cborType := data[0] & CborTypeMask
+	switch cborType {
+	case CborTypeUnsignedInt, CborTypeNegativeInt:
+		return d.decodeInteger(data)
+	case CborTypeByteString:
+		return d.decodeByteString(data)
+	case CborTypeTag:
+		tagNumber, _, err := decodeCBORTag(data)
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case tagNumber == 102 || (tagNumber >= 121 && tagNumber <= 127) || (tagNumber >= 1280 && tagNumber <= 1400):
+			return nil, fmt.Errorf("unexpected constructor tag in scalar decoder: %d", tagNumber)
+		case tagNumber == 2 || tagNumber == 3:
+			return d.decodeInteger(data)
+		default:
+			return nil, fmt.Errorf("unknown CBOR tag for PlutusData: %d", tagNumber)
+		}
+	}
+	return nil, fmt.Errorf("unsupported CBOR major type 0x%02x for PlutusData", cborType)
+}
+
+func (d *Decoder) decodeNextPlutusData(
+	data []byte,
+	state *decodeState,
+) (PlutusData, []byte, error) {
+	if len(data) == 0 {
+		return nil, nil, errors.New("empty data")
+	}
+	if err := state.enterValue(); err != nil {
+		return nil, nil, err
+	}
+	defer state.leaveValue()
+
+	switch data[0] & CborTypeMask {
+	case CborTypeArray:
+		tmpList, rest, err := d.decodeListNextEntered(data, state)
+		if err != nil {
+			return nil, nil, err
+		}
+		return tmpList, rest, nil
+	case CborTypeMap:
+		tmpMap, rest, err := d.decodeMapNextEntered(data, state)
+		if err != nil {
+			return nil, nil, err
+		}
+		return tmpMap, rest, nil
+	case CborTypeTag:
+		tagNumber, tagContent, err := decodeCBORTag(data)
+		if err != nil {
+			return nil, nil, err
+		}
+		switch {
+		case tagNumber == 102 || (tagNumber >= 121 && tagNumber <= 127) || (tagNumber >= 1280 && tagNumber <= 1400):
+			tmpConstr, rest, err := d.decodeConstrNextEntered(
+				tagNumber,
+				tagContent,
+				state,
+			)
+			if err != nil {
+				return nil, nil, err
+			}
+			return tmpConstr, rest, nil
+		case tagNumber == valueCBORTag:
+			tmpValue, rest, err := d.decodeValueNextEntered(tagContent, state)
+			if err != nil {
+				return nil, nil, err
+			}
+			return tmpValue, rest, nil
+		}
+	}
+
+	item, rest, err := splitCBORItemEntered(data, state)
+	if err != nil {
+		return nil, nil, err
+	}
+	tmp, err := d.decodePrimitive(item, state)
+	if err != nil {
+		return nil, nil, err
+	}
+	return tmp, rest, nil
+}
+
+// decodeValueNextEntered decodes the content of a tag 1401 item. The tag has
+// already been counted by the caller; the inner map is counted here, so each
+// node of the tagged subtree is charged exactly once.
+func (d *Decoder) decodeValueNextEntered(
+	data []byte,
+	state *decodeState,
+) (*Value, []byte, error) {
+	if err := state.enterValue(); err != nil {
+		return nil, nil, err
+	}
+	defer state.leaveValue()
+	inner, rest, err := d.decodeMapNextEntered(data, state)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := (&Value{Inner: inner}).Validate(); err != nil {
+		return nil, nil, err
+	}
+	value := d.values.alloc()
+	value.Inner = inner
+	return value, rest, nil
+}
+
+func (d *Decoder) decodeConstrNextEntered(
+	tagNumber uint64,
+	data []byte,
+	state *decodeState,
+) (*Constr, []byte, error) {
+	constr := d.constrs.alloc()
+	switch {
+	case tagNumber >= 121 && tagNumber <= 127:
+		tmpFields, tmpUseIndef, rest, err := d.decodeListItemsNextEntered(
+			data,
+			state,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		constr.Tag = d.bigInts.alloc().SetUint64(tagNumber - 121)
+		constr.Fields = tmpFields
+		constr.useIndef = tmpUseIndef
+		return constr, rest, nil
+	case tagNumber >= 1280 && tagNumber <= 1400:
+		tmpFields, tmpUseIndef, rest, err := d.decodeListItemsNextEntered(
+			data,
+			state,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		constr.Tag = d.bigInts.alloc().SetUint64(tagNumber - 1280 + 7)
+		constr.Fields = tmpFields
+		constr.useIndef = tmpUseIndef
+		return constr, rest, nil
+	case tagNumber == 102:
+		fieldCount, rest, useIndef, err := decodeCBORArray(data)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !useIndef && fieldCount != 2 {
+			return nil, nil, fmt.Errorf("constructor 102 outer array has %d items, want 2", fieldCount)
+		}
+
+		alternative, next, err := decodeCBORUint(rest)
+		if err != nil {
+			return nil, nil, err
+		}
+		rest = next
+
+		tmpFields, tmpUseIndef, next, err := d.decodeListItemsNextEntered(
+			rest,
+			state,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		rest = next
+
+		if useIndef {
+			if len(rest) == 0 || rest[0] != 0xff {
+				return nil, nil, errors.New("unterminated indefinite-length CBOR array")
+			}
+			rest = rest[1:]
+		}
+
+		constr.Tag = d.bigInts.alloc().SetUint64(alternative)
+		constr.Fields = tmpFields
+		constr.useIndef = tmpUseIndef
+		return constr, rest, nil
+	default:
+		return nil, nil, fmt.Errorf("unknown CBOR tag for PlutusData constructor: %d", tagNumber)
+	}
+}
+
+func (d *Decoder) decodeMapNextEntered(data []byte, state *decodeState) (*Map, []byte, error) {
+	pairCount, rest, useIndef, err := decodeCBORMap(data)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if !useIndef {
+		if pairCount > len(rest)/2 {
+			return nil, nil, fmt.Errorf("CBOR map claims %d pairs but only %d bytes remain", pairCount, len(rest))
+		}
+		if err := state.checkAdditionalNodes(pairCount * 2); err != nil {
+			return nil, nil, err
+		}
+		pairs := d.pairs.alloc(pairCount)
+		for i := range pairCount {
+			pair, next, err := d.decodeMapPairNextEntered(rest, state)
+			if err != nil {
+				return nil, nil, err
+			}
+			pairs[i] = pair
+			rest = next
+		}
+
+		decoded := d.maps.alloc()
+		decoded.Pairs = pairs
+		decoded.useIndef = useIndefPtr(false)
+		return decoded, rest, nil
+	}
+
+	var (
+		smallPairs [4][2]PlutusData
+		pairs      [][2]PlutusData
+		pairLen    int
+	)
+	for {
+		if len(rest) == 0 {
+			return nil, nil, errors.New("unterminated indefinite-length CBOR map")
+		}
+		if rest[0] == 0xff {
+			rest = rest[1:]
+			break
+		}
+
+		pair, next, err := d.decodeMapPairNextEntered(rest, state)
+		if err != nil {
+			return nil, nil, err
+		}
+		rest = next
+
+		if pairs != nil {
+			if pairLen == len(pairs) {
+				grown := d.pairs.alloc(max(pairLen*2, pairLen+1))
+				copy(grown, pairs[:pairLen])
+				pairs = grown
+			}
+			pairs[pairLen] = pair
+			pairLen++
+			continue
+		}
+		if pairLen < len(smallPairs) {
+			smallPairs[pairLen] = pair
+			pairLen++
+			continue
+		}
+		pairs = d.pairs.alloc(pairLen * 2)
+		copy(pairs, smallPairs[:pairLen])
+		pairs[pairLen] = pair
+		pairLen++
+	}
+
+	if pairs == nil {
+		pairs = d.pairs.alloc(pairLen)
+		copy(pairs, smallPairs[:pairLen])
+	} else {
+		pairs = pairs[:pairLen:pairLen]
+	}
+
+	decoded := d.maps.alloc()
+	decoded.Pairs = pairs
+	decoded.useIndef = useIndefPtr(true)
+	return decoded, rest, nil
+}
+
+func (d *Decoder) decodeMapPairNextEntered(
+	data []byte,
+	state *decodeState,
+) ([2]PlutusData, []byte, error) {
+	key, rest, err := d.decodeNextPlutusData(data, state)
+	if err != nil {
+		return [2]PlutusData{}, nil, err
+	}
+	value, rest, err := d.decodeNextPlutusData(rest, state)
+	if err != nil {
+		return [2]PlutusData{}, nil, err
+	}
+	return [2]PlutusData{key, value}, rest, nil
+}
+
+func (d *Decoder) decodeListNextEntered(data []byte, state *decodeState) (*List, []byte, error) {
+	tmpItems, tmpUseIndef, rest, err := d.decodeListItemsNextEntered(
+		data,
+		state,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	decoded := d.lists.alloc()
+	decoded.Items = tmpItems
+	decoded.useIndef = tmpUseIndef
+	return decoded, rest, nil
+}
+
+func (d *Decoder) decodeListItemsNextEntered(
+	data []byte,
+	state *decodeState,
+) ([]PlutusData, *bool, []byte, error) {
+	itemCount, rest, useIndef, err := decodeCBORArray(data)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	if !useIndef {
+		tmpItems, rest, err := d.decodeListItemsDefiniteEntered(
+			itemCount,
+			rest,
+			state,
+		)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		return tmpItems, useIndefPtr(false), rest, nil
+	}
+
+	var smallItems [4]PlutusData
+	var tmpItems []PlutusData
+	tmpLen := 0
+	for {
+		if len(rest) == 0 {
+			return nil, nil, nil, errors.New("unterminated indefinite-length CBOR array")
+		}
+		if rest[0] == 0xff {
+			rest = rest[1:]
+			break
+		}
+
+		tmp, next, err := d.decodeNextPlutusData(rest, state)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		rest = next
+
+		if tmpItems != nil {
+			if tmpLen == len(tmpItems) {
+				grown := d.items.alloc(max(tmpLen*2, tmpLen+1))
+				copy(grown, tmpItems[:tmpLen])
+				tmpItems = grown
+			}
+			tmpItems[tmpLen] = tmp
+			tmpLen++
+			continue
+		}
+		if tmpLen < len(smallItems) {
+			smallItems[tmpLen] = tmp
+			tmpLen++
+			continue
+		}
+		tmpItems = d.items.alloc(tmpLen * 2)
+		copy(tmpItems, smallItems[:tmpLen])
+		tmpItems[tmpLen] = tmp
+		tmpLen++
+	}
+
+	if tmpItems == nil {
+		tmpItems = d.items.alloc(tmpLen)
+		copy(tmpItems, smallItems[:tmpLen])
+	} else {
+		tmpItems = tmpItems[:tmpLen:tmpLen]
+	}
+	return tmpItems, useIndefPtr(true), rest, nil
+}
+
+func (d *Decoder) decodeListItemsDefiniteEntered(
+	itemCount int,
+	rest []byte,
+	state *decodeState,
+) ([]PlutusData, []byte, error) {
+	if itemCount > len(rest) {
+		return nil, nil, fmt.Errorf("CBOR array claims %d items but only %d bytes remain", itemCount, len(rest))
+	}
+	if err := state.checkAdditionalNodes(itemCount); err != nil {
+		return nil, nil, err
+	}
+	tmpItems := d.items.alloc(itemCount)
+	for i := range itemCount {
+		tmp, next, err := d.decodeNextPlutusData(rest, state)
+		if err != nil {
+			return nil, nil, err
+		}
+		rest = next
+		tmpItems[i] = tmp
+	}
+	return tmpItems, rest, nil
+}
+
+var bigIntOne = big.NewInt(1)
+
+func (d *Decoder) allocBigInt() *big.Int {
+	return d.bigInts.alloc()
+}
+
+func (d *Decoder) allocInteger(inner *big.Int) *Integer {
+	integer := d.integers.alloc()
+	integer.Inner = inner
+	return integer
+}
+
+func (d *Decoder) decodeInteger(data []byte) (*Integer, error) {
+	cborType, value, rest, indefinite, err := decodeCBORHead(data)
+	if err != nil {
+		return nil, err
+	}
+
+	switch cborType {
+	case CborTypeUnsignedInt:
+		if indefinite {
+			return nil, errors.New("indefinite CBOR integer is not supported")
+		}
+		if len(rest) > 0 {
+			return nil, fmt.Errorf("unexpected %d trailing bytes", len(rest))
+		}
+		inner := d.allocBigInt()
+		inner.SetUint64(value)
+		return d.allocInteger(inner), nil
+	case CborTypeNegativeInt:
+		if indefinite {
+			return nil, errors.New("indefinite CBOR integer is not supported")
+		}
+		if len(rest) > 0 {
+			return nil, fmt.Errorf("unexpected %d trailing bytes", len(rest))
+		}
+		inner := d.allocBigInt()
+		inner.SetUint64(value)
+		inner.Add(inner, bigIntOne)
+		inner.Neg(inner)
+		return d.allocInteger(inner), nil
+	case CborTypeTag:
+		if indefinite {
+			return nil, errors.New("indefinite CBOR tags are not supported")
+		}
+		if value != 2 && value != 3 {
+			return nil, fmt.Errorf("unknown CBOR tag for PlutusData: %d", value)
+		}
+		bytes, rest, err := d.decodeByteStringContent(rest)
+		if err != nil {
+			return nil, err
+		}
+		if len(rest) > 0 {
+			return nil, fmt.Errorf("unexpected %d trailing bytes", len(rest))
+		}
+		inner := d.allocBigInt()
+		inner.SetBytes(bytes)
+		if value == 3 {
+			inner.Add(inner, bigIntOne)
+			inner.Neg(inner)
+		}
+		return d.allocInteger(inner), nil
+	default:
+		return nil, fmt.Errorf("unsupported CBOR type for PlutusData integer: 0x%02x", cborType)
+	}
+}
+
+func (d *Decoder) decodeByteString(data []byte) (*ByteString, error) {
+	inner, rest, err := d.decodeByteStringContent(data)
+	if err != nil {
+		return nil, err
+	}
+	if len(rest) > 0 {
+		return nil, fmt.Errorf("unexpected %d trailing bytes", len(rest))
+	}
+	value := d.byteStrings.alloc()
+	value.Inner = inner
+	return value, nil
+}
+
+func (d *Decoder) decodeByteStringContent(data []byte) ([]byte, []byte, error) {
+	value, rest, indefinite, err := decodeCBORHeadValue(data, CborTypeByteString)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !indefinite {
+		if err := checkByteStringLeafSize(value); err != nil {
+			return nil, nil, err
+		}
+		if value > uint64(len(rest)) {
+			return nil, nil, errors.New("truncated CBOR payload")
+		}
+		inner := d.bytes.alloc(int(value))
+		copy(inner, rest[:value])
+		return inner, rest[value:], nil
+	}
+
+	total := 0
+	scan := rest
+	for {
+		if len(scan) == 0 {
+			return nil, nil, errors.New("unterminated indefinite-length CBOR string")
+		}
+		if scan[0] == 0xff {
+			break
+		}
+		chunkType, chunkValue, chunkRest, chunkIndef, err := decodeCBORHead(scan)
+		if err != nil {
+			return nil, nil, err
+		}
+		if chunkIndef || chunkType != CborTypeByteString {
+			return nil, nil, fmt.Errorf("invalid CBOR chunk type 0x%02x", chunkType)
+		}
+		if err := checkByteStringLeafSize(chunkValue); err != nil {
+			return nil, nil, err
+		}
+		if chunkValue > uint64(len(chunkRest)) {
+			return nil, nil, errors.New("truncated CBOR payload")
+		}
+		if chunkValue > uint64(math.MaxInt-total) {
+			return nil, nil, fmt.Errorf("CBOR byte string too large: %d", chunkValue)
+		}
+		total += int(chunkValue)
+		scan = chunkRest[chunkValue:]
+	}
+
+	inner := d.bytes.alloc(total)
+	offset := 0
+	for {
+		if rest[0] == 0xff {
+			return inner, rest[1:], nil
+		}
+		_, chunkValue, chunkRest, _, err := decodeCBORHead(rest)
+		if err != nil {
+			return nil, nil, err
+		}
+		copy(inner[offset:], chunkRest[:chunkValue])
+		offset += int(chunkValue)
+		rest = chunkRest[chunkValue:]
+	}
+}

@@ -1,0 +1,2265 @@
+// Copyright 2026 Blink Labs Software
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package localstatequery
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math/big"
+
+	"github.com/blinklabs-io/gouroboros/cbor"
+	"github.com/blinklabs-io/gouroboros/ledger"
+	lcommon "github.com/blinklabs-io/gouroboros/ledger/common"
+	"github.com/blinklabs-io/gouroboros/protocol/internal/cborpreflight"
+)
+
+// Query types
+const (
+	QueryTypeBlock        = 0
+	QueryTypeSystemStart  = 1
+	QueryTypeChainBlockNo = 2
+	QueryTypeChainPoint   = 3
+
+	// Block query sub-types
+	QueryTypeShelley  = 0
+	QueryTypeHardFork = 2
+
+	// Hard fork query sub-types
+	QueryTypeHardForkEraHistory = 0
+	QueryTypeHardForkCurrentEra = 1
+
+	// Shelley query sub-types
+	QueryTypeShelleyLedgerTip                           = 0
+	QueryTypeShelleyEpochNo                             = 1
+	QueryTypeShelleyNonMyopicMemberRewards              = 2
+	QueryTypeShelleyCurrentProtocolParams               = 3
+	QueryTypeShelleyProposedProtocolParamsUpdates       = 4
+	QueryTypeShelleyStakeDistribution                   = 5
+	QueryTypeShelleyUtxoByAddress                       = 6
+	QueryTypeShelleyUtxoWhole                           = 7
+	QueryTypeShelleyDebugEpochState                     = 8
+	QueryTypeShelleyCbor                                = 9
+	QueryTypeShelleyFilteredDelegationAndRewardAccounts = 10
+	QueryTypeShelleyGenesisConfig                       = 11
+	QueryTypeShelleyDebugNewEpochState                  = 12
+	QueryTypeShelleyDebugChainDepState                  = 13
+	QueryTypeShelleyRewardProvenance                    = 14
+	QueryTypeShelleyUtxoByTxin                          = 15
+	QueryTypeShelleyStakePools                          = 16
+	QueryTypeShelleyStakePoolParams                     = 17
+	QueryTypeShelleyRewardInfoPools                     = 18
+	QueryTypeShelleyPoolState                           = 19
+	QueryTypeShelleyStakeSnapshots                      = 20
+	QueryTypeShelleyPoolDistr                           = 21
+	QueryTypeShelleyStakeDelegDeposits                  = 22
+
+	// Conway governance queries (v8+)
+	QueryTypeShelleyConstitution           = 23
+	QueryTypeShelleyGovState               = 24
+	QueryTypeShelleyDRepState              = 25
+	QueryTypeShelleyDRepStakeDistr         = 26
+	QueryTypeShelleyCommitteeMembersState  = 27
+	QueryTypeShelleyFilteredVoteDelegatees = 28
+	QueryTypeShelleyAccountState           = 29
+	QueryTypeShelleySPOStakeDistr          = 30
+	QueryTypeShelleyGetProposals           = 31
+	QueryTypeShelleyGetRatifyState         = 32
+
+	// GetLedgerPeerSnapshot (Shelley sub-query 34, NtC v19+ / cardano-node
+	// 10.7+): [34] up to v22, [34, peer_kind] from v23.
+	QueryTypeShelleyGetLedgerPeerSnapshot = 34
+
+	// GetPoolDistr2 (Shelley sub-query 36) replaces GetPoolDistr from NtC v21.
+	// cardano-cli sends it while computing a leadership schedule.
+	QueryTypeShelleyPoolDistr2 = 36
+
+	// Shelley queries added after node-to-client version 19. See
+	// shelleyQuerySupported for the versions that carry them.
+	QueryTypeShelleyStakePoolDefaultVote    = 35
+	QueryTypeShelleyStakeDistribution2      = 37
+	QueryTypeShelleyMaxMajorProtocolVersion = 38
+	QueryTypeShelleyDRepDelegations         = 39
+
+	// GetStakePoolState (Shelley sub-query 40) reports the state of the
+	// registered stake pools. Only Leios prototype nodes answer it, from
+	// node-to-client version 23; released nodes do not have the query.
+	QueryTypeShelleyStakePoolState = 40
+
+	// A Shelley query needs at most one GetCBOR wrapper in current clients.
+	// Keep compatibility headroom while bounding recursive custom decoding of
+	// peer-controlled queries well below the general CBOR nesting limit.
+	maxShelleyCborQueryDepth = 32
+)
+
+// LedgerPeerKind selects which ledger peers the snapshot covers.
+// LedgerPeerKindAll requires node-to-client v23; v19 to v22 expose only
+// LedgerPeerKindBig, the high-stake pools used by the diffusion layer for
+// Genesis.
+type LedgerPeerKind int
+
+const (
+	LedgerPeerKindAll LedgerPeerKind = 0 // SingAllLedgerPeers
+	LedgerPeerKindBig LedgerPeerKind = 1 // SingBigLedgerPeers
+)
+
+// simpleQueryBase is a helper type used for various query types
+// to reduce repeat code
+type simpleQueryBase struct {
+	cbor.StructAsArray
+	Type int
+}
+
+// QueryWrapper is used for decoding a query from CBOR
+type QueryWrapper struct {
+	cbor.DecodeStoreCbor
+	Query any
+}
+
+func (q *QueryWrapper) UnmarshalCBOR(data []byte) error {
+	// Store original CBOR
+	q.SetCbor(data)
+	// Decode query
+	tmpQuery, err := decodeQuery(
+		data,
+		"",
+		map[int]any{
+			QueryTypeBlock:        &BlockQuery{},
+			QueryTypeSystemStart:  &SystemStartQuery{},
+			QueryTypeChainBlockNo: &ChainBlockNoQuery{},
+			QueryTypeChainPoint:   &ChainPointQuery{},
+		},
+	)
+	if err != nil {
+		return err
+	}
+	q.Query = tmpQuery
+	return nil
+}
+
+func (q *QueryWrapper) MarshalCBOR() ([]byte, error) {
+	return cbor.Encode(q.Query)
+}
+
+type BlockQuery struct {
+	Query any
+}
+
+func (q *BlockQuery) MarshalCBOR() ([]byte, error) {
+	tmpData := []any{
+		QueryTypeBlock,
+		q.Query,
+	}
+	return cbor.Encode(tmpData)
+}
+
+func (q *BlockQuery) UnmarshalCBOR(data []byte) error {
+	// Unwrap
+	tmpData := struct {
+		cbor.StructAsArray
+		Type     int
+		SubQuery cbor.RawMessage
+	}{}
+	if _, err := cbor.Decode(data, &tmpData); err != nil {
+		return err
+	}
+	// Decode query
+	tmpQuery, err := decodeQuery(
+		tmpData.SubQuery,
+		"Block",
+		map[int]any{
+			QueryTypeShelley:  &ShelleyQuery{},
+			QueryTypeHardFork: &HardForkQuery{},
+		},
+	)
+	if err != nil {
+		return err
+	}
+	q.Query = tmpQuery
+	return nil
+}
+
+type ShelleyQuery struct {
+	Era   uint
+	Query any
+}
+
+func (q *ShelleyQuery) MarshalCBOR() ([]byte, error) {
+	tmpData := []any{
+		QueryTypeShelley,
+		[]any{
+			q.Era,
+			q.Query,
+		},
+	}
+	return cbor.Encode(tmpData)
+}
+
+func (q *ShelleyQuery) UnmarshalCBOR(data []byte) error {
+	// Unwrap
+	tmpData := struct {
+		cbor.StructAsArray
+		Type  int
+		Inner struct {
+			cbor.StructAsArray
+			Era      uint
+			SubQuery cbor.RawMessage
+		}
+	}{}
+	if _, err := cbor.Decode(data, &tmpData); err != nil {
+		return err
+	}
+	// Decode query
+	tmpQuery, err := decodeShelleyQuery(tmpData.Inner.SubQuery)
+	if err != nil {
+		return err
+	}
+	q.Era = tmpData.Inner.Era
+	q.Query = tmpQuery
+	return nil
+}
+
+// shelleyQueryTypes returns a fresh decode target for every Shelley
+// block-query leaf. A new map with new pointer values is built per call so
+// concurrent decodes never share mutable state.
+func shelleyQueryTypes() map[int]any {
+	return map[int]any{
+		QueryTypeShelleyLedgerTip:                           &ShelleyLedgerTipQuery{},
+		QueryTypeShelleyEpochNo:                             &ShelleyEpochNoQuery{},
+		QueryTypeShelleyNonMyopicMemberRewards:              &ShelleyNonMyopicMemberRewardsQuery{},
+		QueryTypeShelleyCurrentProtocolParams:               &ShelleyCurrentProtocolParamsQuery{},
+		QueryTypeShelleyProposedProtocolParamsUpdates:       &ShelleyProposedProtocolParamsUpdatesQuery{},
+		QueryTypeShelleyStakeDistribution:                   &ShelleyStakeDistributionQuery{},
+		QueryTypeShelleyUtxoByAddress:                       &ShelleyUtxoByAddressQuery{},
+		QueryTypeShelleyUtxoWhole:                           &ShelleyUtxoWholeQuery{},
+		QueryTypeShelleyDebugEpochState:                     &ShelleyDebugEpochStateQuery{},
+		QueryTypeShelleyCbor:                                &ShelleyCborQuery{},
+		QueryTypeShelleyFilteredDelegationAndRewardAccounts: &ShelleyFilteredDelegationAndRewardAccountsQuery{},
+		QueryTypeShelleyGenesisConfig:                       &ShelleyGenesisConfigQuery{},
+		QueryTypeShelleyDebugNewEpochState:                  &ShelleyDebugNewEpochStateQuery{},
+		QueryTypeShelleyDebugChainDepState:                  &ShelleyDebugChainDepStateQuery{},
+		QueryTypeShelleyRewardProvenance:                    &ShelleyRewardProvenanceQuery{},
+		QueryTypeShelleyUtxoByTxin:                          &ShelleyUtxoByTxinQuery{},
+		QueryTypeShelleyStakePools:                          &ShelleyStakePoolsQuery{},
+		QueryTypeShelleyStakePoolParams:                     &ShelleyStakePoolParamsQuery{},
+		QueryTypeShelleyRewardInfoPools:                     &ShelleyRewardInfoPoolsQuery{},
+		QueryTypeShelleyPoolState:                           &ShelleyPoolStateQuery{},
+		QueryTypeShelleyStakeSnapshots:                      &ShelleyStakeSnapshotsQuery{},
+		QueryTypeShelleyPoolDistr:                           &ShelleyPoolDistrQuery{},
+		QueryTypeShelleyPoolDistr2:                          &ShelleyPoolDistr2Query{},
+		QueryTypeShelleyStakeDelegDeposits:                  &ShelleyStakeDelegDepositsQuery{},
+		// Conway governance queries
+		QueryTypeShelleyConstitution:            &ShelleyConstitutionQuery{},
+		QueryTypeShelleyGovState:                &ShelleyGovStateQuery{},
+		QueryTypeShelleyDRepState:               &ShelleyDRepStateQuery{},
+		QueryTypeShelleyDRepStakeDistr:          &ShelleyDRepStakeDistrQuery{},
+		QueryTypeShelleyCommitteeMembersState:   &ShelleyCommitteeMembersStateQuery{},
+		QueryTypeShelleyFilteredVoteDelegatees:  &ShelleyFilteredVoteDelegateesQuery{},
+		QueryTypeShelleyAccountState:            &ShelleyAccountStateQuery{},
+		QueryTypeShelleySPOStakeDistr:           &ShelleySPOStakeDistrQuery{},
+		QueryTypeShelleyGetProposals:            &ShelleyGetProposalsQuery{},
+		QueryTypeShelleyGetRatifyState:          &ShelleyGetRatifyStateQuery{},
+		QueryTypeShelleyGetLedgerPeerSnapshot:   &ShelleyGetLedgerPeerSnapshotQuery{},
+		QueryTypeShelleyStakePoolDefaultVote:    &ShelleyStakePoolDefaultVoteQuery{},
+		QueryTypeShelleyStakeDistribution2:      &ShelleyStakeDistribution2Query{},
+		QueryTypeShelleyMaxMajorProtocolVersion: &ShelleyMaxMajorProtocolVersionQuery{},
+		QueryTypeShelleyDRepDelegations:         &ShelleyDRepDelegationsQuery{},
+		QueryTypeShelleyStakePoolState:          &ShelleyStakePoolStateQuery{},
+	}
+}
+
+// decodeShelleyQuery decodes a single Shelley block-query leaf (the
+// [tag, args...] form without the surrounding era wrapper). It is shared by
+// the era-wrapped path in ShelleyQuery and by the inner query carried by the
+// GetCBOR combinator (ShelleyCborQuery).
+func decodeShelleyQuery(data []byte) (any, error) {
+	return decodeShelleyQueryAtDepth(data, 0)
+}
+
+func decodeShelleyQueryAtDepth(data []byte, depth int) (any, error) {
+	queryType, err := cbor.DecodeIdFromList(data)
+	if err != nil {
+		return nil, err
+	}
+	if queryType == QueryTypeShelleyCbor {
+		return decodeShelleyCborQuery(data, depth)
+	}
+	if err := validateShelleyQuerySets(data, queryType); err != nil {
+		return nil, err
+	}
+	return decodeQuery(data, "Block", shelleyQueryTypes())
+}
+
+// shelleyQuerySetFields lists, per Shelley query, the argument positions that
+// carry a peer-controlled set or list filter.
+var shelleyQuerySetFields = map[int][]int{
+	QueryTypeShelleyUtxoByAddress:                       {1},
+	QueryTypeShelleyFilteredDelegationAndRewardAccounts: {1},
+	QueryTypeShelleyUtxoByTxin:                          {1},
+	QueryTypeShelleyStakePoolParams:                     {1},
+	QueryTypeShelleyStakeDelegDeposits:                  {1},
+	QueryTypeShelleyDRepState:                           {1},
+	QueryTypeShelleyDRepStakeDistr:                      {1},
+	QueryTypeShelleyCommitteeMembersState:               {1, 2, 3},
+	QueryTypeShelleyFilteredVoteDelegatees:              {1},
+	QueryTypeShelleySPOStakeDistr:                       {1},
+	QueryTypeShelleyGetProposals:                        {1},
+	QueryTypeShelleyDRepDelegations:                     {1},
+}
+
+// validateShelleyQuerySets bounds the element count of every peer-controlled
+// filter set before typed decoding allocates from it.
+func validateShelleyQuerySets(data []byte, queryType int) error {
+	positions, ok := shelleyQuerySetFields[queryType]
+	if !ok {
+		return nil
+	}
+	fields, err := cborpreflight.ArrayItems(
+		data,
+		len(positions)+1,
+		fmt.Sprintf("shelley query %d", queryType),
+	)
+	if err != nil {
+		return err
+	}
+	for _, pos := range positions {
+		if pos >= len(fields) {
+			// Let the typed decoder report the malformed arity.
+			return nil
+		}
+		if err := cborpreflight.ValidateArray(
+			fields[pos],
+			maxLocalStateQuerySetItems,
+			fmt.Sprintf("shelley query %d filter %d", queryType, pos),
+			nil,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type HardForkQuery struct {
+	Query any
+}
+
+func (q *HardForkQuery) MarshalCBOR() ([]byte, error) {
+	tmpData := []any{
+		QueryTypeHardFork,
+		q.Query,
+	}
+	return cbor.Encode(tmpData)
+}
+
+func (q *HardForkQuery) UnmarshalCBOR(data []byte) error {
+	// Unwrap
+	tmpData := struct {
+		cbor.StructAsArray
+		Type     int
+		SubQuery cbor.RawMessage
+	}{}
+	if _, err := cbor.Decode(data, &tmpData); err != nil {
+		return err
+	}
+	// Decode query
+	tmpQuery, err := decodeQuery(
+		tmpData.SubQuery,
+		"Hard-fork",
+		map[int]any{
+			QueryTypeHardForkEraHistory: &HardForkEraHistoryQuery{},
+			QueryTypeHardForkCurrentEra: &HardForkCurrentEraQuery{},
+		},
+	)
+	if err != nil {
+		return err
+	}
+	q.Query = tmpQuery
+	return nil
+}
+
+type ShelleyLedgerTipQuery struct {
+	simpleQueryBase
+}
+
+type ShelleyEpochNoQuery struct {
+	simpleQueryBase
+}
+
+type ShelleyNonMyopicMemberRewardsQuery struct {
+	cbor.StructAsArray
+	Type   int
+	Stakes cbor.SetType[cbor.RawMessage]
+}
+
+func (q *ShelleyNonMyopicMemberRewardsQuery) UnmarshalCBOR(data []byte) error {
+	if err := cborpreflight.ValidateSecondFieldArray(
+		data,
+		maxLocalStateQuerySetItems,
+		"non-myopic member rewards stakes",
+		nil,
+	); err != nil {
+		return err
+	}
+	var tmp struct {
+		cbor.StructAsArray
+		Type   int
+		Stakes cbor.SetType[cbor.RawMessage]
+	}
+	if _, err := cbor.Decode(data, &tmp); err != nil {
+		return err
+	}
+	q.Type = tmp.Type
+	q.Stakes = tmp.Stakes
+	return nil
+}
+
+type ShelleyCurrentProtocolParamsQuery struct {
+	simpleQueryBase
+}
+
+type ShelleyProposedProtocolParamsUpdatesQuery struct {
+	simpleQueryBase
+}
+
+type ShelleyStakeDistributionQuery struct {
+	simpleQueryBase
+}
+
+type ShelleyUtxoByAddressQuery struct {
+	cbor.StructAsArray
+	Type  int
+	Addrs []lcommon.Address
+}
+
+type ShelleyUtxoWholeQuery struct {
+	simpleQueryBase
+}
+
+type ShelleyDebugEpochStateQuery struct {
+	simpleQueryBase
+}
+
+// ShelleyCborQuery is the GetCBOR query combinator (Shelley sub-query 9).
+// It wraps an inner Shelley block-query whose result the client wants
+// returned as raw serialised CBOR (CBOR-in-CBOR, tag 24). On the wire it is
+// [9, innerQuery]; cardano-cli emits this shape for several queries,
+// e.g. `query stake-snapshot`. Modelling it as a bare [9] (simpleQueryBase)
+// made any GetCBOR-wrapped query fail to decode with "cannot decode CBOR
+// array to struct with different number of elements", closing the NtC
+// connection. See dingo issue #2917.
+type ShelleyCborQuery struct {
+	cbor.StructAsArray
+	Type  int
+	Query any
+}
+
+func (q *ShelleyCborQuery) UnmarshalCBOR(data []byte) error {
+	decoded, err := decodeShelleyCborQuery(data, 0)
+	if err != nil {
+		return err
+	}
+	*q = *decoded
+	return nil
+}
+
+func decodeShelleyCborQuery(
+	data []byte,
+	depth int,
+) (*ShelleyCborQuery, error) {
+	if depth >= maxShelleyCborQueryDepth {
+		return nil, fmt.Errorf(
+			"shelley GetCBOR query wrapper depth exceeds maximum %d",
+			maxShelleyCborQueryDepth,
+		)
+	}
+	var tmp struct {
+		cbor.StructAsArray
+		Type     int
+		SubQuery cbor.RawMessage
+	}
+	if _, err := cbor.Decode(data, &tmp); err != nil {
+		return nil, err
+	}
+	if tmp.Type != QueryTypeShelleyCbor {
+		return nil, fmt.Errorf("unexpected GetCBOR query type: %d", tmp.Type)
+	}
+	inner, err := decodeShelleyQueryAtDepth(tmp.SubQuery, depth+1)
+	if err != nil {
+		return nil, err
+	}
+	return &ShelleyCborQuery{Type: tmp.Type, Query: inner}, nil
+}
+
+func (q *ShelleyCborQuery) MarshalCBOR() ([]byte, error) {
+	return cbor.Encode([]any{q.Type, q.Query})
+}
+
+type ShelleyFilteredDelegationAndRewardAccountsQuery struct {
+	cbor.StructAsArray
+	Type  int
+	Creds cbor.SetType[StakeCredential]
+}
+
+// ShelleyStakeDelegDepositsQuery returns the deposit locked by each requested
+// registered stake credential. It was added with node-to-client version 16 and
+// is used by cardano-cli query stake-address-info.
+type ShelleyStakeDelegDepositsQuery struct {
+	cbor.StructAsArray
+	Type  int
+	Creds cbor.SetType[StakeCredential]
+}
+
+type ShelleyGenesisConfigQuery struct {
+	simpleQueryBase
+}
+
+type ShelleyDebugNewEpochStateQuery struct {
+	simpleQueryBase
+}
+
+type ShelleyDebugChainDepStateQuery struct {
+	simpleQueryBase
+}
+
+type ShelleyRewardProvenanceQuery struct {
+	simpleQueryBase
+}
+
+type ShelleyUtxoByTxinQuery struct {
+	cbor.StructAsArray
+	Type  int
+	TxIns []ledger.ShelleyTransactionInput
+}
+
+type ShelleyStakePoolsQuery struct {
+	simpleQueryBase
+}
+
+type ShelleyStakePoolParamsQuery struct {
+	cbor.StructAsArray
+	Type    int
+	PoolIds cbor.SetType[ledger.PoolId]
+}
+
+type ShelleyRewardInfoPoolsQuery struct {
+	simpleQueryBase
+}
+
+type ShelleyPoolStateQuery struct {
+	cbor.StructAsArray
+	Type  int
+	Pools []cbor.SetType[ledger.PoolId]
+}
+
+func (q *ShelleyPoolStateQuery) UnmarshalCBOR(data []byte) error {
+	queryType, pools, err := decodePoolFilterQuery(data, "GetPoolState")
+	if err != nil {
+		return err
+	}
+	q.Type = queryType
+	q.Pools = pools
+	return nil
+}
+
+// ShelleyStakeSnapshotsQuery is GetStakeSnapshots (Shelley sub-query 20).
+// On the wire it is [20, poolFilter] where poolFilter is a StrictMaybe of a
+// pool-id set, encoded as a list: [] (SNothing) means "all pools", while
+// [ 258{poolids} ] (SJust) restricts the result to the given pools. It was
+// previously modelled as a bare [20] (simpleQueryBase), which could not
+// decode the pool-filter argument once the GetCBOR wrapper around it was
+// decodable. See dingo issue #2917.
+type ShelleyStakeSnapshotsQuery struct {
+	cbor.StructAsArray
+	Type  int
+	Pools []cbor.SetType[ledger.PoolId]
+}
+
+func (q *ShelleyStakeSnapshotsQuery) UnmarshalCBOR(data []byte) error {
+	queryType, pools, err := decodePoolFilterQuery(data, "GetStakeSnapshots")
+	if err != nil {
+		return err
+	}
+	q.Type = queryType
+	q.Pools = pools
+	return nil
+}
+
+func decodePoolFilterQuery(
+	data []byte,
+	queryName string,
+) (int, []cbor.SetType[ledger.PoolId], error) {
+	fields, err := cborpreflight.ArrayItems(data, 2, queryName+" query")
+	if err != nil {
+		return 0, nil, err
+	}
+	if len(fields) != 2 {
+		return 0, nil, fmt.Errorf(
+			"invalid %s query: expected 2 fields, got %d",
+			queryName,
+			len(fields),
+		)
+	}
+	filters, err := cborpreflight.ArrayItems(
+		fields[1],
+		1,
+		queryName+" pool filter; expected at most one pool set",
+	)
+	if err != nil {
+		return 0, nil, err
+	}
+	if len(filters) == 1 {
+		if err := cborpreflight.ValidateArray(
+			filters[0],
+			maxLocalStateQuerySetItems,
+			queryName+" pool set",
+			nil,
+		); err != nil {
+			return 0, nil, err
+		}
+	}
+	var tmp struct {
+		cbor.StructAsArray
+		Type  int
+		Pools []cbor.SetType[ledger.PoolId]
+	}
+	if _, err := cbor.Decode(data, &tmp); err != nil {
+		return 0, nil, err
+	}
+	return tmp.Type, tmp.Pools, nil
+}
+
+// PoolFilter reports the pool IDs the query is restricted to. When all is
+// true the query covers every pool (the StrictMaybe was SNothing) and pools
+// is nil; when all is false only the returned pools are requested (which may
+// be empty for an explicit SJust of the empty set).
+func (q *ShelleyStakeSnapshotsQuery) PoolFilter() (pools []ledger.PoolId, all bool) {
+	if len(q.Pools) == 0 {
+		return nil, true
+	}
+	return q.Pools[0].Items(), false
+}
+
+type ShelleyPoolDistrQuery struct {
+	cbor.StructAsArray
+	Type  int
+	Pools []cbor.SetType[ledger.PoolId]
+}
+
+func (q *ShelleyPoolDistrQuery) UnmarshalCBOR(data []byte) error {
+	queryType, pools, err := decodePoolFilterQuery(data, "GetPoolDistr")
+	if err != nil {
+		return err
+	}
+	q.Type = queryType
+	q.Pools = pools
+	return nil
+}
+
+// ShelleyPoolDistr2Query is GetPoolDistr2 (Shelley sub-query 36), which
+// replaces GetPoolDistr from node-to-client protocol version 21. The wire form
+// is unchanged from its predecessor -- [36, poolFilter], where poolFilter is a
+// StrictMaybe of a pool-id set encoded as a list, so [] means "all pools" and
+// [ 258{poolids} ] restricts the result. Only the reply differs; see
+// PoolDistr2Result.
+type ShelleyPoolDistr2Query struct {
+	cbor.StructAsArray
+	Type  int
+	Pools []cbor.SetType[ledger.PoolId]
+}
+
+func (q *ShelleyPoolDistr2Query) UnmarshalCBOR(data []byte) error {
+	queryType, pools, err := decodePoolFilterQuery(data, "GetPoolDistr2")
+	if err != nil {
+		return err
+	}
+	q.Type = queryType
+	q.Pools = pools
+	return nil
+}
+
+// PoolFilter reports the pool IDs the query is restricted to. When all is true
+// the query covers every pool (the StrictMaybe was SNothing) and pools is nil;
+// when all is false only the returned pools are requested (which may be empty
+// for an explicit SJust of the empty set).
+func (q *ShelleyPoolDistr2Query) PoolFilter() (pools []ledger.PoolId, all bool) {
+	if len(q.Pools) == 0 {
+		return nil, true
+	}
+	return q.Pools[0].Items(), false
+}
+
+func decodeQuery(
+	data []byte,
+	typeDesc string,
+	queryTypes map[int]any,
+) (any, error) {
+	// Determine query type
+	queryType, err := cbor.DecodeIdFromList(data)
+	if err != nil {
+		return nil, err
+	}
+	var tmpQuery any
+	for typeId, queryObj := range queryTypes {
+		if queryType == typeId {
+			tmpQuery = queryObj
+			break
+		}
+	}
+	if tmpQuery == nil {
+		errMsg := "unknown query type"
+		if typeDesc != "" {
+			errMsg = fmt.Sprintf("unknown %s query type", typeDesc)
+		}
+		return nil, fmt.Errorf("%s: %d", errMsg, queryType)
+	}
+	// Decode query
+	if _, err := cbor.Decode(data, tmpQuery); err != nil {
+		return nil, err
+	}
+	return tmpQuery, nil
+}
+
+func buildQuery(queryType int, params ...any) []any {
+	ret := []any{queryType}
+	if len(params) > 0 {
+		ret = append(ret, params...)
+	}
+	return ret
+}
+
+func buildHardForkQuery(queryType int, params ...any) []any {
+	ret := buildQuery(
+		QueryTypeBlock,
+		buildQuery(
+			QueryTypeHardFork,
+			buildQuery(
+				queryType,
+				params...,
+			),
+		),
+	)
+	return ret
+}
+
+func buildShelleyQuery(
+	era int,
+	queryType int,
+	params ...any,
+) []any {
+	ret := buildQuery(
+		QueryTypeBlock,
+		buildQuery(
+			QueryTypeShelley,
+			buildQuery(
+				era,
+				buildQuery(
+					queryType,
+					params...,
+				),
+			),
+		),
+	)
+	return ret
+}
+
+type SystemStartQuery struct {
+	simpleQueryBase
+}
+
+type SystemStartResult struct {
+	cbor.StructAsArray
+	Year        big.Int
+	Day         int64
+	Picoseconds big.Int
+}
+
+func (s SystemStartResult) String() string {
+	return fmt.Sprintf(
+		"SystemStart %s %d %s",
+		s.Year.String(),
+		s.Day,
+		s.Picoseconds.String(),
+	)
+}
+
+func (s SystemStartResult) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Year        string `json:"year"`
+		Day         int64  `json:"day"`
+		Picoseconds string `json:"picoseconds"`
+	}{
+		Year:        s.Year.String(),
+		Day:         s.Day,
+		Picoseconds: s.Picoseconds.String(),
+	})
+}
+
+func (s *SystemStartResult) UnmarshalJSON(data []byte) error {
+	var tmp struct {
+		Year        string `json:"year"`
+		Day         int64  `json:"day"`
+		Picoseconds string `json:"picoseconds"`
+	}
+	if err := json.Unmarshal(data, &tmp); err != nil {
+		return err
+	}
+	s.Year.SetString(tmp.Year, 10)
+	s.Day = tmp.Day
+	s.Picoseconds.SetString(tmp.Picoseconds, 10)
+	return nil
+}
+
+type ChainBlockNoQuery struct {
+	simpleQueryBase
+}
+
+type ChainPointQuery struct {
+	simpleQueryBase
+}
+
+type HardForkCurrentEraQuery struct {
+	simpleQueryBase
+}
+
+type HardForkEraHistoryQuery struct {
+	simpleQueryBase
+}
+
+type EraHistoryResult struct {
+	cbor.StructAsArray
+	Begin  eraHistoryResultBound
+	End    eraHistoryResultEnd
+	Params eraHistoryResultParams
+}
+
+type eraHistoryResultBound struct {
+	cbor.StructAsArray
+	Timespan   any
+	SlotNo     int
+	EpochNo    int
+	PerasRound *uint64
+}
+
+func (b *eraHistoryResultBound) UnmarshalCBOR(data []byte) error {
+	fields, err := decodeEraHistoryArrayOneOf(data, "bound", 3, 4)
+	if err != nil {
+		return err
+	}
+	var relativeTime big.Int
+	if _, err := cbor.Decode(fields[0], &relativeTime); err != nil {
+		return fmt.Errorf("decode era history bound timespan: %w", err)
+	}
+	var timespan any
+	if _, err := cbor.Decode(fields[0], &timespan); err != nil {
+		return fmt.Errorf("decode era history bound timespan: %w", err)
+	}
+	slotNo, err := decodeEraHistoryInt(fields[1], "bound slot number")
+	if err != nil {
+		return err
+	}
+	epochNo, err := decodeEraHistoryInt(fields[2], "bound epoch number")
+	if err != nil {
+		return err
+	}
+	var perasRound *uint64
+	if len(fields) == 4 {
+		var value uint64
+		if _, err := cbor.Decode(fields[3], &value); err != nil {
+			return fmt.Errorf("decode era history bound Peras round: %w", err)
+		}
+		perasRound = &value
+	}
+	*b = eraHistoryResultBound{
+		Timespan:   timespan,
+		SlotNo:     slotNo,
+		EpochNo:    epochNo,
+		PerasRound: perasRound,
+	}
+	return nil
+}
+
+func (b eraHistoryResultBound) MarshalCBOR() ([]byte, error) {
+	if b.SlotNo < 0 || b.EpochNo < 0 {
+		return nil, errors.New("encode era history bound: negative value")
+	}
+	fields := []any{b.Timespan, b.SlotNo, b.EpochNo}
+	if b.PerasRound != nil {
+		fields = append(fields, *b.PerasRound)
+	}
+	return cbor.Encode(fields)
+}
+
+type eraHistoryResultEnd struct {
+	eraHistoryResultBound
+	Unbounded bool
+}
+
+func (e *eraHistoryResultEnd) UnmarshalCBOR(data []byte) error {
+	if len(data) == 1 && data[0] == 0xf6 {
+		*e = eraHistoryResultEnd{Unbounded: true}
+		return nil
+	}
+	if len(data) == 1 && data[0] == 0xf7 {
+		return errors.New(
+			"decode era history end: CBOR undefined is not an unbounded end",
+		)
+	}
+	var bound eraHistoryResultBound
+	if _, err := cbor.Decode(data, &bound); err != nil {
+		return fmt.Errorf("decode era history end: %w", err)
+	}
+	*e = eraHistoryResultEnd{eraHistoryResultBound: bound}
+	return nil
+}
+
+func (e eraHistoryResultEnd) MarshalCBOR() ([]byte, error) {
+	if e.Unbounded {
+		if !isZeroEraHistoryTimespan(e.Timespan) || e.SlotNo != 0 ||
+			e.EpochNo != 0 || e.PerasRound != nil {
+			return nil, errors.New(
+				"encode era history end: unbounded end contains a bound",
+			)
+		}
+		return []byte{0xf6}, nil
+	}
+	return cbor.Encode(e.eraHistoryResultBound)
+}
+
+// A nil SafeFromTip identifies an indefinite safe zone.
+type eraHistorySafeZone struct {
+	SafeFromTip     *uint64
+	SafeBeforeEpoch *uint64
+}
+
+func (s *eraHistorySafeZone) UnmarshalCBOR(data []byte) error {
+	fields, err := decodeEraHistoryArrayOneOf(
+		data,
+		"safe zone",
+		1,
+		3,
+	)
+	if err != nil {
+		return err
+	}
+	if len(fields) == 0 {
+		return errors.New("decode era history safe zone: empty array")
+	}
+	var tag uint8
+	if _, err := cbor.Decode(fields[0], &tag); err != nil {
+		return fmt.Errorf("decode era history safe zone tag: %w", err)
+	}
+	switch tag {
+	case 0:
+		if len(fields) != 3 {
+			return fmt.Errorf(
+				"decode standard era history safe zone: got %d fields, want 3",
+				len(fields),
+			)
+		}
+		var safeFromTip uint64
+		if _, err := cbor.Decode(fields[1], &safeFromTip); err != nil {
+			return fmt.Errorf("decode safe-from-tip slot count: %w", err)
+		}
+		safeBeforeEpoch, err := decodeSafeBeforeEpoch(fields[2])
+		if err != nil {
+			return err
+		}
+		*s = eraHistorySafeZone{
+			SafeFromTip:     &safeFromTip,
+			SafeBeforeEpoch: safeBeforeEpoch,
+		}
+		return nil
+	case 1:
+		if len(fields) != 1 {
+			return fmt.Errorf(
+				"decode indefinite era history safe zone: got %d fields, want 1",
+				len(fields),
+			)
+		}
+		*s = eraHistorySafeZone{}
+		return nil
+	default:
+		return fmt.Errorf("decode era history safe zone: unknown tag %d", tag)
+	}
+}
+
+func (s eraHistorySafeZone) MarshalCBOR() ([]byte, error) {
+	if s.SafeFromTip == nil {
+		if s.SafeBeforeEpoch != nil {
+			return nil, errors.New(
+				"encode indefinite era history safe zone with epoch limit",
+			)
+		}
+		return cbor.Encode([]any{uint8(1)})
+	}
+	safeBeforeEpoch := []any{uint8(0)}
+	if s.SafeBeforeEpoch != nil {
+		safeBeforeEpoch = []any{uint8(1), *s.SafeBeforeEpoch}
+	}
+	return cbor.Encode([]any{uint8(0), *s.SafeFromTip, safeBeforeEpoch})
+}
+
+func decodeSafeBeforeEpoch(data []byte) (*uint64, error) {
+	fields, err := decodeEraHistoryArrayOneOf(
+		data,
+		"safe-before-epoch",
+		1,
+		2,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(fields) == 0 {
+		return nil, errors.New("decode safe-before-epoch: empty array")
+	}
+	var tag uint8
+	if _, err := cbor.Decode(fields[0], &tag); err != nil {
+		return nil, fmt.Errorf("decode safe-before-epoch tag: %w", err)
+	}
+	if len(fields) == 1 && tag == 0 {
+		return nil, nil
+	}
+	if len(fields) == 2 && tag == 1 {
+		var epochNo uint64
+		if _, err := cbor.Decode(fields[1], &epochNo); err != nil {
+			return nil, fmt.Errorf("decode safe-before epoch number: %w", err)
+		}
+		return &epochNo, nil
+	}
+	return nil, fmt.Errorf(
+		"decode safe-before-epoch: invalid size and tag (%d, %d)",
+		len(fields),
+		tag,
+	)
+}
+
+type eraHistoryResultParams struct {
+	cbor.StructAsArray
+	EpochLength      int
+	SlotLength       int
+	SafeZone         eraHistorySafeZone
+	GenesisWindow    uint64
+	PerasRoundLength *uint64
+}
+
+func (p *eraHistoryResultParams) UnmarshalCBOR(data []byte) error {
+	fields, err := decodeEraHistoryArrayOneOf(data, "parameters", 4, 5)
+	if err != nil {
+		return err
+	}
+	epochLength, err := decodeEraHistoryInt(fields[0], "epoch length")
+	if err != nil {
+		return err
+	}
+	slotLength, err := decodeEraHistoryInt(fields[1], "slot length")
+	if err != nil {
+		return err
+	}
+	var safeZone eraHistorySafeZone
+	if _, err := cbor.Decode(fields[2], &safeZone); err != nil {
+		return fmt.Errorf("decode era history parameters safe zone: %w", err)
+	}
+	var genesisWindow uint64
+	if _, err := cbor.Decode(fields[3], &genesisWindow); err != nil {
+		return fmt.Errorf("decode genesis window: %w", err)
+	}
+	var perasRoundLength *uint64
+	if len(fields) == 5 {
+		var value uint64
+		if _, err := cbor.Decode(fields[4], &value); err != nil {
+			return fmt.Errorf("decode Peras round length: %w", err)
+		}
+		perasRoundLength = &value
+	}
+	*p = eraHistoryResultParams{
+		EpochLength:      epochLength,
+		SlotLength:       slotLength,
+		SafeZone:         safeZone,
+		GenesisWindow:    genesisWindow,
+		PerasRoundLength: perasRoundLength,
+	}
+	return nil
+}
+
+func (p eraHistoryResultParams) MarshalCBOR() ([]byte, error) {
+	if p.EpochLength < 0 || p.SlotLength < 0 {
+		return nil, errors.New("encode era history parameters: negative value")
+	}
+	fields := []any{
+		p.EpochLength,
+		p.SlotLength,
+		p.SafeZone,
+		p.GenesisWindow,
+	}
+	if p.PerasRoundLength != nil {
+		fields = append(fields, *p.PerasRoundLength)
+	}
+	return cbor.Encode(fields)
+}
+
+func isZeroEraHistoryTimespan(value any) bool {
+	switch value := value.(type) {
+	case nil:
+		return true
+	case int:
+		return value == 0
+	case int64:
+		return value == 0
+	case uint64:
+		return value == 0
+	case big.Int:
+		return value.Sign() == 0
+	case *big.Int:
+		return value == nil || value.Sign() == 0
+	default:
+		return false
+	}
+}
+
+func decodeEraHistoryArrayOneOf(
+	data []byte,
+	name string,
+	wants ...int,
+) ([]cbor.RawMessage, error) {
+	decoder, err := cbor.NewStreamDecoder(data)
+	if err != nil {
+		return nil, fmt.Errorf("decode era history %s: %w", name, err)
+	}
+	count, _, _, err := decoder.DecodeArrayHeader()
+	if err != nil {
+		return nil, fmt.Errorf("decode era history %s: %w", name, err)
+	}
+	validCount := false
+	for _, want := range wants {
+		if count == want {
+			validCount = true
+			break
+		}
+	}
+	if !validCount {
+		return nil, fmt.Errorf(
+			"decode era history %s: unexpected array length %d",
+			name,
+			count,
+		)
+	}
+	var fields []cbor.RawMessage
+	consumed, err := cbor.Decode(data, &fields)
+	if err != nil {
+		return nil, fmt.Errorf("decode era history %s: %w", name, err)
+	}
+	if len(fields) != count {
+		return nil, fmt.Errorf(
+			"decode era history %s: got %d fields, want %d",
+			name,
+			len(fields),
+			count,
+		)
+	}
+	if consumed != len(data) {
+		return nil, fmt.Errorf("decode era history %s: trailing data", name)
+	}
+	return fields, nil
+}
+
+func decodeEraHistoryInt(data []byte, name string) (int, error) {
+	var value uint64
+	if _, err := cbor.Decode(data, &value); err != nil {
+		return 0, fmt.Errorf("decode era history %s: %w", name, err)
+	}
+	maxInt := uint64(^uint(0) >> 1)
+	if value > maxInt {
+		return 0, fmt.Errorf("decode era history %s: overflows int", name)
+	}
+	return int(value), nil
+}
+
+// StakeCredential represents a stake credential as [tag, bytes]
+// where tag indicates the credential type (0 for KeyHash, 1 for ScriptHash)
+type StakeCredential struct {
+	cbor.StructAsArray
+	Tag   uint64
+	Bytes ledger.Blake2b224
+}
+
+// NonMyopicMemberRewardsResult represents the non-myopic member rewards result
+// The result is a map where each key is a stake credential
+// and each value is a map of pool IDs to their reward amounts in lovelaces
+type NonMyopicMemberRewardsResult map[StakeCredential]map[ledger.Blake2b224]uint64
+
+type CurrentProtocolParamsResult interface {
+	ledger.AlonzoProtocolParameters |
+		ledger.BabbageProtocolParameters |
+		ledger.ConwayProtocolParameters |
+		ledger.ShelleyProtocolParameters |
+		any
+}
+
+type ProposedProtocolParamsUpdatesResult map[lcommon.GenesisHash]lcommon.ProtocolParameterUpdate
+
+type StakeDistributionResult struct {
+	cbor.StructAsArray
+	Results map[ledger.PoolId]struct {
+		cbor.StructAsArray
+		StakeFraction *cbor.Rat
+		VrfHash       ledger.Blake2b256
+	}
+}
+
+type UTxOsResult struct {
+	cbor.StructAsArray
+	Results map[UtxoId]ledger.BabbageTransactionOutput
+}
+
+type (
+	UTxOByAddressResult = UTxOsResult
+	UTxOWholeResult     = UTxOsResult
+)
+
+type UtxoId struct {
+	cbor.StructAsArray
+	Hash      ledger.Blake2b256
+	Idx       int
+	DatumHash ledger.Blake2b256
+}
+
+func (u *UtxoId) UnmarshalCBOR(data []byte) error {
+	listLen, err := cbor.ListLength(data)
+	if err != nil {
+		return err
+	}
+	switch listLen {
+	case 2:
+		var tmpData struct {
+			cbor.StructAsArray
+			Hash ledger.Blake2b256
+			Idx  int
+		}
+		if _, err := cbor.Decode(data, &tmpData); err != nil {
+			return err
+		}
+		u.Hash = tmpData.Hash
+		u.Idx = tmpData.Idx
+	case 3:
+		type tUtxoId UtxoId
+		var tmp tUtxoId
+		if _, err := cbor.Decode(data, &tmp); err != nil {
+			return err
+		}
+		*u = UtxoId(tmp)
+	default:
+		return fmt.Errorf("invalid list length: %d", listLen)
+	}
+	return nil
+}
+
+func (u *UtxoId) MarshalCBOR() ([]byte, error) {
+	var tmpData []any
+	if u.DatumHash == ledger.NewBlake2b256(nil) {
+		tmpData = []any{
+			u.Hash,
+			u.Idx,
+		}
+	} else {
+		tmpData = []any{
+			u.Hash,
+			u.Idx,
+			u.DatumHash,
+		}
+	}
+	return cbor.Encode(tmpData)
+}
+
+// FilteredDelegationsAndRewardAccountsResult is the result of the
+// GetFilteredDelegationsAndRewardAccounts query.
+// CBOR: array(1)[array(2)[delegation, rewards]]
+// delegation: map[StakeCredential]PoolId, rewards: map[StakeCredential]uint64
+type FilteredDelegationsAndRewardAccountsResult struct {
+	Delegations map[StakeCredential]ledger.Blake2b224
+	Rewards     map[StakeCredential]uint64
+}
+
+// StakeDelegDepositsResult is the result of GetStakeDelegDeposits.
+// The map is wrapped in a one-element array by the Shelley era codec.
+type StakeDelegDepositsResult map[StakeCredential]uint64
+
+func (r *StakeDelegDepositsResult) UnmarshalCBOR(data []byte) error {
+	var tmp struct {
+		cbor.StructAsArray
+		Deposits map[StakeCredential]uint64
+	}
+	if _, err := cbor.Decode(data, &tmp); err != nil {
+		return err
+	}
+	*r = tmp.Deposits
+	return nil
+}
+
+func (r *FilteredDelegationsAndRewardAccountsResult) UnmarshalCBOR(data []byte) error {
+	var tmp struct {
+		cbor.StructAsArray
+		Inner struct {
+			cbor.StructAsArray
+			Delegations map[StakeCredential]ledger.Blake2b224
+			Rewards     map[StakeCredential]uint64
+		}
+	}
+	if _, err := cbor.Decode(data, &tmp); err != nil {
+		return err
+	}
+	r.Delegations = tmp.Inner.Delegations
+	r.Rewards = tmp.Inner.Rewards
+	return nil
+}
+
+// GenesisConfigResult and GenesisConfigResultProtocolParameters are defined in
+// genesis_config.go, which carries the two wire layouts.
+
+// DebugEpochStateResult and DebugNewEpochStateResult are defined in
+// epoch_state.go, and DebugChainDepStateResult in chain_dep_state.go.
+
+// RewardProvenanceResult is the result of the GetRewardProvenance query.
+// CBOR: array(1)[array(16)[epochLength, poolMints, maxLovelaceSupply,
+// deltaR1, deltaR2, r, totalStake, blocksCount, decentralization,
+// expectedBlocks, eta, rPot, treasuryCut, activeStake, activeStakeGo, pools]]
+type RewardProvenanceResult struct {
+	EpochLength       uint64
+	PoolMints         map[ledger.Blake2b224]uint64 // pool ID -> blocks minted
+	MaxLovelaceSupply uint64
+	DeltaR1           uint64
+	DeltaR2           uint64
+	R                 uint64
+	TotalStake        uint64
+	BlocksCount       uint64
+	Decentralization  *cbor.Rat
+	ExpectedBlocks    uint64
+	Eta               *cbor.Rat // success rate
+	RPot              uint64
+	TreasuryCut       uint64
+	ActiveStake       uint64
+	ActiveStakeGo     cbor.RawMessage
+	Pools             cbor.RawMessage
+}
+
+func (r *RewardProvenanceResult) UnmarshalCBOR(data []byte) error {
+	var tmp struct {
+		cbor.StructAsArray
+		Inner struct {
+			cbor.StructAsArray
+			EpochLength       uint64
+			PoolMints         map[ledger.Blake2b224]uint64
+			MaxLovelaceSupply uint64
+			DeltaR1           uint64
+			DeltaR2           uint64
+			R                 uint64
+			TotalStake        uint64
+			BlocksCount       uint64
+			Decentralization  *cbor.Rat
+			ExpectedBlocks    uint64
+			Eta               *cbor.Rat
+			RPot              uint64
+			TreasuryCut       uint64
+			ActiveStake       uint64
+			ActiveStakeGo     cbor.RawMessage
+			Pools             cbor.RawMessage
+		}
+	}
+	if _, err := cbor.Decode(data, &tmp); err != nil {
+		return err
+	}
+	r.EpochLength = tmp.Inner.EpochLength
+	r.PoolMints = tmp.Inner.PoolMints
+	r.MaxLovelaceSupply = tmp.Inner.MaxLovelaceSupply
+	r.DeltaR1 = tmp.Inner.DeltaR1
+	r.DeltaR2 = tmp.Inner.DeltaR2
+	r.R = tmp.Inner.R
+	r.TotalStake = tmp.Inner.TotalStake
+	r.BlocksCount = tmp.Inner.BlocksCount
+	r.Decentralization = tmp.Inner.Decentralization
+	r.ExpectedBlocks = tmp.Inner.ExpectedBlocks
+	r.Eta = tmp.Inner.Eta
+	r.RPot = tmp.Inner.RPot
+	r.TreasuryCut = tmp.Inner.TreasuryCut
+	r.ActiveStake = tmp.Inner.ActiveStake
+	r.ActiveStakeGo = tmp.Inner.ActiveStakeGo
+	r.Pools = tmp.Inner.Pools
+	return nil
+}
+
+type UTxOByTxInResult struct {
+	cbor.StructAsArray
+	Results map[UtxoId]ledger.BabbageTransactionOutput
+}
+
+type StakePoolsResult struct {
+	cbor.StructAsArray
+	Results []ledger.PoolId
+}
+
+// AccountState is the chain's treasury and reserves pots. Both are signed
+// because Coin is an Integer in the ledger (a misconfigured network can drive
+// reserves negative).
+type AccountState struct {
+	cbor.StructAsArray
+	Treasury int64
+	Reserves int64
+}
+
+// AccountStateResult is the result of GetAccountState. The account state is
+// wrapped in the single-element result array, so on the wire it is
+// [ [treasury, reserves] ].
+type AccountStateResult struct {
+	cbor.StructAsArray
+	State AccountState
+}
+
+type StakePoolParamsResult struct {
+	cbor.StructAsArray
+	Results map[ledger.PoolId]struct {
+		cbor.StructAsArray
+		Operator      ledger.Blake2b224
+		VrfKeyHash    ledger.Blake2b256
+		Pledge        uint
+		FixedCost     uint
+		Margin        *cbor.Rat
+		RewardAccount ledger.Address
+		PoolOwners    []ledger.Blake2b224
+		Relays        []ledger.PoolRelay
+		PoolMetadata  *struct {
+			cbor.StructAsArray
+			Url string
+			// The reference ledger stores pmHash as an unbounded byte string and
+			// applies the 32-byte bound in the POOL rule from protocol version 5,
+			// so ledger state can hold a registration with a shorter hash.
+			MetadataHash lcommon.PoolMetadataHash
+		}
+	}
+}
+
+// validateQueryPoolMetadataURL applies the shared pool metadata URL bound to a
+// URL decoded through one of the inline metadata structs in this package.
+// Those structs are unnamed, so they cannot carry a decoder and
+// common.PoolMetadata.UnmarshalCBOR never runs on a query result path.
+func validateQueryPoolMetadataURL(url string) error {
+	return lcommon.ValidatePoolMetadata(&lcommon.PoolMetadata{Url: url})
+}
+
+// UnmarshalCBOR decodes a stake pool parameters query result and bounds each
+// pool metadata URL. The map value is an unnamed struct type, so the bound
+// runs here rather than in a decoder of its own.
+func (r *StakePoolParamsResult) UnmarshalCBOR(data []byte) error {
+	if r == nil {
+		return errors.New("nil StakePoolParamsResult receiver")
+	}
+	type stakePoolParamsResult StakePoolParamsResult
+	var tmp stakePoolParamsResult
+	if _, err := cbor.Decode(data, &tmp); err != nil {
+		return err
+	}
+	for poolId, params := range tmp.Results {
+		if params.PoolMetadata == nil {
+			continue
+		}
+		if err := validateQueryPoolMetadataURL(params.PoolMetadata.Url); err != nil {
+			delete(tmp.Results, poolId)
+		}
+	}
+	*r = StakePoolParamsResult(tmp)
+	return nil
+}
+
+func (r StakePoolParamsResult) MarshalCBOR() ([]byte, error) {
+	for poolId, params := range r.Results {
+		if params.PoolMetadata == nil {
+			continue
+		}
+		if err := validateQueryPoolMetadataURL(params.PoolMetadata.Url); err != nil {
+			return nil, fmt.Errorf("pool %s: %w", poolId, err)
+		}
+	}
+	type stakePoolParamsResult StakePoolParamsResult
+	return cbor.Encode(stakePoolParamsResult(r))
+}
+
+// RewardParams represents the global reward calculation parameters
+// for the current epoch.
+// CBOR: array(4) [nOpt, a0, rPot, totalStake]
+type RewardParams struct {
+	cbor.StructAsArray
+	NOpt       uint16    // Desired number of stake pools (k)
+	A0         *cbor.Rat // Pledge influence factor
+	RPot       uint64    // Total rewards pot for the epoch (lovelace)
+	TotalStake uint64    // Total active stake (lovelace)
+}
+
+// RewardInfoPool represents per-pool reward calculation information.
+// CBOR: array(6) [stake, ownerPledge, ownerStake, cost, margin, performanceEstimate]
+type RewardInfoPool struct {
+	cbor.StructAsArray
+	Stake               uint64    // Absolute stake delegated to this pool (lovelace)
+	OwnerPledge         uint64    // Pool owner(s) pledge (lovelace)
+	OwnerStake          uint64    // Absolute stake delegated by owner(s) (lovelace)
+	Cost                uint64    // Pool fixed cost (lovelace)
+	Margin              *cbor.Rat // Pool margin
+	PerformanceEstimate float64   // Ratio of blocks produced vs expected
+}
+
+// RewardInfoPoolsResult is the result of the RewardInfoPools query.
+// CBOR: array(1)[array(2)[RewardParams, map[PoolKeyHash]RewardInfoPool]]
+type RewardInfoPoolsResult struct {
+	Params RewardParams
+	Pools  map[ledger.Blake2b224]RewardInfoPool
+}
+
+func (r RewardInfoPoolsResult) MarshalCBOR() ([]byte, error) {
+	return cbor.Encode(struct {
+		cbor.StructAsArray
+		Inner struct {
+			cbor.StructAsArray
+			Params RewardParams
+			Pools  map[ledger.Blake2b224]RewardInfoPool
+		}
+	}{
+		Inner: struct {
+			cbor.StructAsArray
+			Params RewardParams
+			Pools  map[ledger.Blake2b224]RewardInfoPool
+		}{
+			Params: r.Params,
+			Pools:  r.Pools,
+		},
+	})
+}
+
+func (r *RewardInfoPoolsResult) UnmarshalCBOR(data []byte) error {
+	var tmp struct {
+		cbor.StructAsArray
+		Inner struct {
+			cbor.StructAsArray
+			Params RewardParams
+			Pools  map[ledger.Blake2b224]RewardInfoPool
+		}
+	}
+	if _, err := cbor.Decode(data, &tmp); err != nil {
+		return err
+	}
+	r.Params = tmp.Inner.Params
+	r.Pools = tmp.Inner.Pools
+	return nil
+}
+
+// PoolStateParams represents the pool registration parameters
+// without the cert type
+type PoolStateParams struct {
+	cbor.StructAsArray
+	Operator      ledger.Blake2b224
+	VrfKeyHash    ledger.Blake2b256
+	Pledge        uint64
+	Cost          uint64
+	Margin        *cbor.Rat
+	RewardAccount ledger.Address
+	PoolOwners    []ledger.Blake2b224
+	Relays        []ledger.PoolRelay
+	PoolMetadata  *struct {
+		cbor.StructAsArray
+		Url string
+		// The reference ledger stores pmHash as an unbounded byte string and
+		// applies the 32-byte bound in the POOL rule from protocol version 5,
+		// so ledger state can hold a registration with a shorter hash.
+		MetadataHash lcommon.PoolMetadataHash
+	}
+}
+
+// UnmarshalCBOR decodes pool registration parameters and bounds the pool
+// metadata URL. The inline metadata struct is unnamed, so the bound runs here
+// rather than in a decoder of its own.
+func (p *PoolStateParams) UnmarshalCBOR(data []byte) error {
+	if p == nil {
+		return errors.New("nil PoolStateParams receiver")
+	}
+	type poolStateParams PoolStateParams
+	var tmp poolStateParams
+	if _, err := cbor.Decode(data, &tmp); err != nil {
+		return err
+	}
+	if tmp.PoolMetadata != nil {
+		if err := validateQueryPoolMetadataURL(tmp.PoolMetadata.Url); err != nil {
+			return err
+		}
+	}
+	*p = PoolStateParams(tmp)
+	return nil
+}
+
+func (p PoolStateParams) MarshalCBOR() ([]byte, error) {
+	if p.PoolMetadata != nil {
+		if err := validateQueryPoolMetadataURL(p.PoolMetadata.Url); err != nil {
+			return nil, err
+		}
+	}
+	type poolStateParams PoolStateParams
+	return cbor.Encode(poolStateParams(p))
+}
+
+// PoolStateResult represents the pool state result
+// The result is a 4-element array: [pstate, fstate, retiring, deposits]
+// where pstate maps pool IDs to their registration parameters
+type PoolStateResult struct {
+	cbor.StructAsArray
+	PState map[ledger.Blake2b224]*PoolStateParams
+	FState map[ledger.Blake2b224]*PoolStateParams // Future pool parameters
+	// Retiring contains pools scheduled to retire (epoch number)
+	Retiring map[ledger.Blake2b224]uint64
+	Deposits map[ledger.Blake2b224]uint64 // Pool deposits
+}
+
+func (r *PoolStateResult) UnmarshalCBOR(data []byte) error {
+	if r == nil {
+		return errors.New("nil PoolStateResult receiver")
+	}
+	type rawPoolStateParams PoolStateParams
+	var tmp struct {
+		cbor.StructAsArray
+		PState   map[ledger.Blake2b224]*rawPoolStateParams
+		FState   map[ledger.Blake2b224]*rawPoolStateParams
+		Retiring map[ledger.Blake2b224]uint64
+		Deposits map[ledger.Blake2b224]uint64
+	}
+	if _, err := cbor.Decode(data, &tmp); err != nil {
+		return err
+	}
+	convert := func(
+		name string,
+		params map[ledger.Blake2b224]*rawPoolStateParams,
+	) (map[ledger.Blake2b224]*PoolStateParams, error) {
+		result := make(map[ledger.Blake2b224]*PoolStateParams, len(params))
+		for poolId, value := range params {
+			if value == nil {
+				result[poolId] = nil
+				continue
+			}
+			if value.PoolMetadata != nil {
+				if err := validateQueryPoolMetadataURL(
+					value.PoolMetadata.Url,
+				); err != nil {
+					return nil, fmt.Errorf(
+						"%s pool %x: %w", name, poolId[:], err,
+					)
+				}
+			}
+			converted := PoolStateParams(*value)
+			result[poolId] = &converted
+		}
+		return result, nil
+	}
+	pstate, err := convert("pstate", tmp.PState)
+	if err != nil {
+		return err
+	}
+	fstate, err := convert("fstate", tmp.FState)
+	if err != nil {
+		return err
+	}
+	*r = PoolStateResult{
+		PState: pstate, FState: fstate,
+		Retiring: tmp.Retiring, Deposits: tmp.Deposits,
+	}
+	return nil
+}
+
+// PoolStakeSnapshot represents the stake distribution for a pool
+// across different snapshots
+type PoolStakeSnapshot struct {
+	cbor.StructAsArray
+	StakeMark uint64 // Stake snapshot from mark
+	StakeSet  uint64 // Stake snapshot from set
+	StakeGo   uint64 // Stake snapshot from go
+}
+
+// StakeSnapshotsResult represents the stake snapshots result.
+// The result is a 4-element array:
+// [snapshots, total_stake_mark, total_stake_set, total_stake_go]
+// where snapshots maps pool IDs to their stake distribution
+// across mark/set/go snapshots
+type StakeSnapshotsResult struct {
+	cbor.StructAsArray
+	PoolSnapshots  map[ledger.Blake2b224]*PoolStakeSnapshot
+	TotalStakeMark uint64
+	TotalStakeSet  uint64
+	TotalStakeGo   uint64
+}
+
+// PoolDistr2Result is the GetPoolDistr2 reply without its era result
+// wrapper: the ledger's QueryResultPoolDistr, which has the same wire form as
+// its PoolDistr. Unlike the GetPoolDistr reply, each pool's entry carries the
+// total stake delegated to it, and the record the total active stake across
+// all pools.
+type PoolDistr2Result = PoolDistribution
+
+// PoolDistr2IndividualStake is one pool's entry in a GetPoolDistr2 reply.
+// From the Dijkstra era it carries a fourth field, the pool's BLS key if it
+// registered one.
+type PoolDistr2IndividualStake = IndividualPoolStake
+
+// PoolDistrResult represents the pool distribution result.
+// It contains a map of pool IDs to their stake distribution
+// (fraction and VRF hash)
+type PoolDistrResult struct {
+	cbor.StructAsArray
+	Results map[ledger.PoolId]struct {
+		cbor.StructAsArray
+		StakeFraction *cbor.Rat
+		VrfHash       ledger.Blake2b256
+	}
+}
+
+// Conway governance query types
+
+type ShelleyConstitutionQuery struct {
+	simpleQueryBase
+}
+
+type ShelleyGovStateQuery struct {
+	simpleQueryBase
+}
+
+type ShelleyDRepStateQuery struct {
+	cbor.StructAsArray
+	Type        int
+	Credentials cbor.SetType[lcommon.Credential]
+}
+
+type ShelleyDRepStakeDistrQuery struct {
+	cbor.StructAsArray
+	Type  int
+	DReps cbor.SetType[lcommon.Drep]
+}
+
+type ShelleyCommitteeMembersStateQuery struct {
+	cbor.StructAsArray
+	Type         int
+	ColdCreds    cbor.SetType[lcommon.Credential]
+	HotCreds     cbor.SetType[lcommon.Credential]
+	MemberStatus cbor.SetType[int]
+}
+
+type ShelleyFilteredVoteDelegateesQuery struct {
+	cbor.StructAsArray
+	Type        int
+	Credentials cbor.SetType[lcommon.Credential]
+}
+
+type ShelleySPOStakeDistrQuery struct {
+	cbor.StructAsArray
+	Type    int
+	PoolIds cbor.SetType[ledger.PoolId]
+}
+
+type ShelleyAccountStateQuery struct {
+	simpleQueryBase
+}
+
+type ShelleyGetProposalsQuery struct {
+	cbor.StructAsArray
+	Type      int
+	ActionIds cbor.SetType[lcommon.GovActionId]
+}
+
+type ShelleyGetRatifyStateQuery struct {
+	simpleQueryBase
+}
+
+// ShelleyGetLedgerPeerSnapshotQuery is GetLedgerPeerSnapshot (Shelley query
+// 34). Node-to-client versions 19 to 22 encode it as [34] and ask only for
+// big ledger peers; version 23 encodes it as [34, peer_kind] and accepts only
+// that form. WithPeerKind selects the version 23 form.
+type ShelleyGetLedgerPeerSnapshotQuery struct {
+	Type         int
+	PeerKind     LedgerPeerKind
+	WithPeerKind bool
+}
+
+func (q *ShelleyGetLedgerPeerSnapshotQuery) UnmarshalCBOR(data []byte) error {
+	var fields []cbor.RawMessage
+	if _, err := cbor.Decode(data, &fields); err != nil {
+		return err
+	}
+	if len(fields) != 1 && len(fields) != 2 {
+		return fmt.Errorf(
+			"GetLedgerPeerSnapshot: expected 1 or 2 elements, got %d",
+			len(fields),
+		)
+	}
+	var queryType int
+	if _, err := cbor.Decode(fields[0], &queryType); err != nil {
+		return err
+	}
+	if queryType != QueryTypeShelleyGetLedgerPeerSnapshot {
+		return fmt.Errorf(
+			"unexpected GetLedgerPeerSnapshot query type: %d",
+			queryType,
+		)
+	}
+	tmp := ShelleyGetLedgerPeerSnapshotQuery{
+		Type:     queryType,
+		PeerKind: LedgerPeerKindBig,
+	}
+	if len(fields) == 2 {
+		var kind uint8
+		if _, err := cbor.Decode(fields[1], &kind); err != nil {
+			return err
+		}
+		switch LedgerPeerKind(kind) {
+		case LedgerPeerKindAll, LedgerPeerKindBig:
+		default:
+			return fmt.Errorf("invalid LedgerPeerKind: %d", kind)
+		}
+		tmp.PeerKind = LedgerPeerKind(kind)
+		tmp.WithPeerKind = true
+	}
+	*q = tmp
+	return nil
+}
+
+func (q ShelleyGetLedgerPeerSnapshotQuery) MarshalCBOR() ([]byte, error) {
+	if q.Type != QueryTypeShelleyGetLedgerPeerSnapshot {
+		return nil, fmt.Errorf(
+			"unexpected GetLedgerPeerSnapshot query type: %d",
+			q.Type,
+		)
+	}
+	if q.WithPeerKind {
+		switch q.PeerKind {
+		case LedgerPeerKindAll, LedgerPeerKindBig:
+		default:
+			return nil, fmt.Errorf("invalid LedgerPeerKind: %d", q.PeerKind)
+		}
+		return cbor.Encode([]int{q.Type, int(q.PeerKind)})
+	}
+	if q.PeerKind != LedgerPeerKindBig {
+		return nil, ErrLedgerPeerKindUnsupportedVersion
+	}
+	return cbor.Encode([]int{q.Type})
+}
+
+// Conway governance result types
+
+// ConstitutionResult represents the constitution query result.
+// The constitution contains an anchor (URL and hash) and an optional
+// guardrails script hash
+type ConstitutionResult struct {
+	cbor.StructAsArray
+	Anchor     lcommon.GovAnchor
+	ScriptHash []byte // Optional guardrails script hash (nil if no guardrails)
+}
+
+// Committee represents the constitutional committee.
+// Members maps cold credentials to their expiry epoch.
+// Threshold is the voting threshold as a rational number.
+type Committee struct {
+	cbor.StructAsArray
+	Members   map[StakeCredential]uint64 // Cold credential -> expiry epoch
+	Threshold cbor.Rat
+}
+
+// GovActionState represents a governance proposal and its current voting state.
+type GovActionState struct {
+	cbor.StructAsArray
+	Id                lcommon.GovActionId
+	CommitteeVotes    map[StakeCredential]lcommon.Vote
+	DRepVotes         map[StakeCredential]lcommon.Vote
+	SPOVotes          map[ledger.Blake2b224]lcommon.Vote
+	ProposalProcedure cbor.RawMessage
+	ProposedIn        uint64
+	ExpiresAfter      uint64
+}
+
+// GovStateResult represents the full governance state.
+// This includes proposals, committee, constitution, protocol parameters,
+// and DRep pulsing state.
+// The raw messages can be further decoded based on the era.
+type GovStateResult struct {
+	cbor.StructAsArray
+	Proposals        []GovActionState // Governance proposals with voting state
+	Committee        cbor.RawMessage  // StrictMaybe Committee
+	Constitution     ConstitutionResult
+	CurrentPParams   cbor.RawMessage // Era-specific protocol parameters
+	PrevPParams      cbor.RawMessage // Previous era protocol parameters
+	FuturePParams    cbor.RawMessage // Scheduled parameter changes
+	DRepPulsingState cbor.RawMessage // DRep pulsing state
+}
+
+// DecodeCommittee decodes the Committee field from its StrictMaybe CBOR encoding.
+// In Cardano, StrictMaybe is encoded as:
+//   - [0] for SNothing (no committee)
+//   - [1, data] for SJust (committee present)
+//
+// Returns nil if the committee is absent (SNothing or empty/nil wrapper).
+func (g *GovStateResult) DecodeCommittee() (*Committee, error) {
+	if len(g.Committee) == 0 {
+		return nil, nil
+	}
+	// CBOR null (0xf6) means no committee present
+	if len(g.Committee) == 1 && g.Committee[0] == 0xf6 {
+		return nil, nil
+	}
+	var wrapper []cbor.RawMessage
+	if _, err := cbor.Decode(g.Committee, &wrapper); err != nil {
+		return nil, err
+	}
+	if len(wrapper) == 0 {
+		return nil, nil
+	}
+	var tag uint64
+	if _, err := cbor.Decode(wrapper[0], &tag); err != nil {
+		return nil, err
+	}
+	switch tag {
+	case 0:
+		return nil, nil
+	case 1:
+		if len(wrapper) < 2 {
+			return nil, errors.New("invalid StrictMaybe SJust: missing data")
+		}
+		var committee Committee
+		if _, err := cbor.Decode(wrapper[1], &committee); err != nil {
+			return nil, err
+		}
+		return &committee, nil
+	default:
+		return nil, fmt.Errorf("unknown StrictMaybe tag: %d", tag)
+	}
+}
+
+// DRepStateEntry represents the state of a single DRep.
+//
+// On the wire it is the cardano-node GetDRepState value: a 4-element array
+//
+//	[ expiry, anchor, deposit, delegators ]
+//
+// where anchor is a StrictMaybe encoded as a list ([] for none, [anchor] for
+// some — not a CBOR null), and delegators is a CBOR set (tag 258) of the stake
+// credentials currently delegating their voting power to this DRep. cardano
+// clients (cardano-cli) decode this exact shape; emitting a 3-element array (no
+// delegators) or a CBOR null anchor makes them fail with a size mismatch.
+type DRepStateEntry struct {
+	Expiry     uint64             // Epoch when DRep expires
+	Anchor     *lcommon.GovAnchor // Optional metadata anchor
+	Deposit    uint64             // Deposit amount
+	Delegators []StakeCredential  // Stake credentials delegating to this DRep
+}
+
+func (e DRepStateEntry) MarshalCBOR() ([]byte, error) {
+	// StrictMaybe Anchor: SNothing -> [], SJust -> [anchor].
+	anchor := []any{}
+	if e.Anchor != nil {
+		anchor = []any{*e.Anchor}
+	}
+	// Delegators as a CBOR set (tag 258); empty when the DRep has none.
+	delegators := make(cbor.Set, len(e.Delegators))
+	for i := range e.Delegators {
+		delegators[i] = e.Delegators[i]
+	}
+	return cbor.Encode([]any{
+		e.Expiry,
+		anchor,
+		e.Deposit,
+		delegators,
+	})
+}
+
+func (e *DRepStateEntry) UnmarshalCBOR(data []byte) error {
+	var raw struct {
+		cbor.StructAsArray
+		Expiry     uint64
+		Anchor     []lcommon.GovAnchor
+		Deposit    uint64
+		Delegators []StakeCredential
+	}
+	if _, err := cbor.Decode(data, &raw); err != nil {
+		return err
+	}
+	e.Expiry = raw.Expiry
+	if len(raw.Anchor) > 0 {
+		anchor := raw.Anchor[0]
+		e.Anchor = &anchor
+	} else {
+		e.Anchor = nil
+	}
+	e.Deposit = raw.Deposit
+	e.Delegators = raw.Delegators
+	return nil
+}
+
+// DRepStateResult represents the DRep state query result.
+// The result is a map of stake credentials to DRep state entries.
+type DRepStateResult map[StakeCredential]DRepStateEntry
+
+// DRepStakeDistrResult and DRepStakeDistrEntry are defined in
+// drep_stake_distr.go, which carries the reply's wire layout.
+
+// HotCredAuthStatus represents the authorization status of a hot credential
+type HotCredAuthStatus int
+
+const (
+	HotCredNotAuthorized HotCredAuthStatus = 0
+	HotCredAuthorized    HotCredAuthStatus = 1
+	HotCredResigned      HotCredAuthStatus = 2
+)
+
+// MemberStatus represents the status of a committee member
+type MemberStatus int
+
+const (
+	MemberStatusActive       MemberStatus = 0
+	MemberStatusExpired      MemberStatus = 1
+	MemberStatusUnrecognized MemberStatus = 2
+)
+
+// NextEpochChange represents the change that will happen at the next epoch
+type NextEpochChange int
+
+const (
+	NextEpochNoChange     NextEpochChange = 0
+	NextEpochToBeEnacted  NextEpochChange = 1
+	NextEpochToBeRemoved  NextEpochChange = 2
+	NextEpochToBeExpired  NextEpochChange = 3
+	NextEpochTermAdjusted NextEpochChange = 5
+)
+
+// HotCredAuthStatusValue represents a tagged union for hot credential
+// authorization status.
+// CBOR encoding: [0] for NotAuthorized, [1, credential] for Authorized,
+// [2, anchor_or_null] for Resigned
+type HotCredAuthStatusValue struct {
+	Status     HotCredAuthStatus
+	Credential *lcommon.Credential
+	Anchor     *lcommon.GovAnchor
+}
+
+func (h *HotCredAuthStatusValue) UnmarshalCBOR(data []byte) error {
+	listLen, err := cbor.ListLength(data)
+	if err != nil {
+		return err
+	}
+	tag, err := cbor.DecodeIdFromList(data)
+	if err != nil {
+		return err
+	}
+	switch {
+	case listLen == 1 && tag == 0:
+		h.Status = HotCredNotAuthorized
+	case listLen == 2 && tag == 1:
+		var tmp struct {
+			cbor.StructAsArray
+			Tag        int
+			Credential lcommon.Credential
+		}
+		if _, err := cbor.Decode(data, &tmp); err != nil {
+			return err
+		}
+		h.Status = HotCredAuthorized
+		h.Credential = &tmp.Credential
+	case listLen == 2 && tag == 2:
+		var tmp struct {
+			cbor.StructAsArray
+			Tag    int
+			Anchor *lcommon.GovAnchor
+		}
+		if _, err := cbor.Decode(data, &tmp); err != nil {
+			return err
+		}
+		h.Status = HotCredResigned
+		h.Anchor = tmp.Anchor
+	default:
+		return fmt.Errorf(
+			"unexpected HotCredAuthStatusValue: tag=%d, length=%d",
+			tag,
+			listLen,
+		)
+	}
+	return nil
+}
+
+func (h *HotCredAuthStatusValue) MarshalCBOR() ([]byte, error) {
+	switch h.Status {
+	case HotCredNotAuthorized:
+		return cbor.Encode([]any{0})
+	case HotCredAuthorized:
+		if h.Credential == nil {
+			return nil, errors.New(
+				"credential must be set for HotCredAuthorized",
+			)
+		}
+		return cbor.Encode([]any{1, h.Credential})
+	case HotCredResigned:
+		return cbor.Encode([]any{2, h.Anchor})
+	default:
+		return nil, fmt.Errorf("unknown HotCredAuthStatus: %d", h.Status)
+	}
+}
+
+// NextEpochChangeValue represents a tagged union for next epoch changes.
+// CBOR encoding: simple int (0-3) for most changes,
+// or [5, epoch] for TermAdjusted
+type NextEpochChangeValue struct {
+	Change        NextEpochChange
+	AdjustedEpoch *uint64
+}
+
+func (n *NextEpochChangeValue) UnmarshalCBOR(data []byte) error {
+	// Check if this is a CBOR list (for TermAdjusted) or a simple integer
+	listLen, listErr := cbor.ListLength(data)
+	if listErr != nil {
+		// Not a list, decode as a simple integer
+		var simpleVal int
+		if _, err := cbor.Decode(data, &simpleVal); err != nil {
+			return fmt.Errorf(
+				"failed to decode NextEpochChangeValue: %w",
+				err,
+			)
+		}
+		if simpleVal < 0 || simpleVal > 3 {
+			return fmt.Errorf(
+				"unexpected simple NextEpochChange value: %d",
+				simpleVal,
+			)
+		}
+		n.Change = NextEpochChange(simpleVal)
+		return nil
+	}
+	// It's a list, decode as [5, epoch]
+	if listLen != 2 {
+		return fmt.Errorf(
+			"unexpected list length %d for NextEpochChangeValue",
+			listLen,
+		)
+	}
+	var tmp struct {
+		cbor.StructAsArray
+		Tag   int
+		Epoch uint64
+	}
+	if _, err := cbor.Decode(data, &tmp); err != nil {
+		return fmt.Errorf("failed to decode NextEpochChangeValue: %w", err)
+	}
+	if tmp.Tag != 5 {
+		return fmt.Errorf(
+			"unexpected tag %d for NextEpochChangeValue list",
+			tmp.Tag,
+		)
+	}
+	n.Change = NextEpochTermAdjusted
+	n.AdjustedEpoch = &tmp.Epoch
+	return nil
+}
+
+func (n *NextEpochChangeValue) MarshalCBOR() ([]byte, error) {
+	if n.Change == NextEpochTermAdjusted {
+		if n.AdjustedEpoch == nil {
+			return nil, errors.New(
+				"adjustedEpoch must be set for NextEpochTermAdjusted",
+			)
+		}
+		return cbor.Encode([]any{5, *n.AdjustedEpoch})
+	}
+	return cbor.Encode(int(n.Change))
+}
+
+// CommitteeMemberState represents the state of a committee member
+type CommitteeMemberState struct {
+	cbor.StructAsArray
+	HotCredStatus   HotCredAuthStatusValue
+	Status          MemberStatus
+	Expiry          *uint64
+	NextEpochChange NextEpochChangeValue
+}
+
+// CommitteeMembersStateResult represents the committee members state
+// query result. Contains the committee members, voting threshold,
+// and current epoch
+type CommitteeMembersStateResult struct {
+	cbor.StructAsArray
+	Members   map[StakeCredential]CommitteeMemberState
+	Threshold *cbor.Rat
+	Epoch     uint64
+}
+
+// FilteredVoteDelegateesResult represents the vote delegatees
+// for stake credentials.
+// The result maps stake credentials to their DRep delegations
+// and is wrapped in a one-element array by the Shelley era codec.
+type FilteredVoteDelegateesResult map[StakeCredential]lcommon.Drep
+
+func (r *FilteredVoteDelegateesResult) UnmarshalCBOR(data []byte) error {
+	var tmp struct {
+		cbor.StructAsArray
+		Delegatees map[StakeCredential]lcommon.Drep
+	}
+	if _, err := cbor.Decode(data, &tmp); err != nil {
+		return err
+	}
+	*r = tmp.Delegatees
+	return nil
+}
+
+// SPOStakeDistrResult represents the SPO stake distribution for governance
+// Maps pool IDs to their governance voting power
+type SPOStakeDistrResult struct {
+	cbor.StructAsArray
+	Results map[ledger.PoolId]uint64
+}
+
+// ProposalsResult represents the result of a GetProposals query.
+// It contains a list of governance action states for all active proposals.
+// The list is wrapped in a one-element array by the Shelley era codec.
+type ProposalsResult []GovActionState
+
+func (r *ProposalsResult) UnmarshalCBOR(data []byte) error {
+	var tmp struct {
+		cbor.StructAsArray
+		Proposals []GovActionState
+	}
+	if _, err := cbor.Decode(data, &tmp); err != nil {
+		return err
+	}
+	*r = tmp.Proposals
+	return nil
+}
+
+// EnactState represents the enactment state within a ratify state result.
+// It contains the current committee, constitution, protocol parameters,
+// treasury, withdrawals, and previous governance action IDs.
+type EnactState struct {
+	cbor.StructAsArray
+	Committee     cbor.RawMessage // Complex committee structure, keep as RawMessage
+	Constitution  ConstitutionResult
+	CurPParams    cbor.RawMessage // Era-specific protocol params
+	PrevPParams   cbor.RawMessage
+	Treasury      uint64
+	Withdrawals   map[StakeCredential]uint64
+	PrevActionIds cbor.RawMessage // Complex map of gov action types to optional action IDs
+}
+
+// RatifyStateResult represents the result of the GetRatifyState query (query ID 32).
+// It contains the enact state, a list of enacted governance actions,
+// a set of expired governance action IDs, and a delayed flag.
+type RatifyStateResult struct {
+	cbor.StructAsArray
+	EnactState EnactState
+	Enacted    []GovActionState
+	Expired    []lcommon.GovActionId
+	Delayed    bool
+}

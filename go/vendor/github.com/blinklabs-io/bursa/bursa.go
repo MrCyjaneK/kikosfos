@@ -1,0 +1,3226 @@
+// Copyright 2026 Blink Labs Software
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package bursa
+
+import (
+	"bytes"
+	"crypto/ed25519"
+	crand "crypto/rand"
+	"crypto/sha512"
+	"crypto/subtle"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+
+	"github.com/blinklabs-io/bursa/bip32"
+	bip39 "github.com/blinklabs-io/go-bip39"
+	ouroboros "github.com/blinklabs-io/gouroboros"
+	"github.com/blinklabs-io/gouroboros/cbor"
+	"github.com/blinklabs-io/gouroboros/kes"
+	"github.com/blinklabs-io/gouroboros/ledger"
+	lcommon "github.com/blinklabs-io/gouroboros/ledger/common"
+	"github.com/blinklabs-io/gouroboros/vrf"
+	"github.com/btcsuite/btcd/btcutil/bech32"
+	"golang.org/x/crypto/blake2b"
+)
+
+var (
+	// ErrInvalidMnemonic indicates the provided mnemonic is not valid BIP39
+	ErrInvalidMnemonic = errors.New("invalid mnemonic")
+	// ErrInvalidDerivationIndex indicates a derivation index exceeds the maximum allowed value
+	ErrInvalidDerivationIndex = errors.New(
+		"derivation indices must be less than 2^31",
+	)
+	// ErrInvalidNetwork indicates the provided network name is not recognized
+	ErrInvalidNetwork = errors.New("invalid network name")
+)
+
+type KeyFile struct {
+	Type        string `json:"type"`
+	Description string `json:"description"`
+	CborHex     string `json:"cborHex"`
+	// Embedded CBOR storage for automatic caching
+	cbor.DecodeStoreCbor `                          swaggerignore:"true"`
+}
+
+type LoadedKey struct {
+	File        string
+	Type        string
+	Description string
+	RawCBOR     []byte
+	VKey        []byte
+	SKey        []byte
+	// OpCert fields (only populated for NodeOperationalCertificate type)
+	OpCertIssueNumber uint64 // Certificate sequence/issue number
+	OpCertKesPeriod   uint64 // KES period at certificate creation
+	OpCertSignature   []byte // Cold key signature (64 bytes)
+	OpCertColdVKey    []byte // Cold verification key (32 bytes)
+	// KES metadata
+	KESPeriod uint64 // Current period for KES keys (track key evolution)
+}
+
+// Script represents a native script for multi-signature wallets
+// This is an alias for gouroboros ledger common Script for compatibility
+type Script = lcommon.Script
+
+// Native script type aliases for gouroboros types
+type (
+	NativeScript                 = lcommon.NativeScript
+	NativeScriptPubkey           = lcommon.NativeScriptPubkey
+	NativeScriptAll              = lcommon.NativeScriptAll
+	NativeScriptAny              = lcommon.NativeScriptAny
+	NativeScriptNofK             = lcommon.NativeScriptNofK
+	NativeScriptInvalidBefore    = lcommon.NativeScriptInvalidBefore
+	NativeScriptInvalidHereafter = lcommon.NativeScriptInvalidHereafter
+)
+
+// ScriptWitness pairs an Ed25519 verification key with its signature over the
+// script validation payload, mirroring a transaction's vkey witness. Both
+// fields are required for cryptographic validation: the key hash (Blake2b-224
+// of Vkey) must match a NativeScriptPubkey's key hash, and Signature must
+// verify against Vkey and the supplied message.
+type ScriptWitness = lcommon.VkeyWitness
+
+// GetScriptType returns the script type identifier for a native script.
+// Only accepts *NativeScript types; returns an error for other script types.
+func GetScriptType(script Script) (int, error) {
+	nativeScript, ok := script.(*NativeScript)
+	if !ok {
+		return 0, errors.New("script is not a native script")
+	}
+	// We need to determine the type from the CBOR data
+	// Since NativeScript stores the CBOR, we can decode the first byte to get the type
+	cborData := nativeScript.Cbor()
+	if len(cborData) == 0 {
+		return 0, errors.New("script CBOR data is empty")
+	}
+	id, err := cbor.DecodeIdFromList(cborData)
+	if err != nil {
+		return 0, fmt.Errorf("failed to decode script type from CBOR: %w", err)
+	}
+	return id, nil
+}
+
+// String returns the Bech32-encoded representation of the key according to CIP-0005
+func (kf KeyFile) String() string {
+	var prefix string
+	switch kf.Type {
+	case "RootExtendedSigningKeyShelley_ed25519_bip32":
+		prefix = "root_xsk"
+	case "AccountExtendedSigningKeyShelley_ed25519_bip32":
+		prefix = "acct_xsk"
+	case "PaymentVerificationKeyShelley_ed25519":
+		prefix = "addr_vk"
+	case "PaymentSigningKeyShelley_ed25519":
+		prefix = "addr_sk"
+	case "PaymentExtendedSigningKeyShelley_ed25519_bip32":
+		prefix = "addr_xsk"
+	case "StakeVerificationKeyShelley_ed25519":
+		prefix = "stake_vk"
+	case "StakeSigningKeyShelley_ed25519":
+		prefix = "stake_sk"
+	case "StakeExtendedSigningKeyShelley_ed25519_bip32":
+		prefix = "stake_xsk"
+	case "DRepVerificationKeyShelley_ed25519",
+		"DRepVerificationKey_ed25519":
+		prefix = "drep_vk"
+	case "DRepSigningKeyShelley_ed25519",
+		"DRepSigningKey_ed25519":
+		prefix = "drep_sk"
+	case "DRepExtendedSigningKeyShelley_ed25519_bip32",
+		"DRepExtendedSigningKey_ed25519_bip32":
+		prefix = "drep_xsk"
+	case "CommitteeColdVerificationKeyShelley_ed25519",
+		"ConstitutionalCommitteeColdVerificationKey_ed25519":
+		prefix = "cc_cold_vk"
+	case "CommitteeColdSigningKeyShelley_ed25519",
+		"ConstitutionalCommitteeColdSigningKey_ed25519":
+		prefix = "cc_cold_sk"
+	case "CommitteeColdExtendedSigningKeyShelley_ed25519_bip32",
+		"ConstitutionalCommitteeColdExtendedSigningKey_ed25519_bip32":
+		prefix = "cc_cold_xsk"
+	case "CommitteeHotVerificationKeyShelley_ed25519",
+		"ConstitutionalCommitteeHotVerificationKey_ed25519":
+		prefix = "cc_hot_vk"
+	case "CommitteeHotSigningKeyShelley_ed25519",
+		"ConstitutionalCommitteeHotSigningKey_ed25519":
+		prefix = "cc_hot_sk"
+	case "CommitteeHotExtendedSigningKeyShelley_ed25519_bip32",
+		"ConstitutionalCommitteeHotExtendedSigningKey_ed25519_bip32":
+		prefix = "cc_hot_xsk"
+	case "StakePoolVerificationKey_ed25519",
+		"StakePoolVerificationKeyShelley_ed25519":
+		prefix = "pool_vk"
+	case "StakePoolSigningKey_ed25519",
+		"StakePoolSigningKeyShelley_ed25519":
+		prefix = "pool_sk"
+	case "StakePoolExtendedSigningKeyShelley_ed25519_bip32":
+		prefix = "pool_xsk"
+	case "PolicyVerificationKeyShelley_ed25519":
+		prefix = "policy_vk"
+	case "PolicySigningKeyShelley_ed25519":
+		prefix = "policy_sk"
+	case "PolicyExtendedSigningKeyShelley_ed25519_bip32":
+		prefix = "policy_xsk"
+	case "CalidusVerificationKeyShelley_ed25519":
+		prefix = "calidus_vk"
+	case "CalidusSigningKeyShelley_ed25519":
+		prefix = "calidus_sk"
+	case "CalidusExtendedSigningKeyShelley_ed25519_bip32":
+		prefix = "calidus_xsk"
+	default:
+		// Fallback to CBOR hex if type not recognized
+		return kf.CborHex
+	}
+
+	cborData, err := hex.DecodeString(kf.CborHex)
+	if err != nil {
+		return kf.CborHex
+	}
+	// cardano-cli format: CBOR-encoded raw bytes
+	keyBytes, err := decodeKeyEnvelopeBytes(cborData, "key")
+	if err != nil {
+		return kf.CborHex
+	}
+
+	var data []byte
+	if strings.Contains(kf.Type, "_bip32") {
+		// Extended key: 128 bytes (privKey 64 | pubKey 32 | chainCode 32)
+		// For bech32: need privKey (64) + chainCode (32) = 96 bytes
+		if len(keyBytes) != 128 {
+			return kf.CborHex
+		}
+		privKey := keyBytes[0:64]
+		chainCode := keyBytes[96:128]
+		data = append(privKey, chainCode...)
+	} else {
+		// Non-extended key: 32 bytes
+		if len(keyBytes) != 32 {
+			return kf.CborHex
+		}
+		data = keyBytes
+	}
+
+	converted, err := bech32.ConvertBits(data, 8, 5, true)
+	if err != nil {
+		return kf.CborHex
+	}
+	encoded, err := bech32.Encode(prefix, converted)
+	if err != nil {
+		return kf.CborHex
+	}
+	return encoded
+}
+
+// Buffer pool for JSON marshaling
+var jsonBufferPool = sync.Pool{
+	New: func() any {
+		return &bytes.Buffer{}
+	},
+}
+
+// WalletConfig holds configuration options for wallet creation.
+// All index fields default to 0 and must be less than 2^31.
+type WalletConfig struct {
+	Network         string // Canonical network registry name
+	Password        string //nolint:gosec // G117: password field is intentional for key derivation
+	AccountID       uint32 // Account derivation index
+	PaymentID       uint32 // Payment key derivation index
+	StakeID         uint32 // Stake key derivation index
+	DRepID          uint32 // DRep key derivation index (CIP-105)
+	CommitteeColdID uint32 // Committee cold key derivation index (CIP-105)
+	CommitteeHotID  uint32 // Committee hot key derivation index (CIP-105)
+	PoolColdID      uint32 // Pool cold key derivation index (CIP-1853)
+	// AddressID is a compatibility alias for PaymentID and StakeID.
+	// Deprecated: configure PaymentID and StakeID independently instead.
+	AddressID    uint32
+	paymentIDSet bool
+	stakeIDSet   bool
+}
+
+// WalletOption is a functional option for configuring wallet creation
+type WalletOption func(*WalletConfig)
+
+// WithNetwork sets the network for the wallet.
+// Use a canonical network registry name, such as "mainnet", "preprod", or
+// "preview".
+// Default: "mainnet"
+func WithNetwork(network string) WalletOption {
+	return func(c *WalletConfig) {
+		c.Network = network
+	}
+}
+
+// WithPassword sets the password for key derivation.
+// This provides additional entropy for the master key derivation.
+// Default: "" (empty string)
+func WithPassword(password string) WalletOption {
+	return func(c *WalletConfig) {
+		c.Password = password
+	}
+}
+
+// WithAccountID sets the account derivation index.
+// Must be less than 2^31 for BIP32 compatibility.
+// Default: 0
+func WithAccountID(id uint32) WalletOption {
+	return func(c *WalletConfig) {
+		c.AccountID = id
+	}
+}
+
+// WithPaymentID sets the payment key derivation index.
+// Must be less than 2^31 for BIP32 compatibility.
+// Default: 0
+func WithPaymentID(id uint32) WalletOption {
+	return func(c *WalletConfig) {
+		c.PaymentID = id
+		c.paymentIDSet = true
+	}
+}
+
+// WithStakeID sets the stake key derivation index.
+// Must be less than 2^31 for BIP32 compatibility.
+// Default: 0
+func WithStakeID(id uint32) WalletOption {
+	return func(c *WalletConfig) {
+		c.StakeID = id
+		c.stakeIDSet = true
+	}
+}
+
+// WithDRepID sets the DRep key derivation index (CIP-105).
+// Must be less than 2^31 for BIP32 compatibility.
+// Default: 0
+func WithDRepID(id uint32) WalletOption {
+	return func(c *WalletConfig) {
+		c.DRepID = id
+	}
+}
+
+// WithCommitteeColdID sets the committee cold key derivation index (CIP-105).
+// Must be less than 2^31 for BIP32 compatibility.
+// Default: 0
+func WithCommitteeColdID(id uint32) WalletOption {
+	return func(c *WalletConfig) {
+		c.CommitteeColdID = id
+	}
+}
+
+// WithCommitteeHotID sets the committee hot key derivation index (CIP-105).
+// Must be less than 2^31 for BIP32 compatibility.
+// Default: 0
+func WithCommitteeHotID(id uint32) WalletOption {
+	return func(c *WalletConfig) {
+		c.CommitteeHotID = id
+	}
+}
+
+// WithPoolColdID sets the pool cold key derivation index (CIP-1853).
+// Must be less than 2^31 for BIP32 compatibility.
+// Default: 0
+func WithPoolColdID(id uint32) WalletOption {
+	return func(c *WalletConfig) {
+		c.PoolColdID = id
+	}
+}
+
+// WithAddressID sets the payment and stake derivation indices when their
+// dedicated options have not been provided.
+// Must be less than 2^31 for BIP32 compatibility.
+// Default: 0
+// New code should use WithPaymentID and WithStakeID instead.
+func WithAddressID(id uint32) WalletOption {
+	return func(c *WalletConfig) {
+		c.AddressID = id
+		if !c.paymentIDSet {
+			c.PaymentID = id
+		}
+		if !c.stakeIDSet {
+			c.StakeID = id
+		}
+	}
+}
+
+// defaultWalletConfig returns the default wallet configuration
+func defaultWalletConfig() *WalletConfig {
+	return &WalletConfig{
+		Network: "mainnet",
+	}
+}
+
+// Wallet represents a complete HD wallet with all key types
+type Wallet struct {
+	Mnemonic                  string  `json:"mnemonic"                     example:"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"`
+	PaymentAddress            string  `json:"payment_address"              example:"addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a429mg32v29q3cg4sdj5c9ts5vxknc0yutnj8x8r8qy2l2q9sgds2"`
+	StakeAddress              string  `json:"stake_address"                example:"stake1uy9ggsc9qls4pu9qvyyacwnmr9tt0gzcdt5s0zj4au8qkqc65ge8t"`
+	PaymentVKey               KeyFile `json:"payment_vkey"`
+	PaymentSKey               KeyFile `json:"payment_skey"`
+	PaymentExtendedSKey       KeyFile `json:"payment_extended_skey"`
+	StakeVKey                 KeyFile `json:"stake_vkey"`
+	StakeSKey                 KeyFile `json:"stake_skey"`
+	StakeExtendedSKey         KeyFile `json:"stake_extended_skey"`
+	DRepVKey                  KeyFile `json:"drep_vkey"`
+	DRepSKey                  KeyFile `json:"drep_skey"`
+	DRepExtendedSKey          KeyFile `json:"drep_extended_skey"`
+	CommitteeColdVKey         KeyFile `json:"committee_cold_vkey"`
+	CommitteeColdSKey         KeyFile `json:"committee_cold_skey"`
+	CommitteeColdExtendedSKey KeyFile `json:"committee_cold_extended_skey"`
+	CommitteeHotVKey          KeyFile `json:"committee_hot_vkey"`
+	CommitteeHotSKey          KeyFile `json:"committee_hot_skey"`
+	CommitteeHotExtendedSKey  KeyFile `json:"committee_hot_extended_skey"`
+	PoolColdVKey              KeyFile `json:"pool_cold_vkey"`
+	PoolColdSKey              KeyFile `json:"pool_cold_skey"`
+	PoolColdExtendedSKey      KeyFile `json:"pool_cold_extended_skey"`
+}
+
+// GenerateMnemonic generates a new BIP39 mnemonic phrase
+func GenerateMnemonic() (string, error) {
+	entropy, err := bip39.NewEntropy(256)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate entropy: %w", err)
+	}
+	mnemonic, err := bip39.NewMnemonic(entropy)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate mnemonic: %w", err)
+	}
+	return mnemonic, nil
+}
+
+// NewWallet creates a new wallet from a BIP39 mnemonic phrase.
+// Use functional options to configure the wallet:
+//
+//	wallet, err := bursa.NewWallet(mnemonic,
+//	    bursa.WithNetwork("mainnet"),
+//	    bursa.WithPassword("optional-password"),
+//	    bursa.WithAccountID(0),
+//	)
+//
+// All derivation indices must be less than 2^31 (0x80000000) for BIP32 compatibility.
+func NewWallet(mnemonic string, opts ...WalletOption) (*Wallet, error) {
+	// Apply default configuration
+	cfg := defaultWalletConfig()
+	for _, opt := range opts {
+		opt(cfg)
+	}
+
+	if !isMnemonicValid(mnemonic) {
+		return nil, ErrInvalidMnemonic
+	}
+	if cfg.AccountID >= 0x80000000 || cfg.PaymentID >= 0x80000000 ||
+		cfg.StakeID >= 0x80000000 || cfg.DRepID >= 0x80000000 ||
+		cfg.CommitteeColdID >= 0x80000000 || cfg.CommitteeHotID >= 0x80000000 ||
+		cfg.PoolColdID >= 0x80000000 || cfg.AddressID >= 0x80000000 {
+		return nil, ErrInvalidDerivationIndex
+	}
+	rootKey, err := GetRootKeyFromMnemonic(mnemonic, cfg.Password)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get root key from mnemonic: %w", err)
+	}
+	accountKey, err := GetAccountKey(rootKey, cfg.AccountID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get account key: %w", err)
+	}
+	paymentKey, err := GetPaymentKey(accountKey, cfg.PaymentID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get payment key: %w", err)
+	}
+	stakeKey, err := GetStakeKey(accountKey, cfg.StakeID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get stake key: %w", err)
+	}
+	drepKey, err := GetDRepKey(accountKey, cfg.DRepID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get DRep key: %w", err)
+	}
+	committeeColdKey, err := GetCommitteeColdKey(
+		accountKey,
+		cfg.CommitteeColdID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get committee cold key: %w", err)
+	}
+	committeeHotKey, err := GetCommitteeHotKey(accountKey, cfg.CommitteeHotID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get committee hot key: %w", err)
+	}
+	// CIP-1853: Derive pool cold key using m/1853'/1815'/0'/index'
+	// usecase is fixed to 0 as per CIP-1853 specification
+	poolColdKey, err := GetPoolColdKey(rootKey, 0, cfg.PoolColdID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get pool cold key: %w", err)
+	}
+	network, ok := ouroboros.NetworkByName(cfg.Network)
+	if !ok {
+		return nil, fmt.Errorf("unable to get address: %w", ErrInvalidNetwork)
+	}
+	addr, err := newAddressFromKeys(paymentKey, stakeKey, network.Id)
+	if err != nil {
+		return nil, fmt.Errorf("unable to get address: %w", err)
+	}
+	if addr == nil {
+		return nil, errors.New("unable to get address")
+	}
+	stakeAddr := addr.StakeAddress()
+	if stakeAddr == nil {
+		return nil, errors.New("unable to get stake address")
+	}
+	paymentVKey, err := GetPaymentVKey(paymentKey)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to get payment verification key: %w",
+			err,
+		)
+	}
+	paymentSKey, err := GetPaymentSKey(paymentKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get payment signing key: %w", err)
+	}
+	paymentExtendedSKey, err := GetPaymentExtendedSKey(paymentKey)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to get payment extended signing key: %w",
+			err,
+		)
+	}
+	stakeVKey, err := GetStakeVKey(stakeKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get stake verification key: %w", err)
+	}
+	stakeSKey, err := GetStakeSKey(stakeKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get stake signing key: %w", err)
+	}
+	stakeExtendedSKey, err := GetStakeExtendedSKey(stakeKey)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to get stake extended signing key: %w",
+			err,
+		)
+	}
+	drepVKey, err := GetDRepVKey(drepKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get DRep verification key: %w", err)
+	}
+	drepSKey, err := GetDRepSKey(drepKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get DRep signing key: %w", err)
+	}
+	drepExtendedSKey, err := GetDRepExtendedSKey(drepKey)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to get DRep extended signing key: %w",
+			err,
+		)
+	}
+	committeeColdVKey, err := GetCommitteeColdVKey(committeeColdKey)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to get committee cold verification key: %w",
+			err,
+		)
+	}
+	committeeColdSKey, err := GetCommitteeColdSKey(committeeColdKey)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to get committee cold signing key: %w",
+			err,
+		)
+	}
+	committeeColdExtendedSKey, err := GetCommitteeColdExtendedSKey(
+		committeeColdKey,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to get committee cold extended signing key: %w",
+			err,
+		)
+	}
+	committeeHotVKey, err := GetCommitteeHotVKey(committeeHotKey)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to get committee hot verification key: %w",
+			err,
+		)
+	}
+	committeeHotSKey, err := GetCommitteeHotSKey(committeeHotKey)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to get committee hot signing key: %w",
+			err,
+		)
+	}
+	committeeHotExtendedSKey, err := GetCommitteeHotExtendedSKey(
+		committeeHotKey,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to get committee hot extended signing key: %w",
+			err,
+		)
+	}
+	poolColdVKey, err := GetPoolColdVKey(poolColdKey)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to get pool cold verification key: %w",
+			err,
+		)
+	}
+	poolColdSKey, err := GetPoolColdSKey(poolColdKey)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to get pool cold signing key: %w",
+			err,
+		)
+	}
+	poolColdExtendedSKey, err := GetPoolColdExtendedSKey(poolColdKey)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to get pool cold extended signing key: %w",
+			err,
+		)
+	}
+	w := &Wallet{
+		Mnemonic:                  mnemonic,
+		PaymentAddress:            addr.String(),
+		StakeAddress:              stakeAddr.String(),
+		PaymentVKey:               paymentVKey,
+		PaymentSKey:               paymentSKey,
+		PaymentExtendedSKey:       paymentExtendedSKey,
+		StakeVKey:                 stakeVKey,
+		StakeSKey:                 stakeSKey,
+		StakeExtendedSKey:         stakeExtendedSKey,
+		DRepVKey:                  drepVKey,
+		DRepSKey:                  drepSKey,
+		DRepExtendedSKey:          drepExtendedSKey,
+		CommitteeColdVKey:         committeeColdVKey,
+		CommitteeColdSKey:         committeeColdSKey,
+		CommitteeColdExtendedSKey: committeeColdExtendedSKey,
+		CommitteeHotVKey:          committeeHotVKey,
+		CommitteeHotSKey:          committeeHotSKey,
+		CommitteeHotExtendedSKey:  committeeHotExtendedSKey,
+		PoolColdVKey:              poolColdVKey,
+		PoolColdSKey:              poolColdSKey,
+		PoolColdExtendedSKey:      poolColdExtendedSKey,
+	}
+	return w, nil
+}
+
+func ExtractKeyFiles(wallet *Wallet) (map[string]string, error) {
+	if wallet == nil {
+		return nil, errors.New("wallet cannot be nil")
+	}
+	keyMap := map[string]KeyFile{
+		"payment.vkey":                 wallet.PaymentVKey,
+		"payment.skey":                 wallet.PaymentSKey,
+		"paymentExtended.skey":         wallet.PaymentExtendedSKey,
+		"stake.vkey":                   wallet.StakeVKey,
+		"stake.skey":                   wallet.StakeSKey,
+		"stakeExtended.skey":           wallet.StakeExtendedSKey,
+		"drep.vkey":                    wallet.DRepVKey,
+		"drep.skey":                    wallet.DRepSKey,
+		"drepExtended.skey":            wallet.DRepExtendedSKey,
+		"committee-cold.vkey":          wallet.CommitteeColdVKey,
+		"committee-cold.skey":          wallet.CommitteeColdSKey,
+		"committee-cold-extended.skey": wallet.CommitteeColdExtendedSKey,
+		"committee-hot.vkey":           wallet.CommitteeHotVKey,
+		"committee-hot.skey":           wallet.CommitteeHotSKey,
+		"committee-hot-extended.skey":  wallet.CommitteeHotExtendedSKey,
+		"pool-cold.vkey":               wallet.PoolColdVKey,
+		"pool-cold.skey":               wallet.PoolColdSKey,
+		"pool-cold-extended.skey":      wallet.PoolColdExtendedSKey,
+	}
+
+	result := make(map[string]string)
+	for name, kf := range keyMap {
+		keyStr, err := GetKeyFile(kf)
+		if err != nil {
+			return nil, fmt.Errorf("unable to get %s: %w", name, err)
+		}
+		result[name] = keyStr
+	}
+	return result, nil
+}
+
+// GetRootKeyFromMnemonic derives the CIP-1852 root key from a mnemonic string.
+// It delegates to GetRootKeyFromMnemonicBytes; callers that hold the decrypted
+// mnemonic in a zeroable byte slice (e.g. signing paths) should call that
+// function directly to avoid materializing an un-zeroable mnemonic string.
+//
+// Behavior change: every invalid mnemonic now returns ErrInvalidMnemonic
+// uniformly. Previously the underlying bip39.EntropyFromMnemonic error could be
+// surfaced; callers matching on that specific error should match on
+// ErrInvalidMnemonic instead.
+func GetRootKeyFromMnemonic(mnemonic, password string) (bip32.XPrv, error) {
+	b := []byte(mnemonic)
+	defer zeroBytes(b)
+	return GetRootKeyFromMnemonicBytes(b, password)
+}
+
+func GetRootKey(entropy []byte, password []byte) bip32.XPrv {
+	return bip32.FromBip39Entropy(entropy, password)
+}
+
+func GetRootSKey(rootKey bip32.XPrv) (KeyFile, error) {
+	return getExtendedSigningKeyFile(
+		rootKey,
+		"RootExtendedSigningKeyShelley_ed25519_bip32",
+		"Root Extended Signing Key (BIP32)",
+	)
+}
+
+func GetAccountKey(rootKey bip32.XPrv, num uint32) (bip32.XPrv, error) {
+	const harden = 0x80000000
+	if num > 0x7FFFFFFF {
+		return nil, ErrInvalidDerivationIndex
+	}
+	hardNum := harden + num
+	return rootKey.
+		Derive(uint32(harden + 1852)).
+		Derive(uint32(harden + 1815)).
+		Derive(uint32(hardNum)), nil
+}
+
+func GetAccountVKey(accountKey bip32.XPrv) (KeyFile, error) {
+	// Encode just the raw public key bytes (cardano-cli compatible format)
+	keyCbor, err := cbor.Encode(accountKey.Public().PublicKey())
+	if err != nil {
+		return KeyFile{}, fmt.Errorf(
+			"failed to encode account verification key CBOR: %w",
+			err,
+		)
+	}
+	kf := KeyFile{
+		Type:        "AccountVerificationKeyShelley_ed25519",
+		Description: "Account Verification Key",
+		CborHex:     hex.EncodeToString(keyCbor),
+	}
+	kf.SetCbor(keyCbor)
+	return kf, nil
+}
+
+func GetAccountSKey(accountKey bip32.XPrv) (KeyFile, error) {
+	return getExtendedSigningKeyFile(
+		accountKey,
+		"AccountExtendedSigningKeyShelley_ed25519_bip32",
+		"Account Extended Signing Key (BIP32)",
+	)
+}
+
+func GetPaymentKey(accountKey bip32.XPrv, num uint32) (bip32.XPrv, error) {
+	if num >= 0x80000000 {
+		return nil, ErrInvalidDerivationIndex
+	}
+	return accountKey.Derive(0).Derive(num), nil
+}
+
+func GetPaymentVKey(paymentKey bip32.XPrv) (KeyFile, error) {
+	// Encode just the raw public key bytes (cardano-cli compatible format)
+	keyCbor, err := cbor.Encode(paymentKey.Public().PublicKey())
+	if err != nil {
+		return KeyFile{}, fmt.Errorf(
+			"failed to encode payment verification key CBOR: %w",
+			err,
+		)
+	}
+	kf := KeyFile{
+		Type:        "PaymentVerificationKeyShelley_ed25519",
+		Description: "Payment Verification Key",
+		CborHex:     hex.EncodeToString(keyCbor),
+	}
+	kf.SetCbor(keyCbor)
+	return kf, nil
+}
+
+func getNonExtendedSigningKeyFile(
+	key bip32.XPrv,
+	keyType, description string,
+) (KeyFile, error) {
+	// A non-extended Ed25519 signing envelope contains a 32-byte seed. Consumers
+	// expand that seed before deriving its verification key, so this form is only
+	// valid when the paired verification identity uses standard Ed25519.
+	keyCbor, err := cbor.Encode(key.PrivateKey()[:32])
+	if err != nil {
+		return KeyFile{}, fmt.Errorf(
+			"failed to encode %s CBOR: %w",
+			description,
+			err,
+		)
+	}
+	kf := KeyFile{
+		Type:        keyType,
+		Description: description,
+		CborHex:     hex.EncodeToString(keyCbor),
+	}
+	kf.SetCbor(keyCbor)
+	return kf, nil
+}
+
+func createExtendedSigningKeyFile(
+	privateKey, publicKey, chainCode []byte,
+	keyType, description string,
+) (KeyFile, error) {
+	if len(privateKey) != 64 || len(publicKey) != 32 || len(chainCode) != 32 {
+		return KeyFile{}, fmt.Errorf(
+			"invalid extended signing key components for %s: private=%d public=%d chain-code=%d",
+			description,
+			len(privateKey),
+			len(publicKey),
+			len(chainCode),
+		)
+	}
+	extendedKey := make([]byte, 128)
+	copy(extendedKey[0:64], privateKey)
+	copy(extendedKey[64:96], publicKey)
+	copy(extendedKey[96:128], chainCode)
+	keyCbor, err := cbor.Encode(extendedKey)
+	if err != nil {
+		return KeyFile{}, fmt.Errorf(
+			"failed to encode %s CBOR: %w",
+			description,
+			err,
+		)
+	}
+	kf := KeyFile{
+		Type:        keyType,
+		Description: description,
+		CborHex:     hex.EncodeToString(keyCbor),
+	}
+	kf.SetCbor(keyCbor)
+	return kf, nil
+}
+
+func getExtendedSigningKeyFile(
+	key bip32.XPrv,
+	keyType, description string,
+) (KeyFile, error) {
+	return createExtendedSigningKeyFile(
+		key.PrivateKey(),
+		key.PublicKey(),
+		key.ChainCode(),
+		keyType,
+		description,
+	)
+}
+
+func GetPaymentSKey(paymentKey bip32.XPrv) (KeyFile, error) {
+	return getExtendedSigningKeyFile(
+		paymentKey,
+		"PaymentExtendedSigningKeyShelley_ed25519_bip32",
+		"Payment Extended Signing Key (BIP32)",
+	)
+}
+
+func GetPaymentExtendedSKey(paymentKey bip32.XPrv) (KeyFile, error) {
+	return getExtendedSigningKeyFile(
+		paymentKey,
+		"PaymentExtendedSigningKeyShelley_ed25519_bip32",
+		"Payment Extended Signing Key (BIP32)",
+	)
+}
+
+// GetCalidusKey derives a Calidus key (CIP-88/CIP-151) for SPO on-chain
+// authentication. Uses the same derivation path as payment key:
+// m/1852'/1815'/account'/0/0
+// The key is functionally identical to the payment key but uses different
+// bech32 prefixes (calidus_xsk/calidus_xvk) and different cardano-cli
+// text envelope types for SPO identity purposes.
+func GetCalidusKey(
+	accountKey bip32.XPrv,
+	num uint32,
+) (bip32.XPrv, error) {
+	if num >= 0x80000000 {
+		return nil, ErrInvalidDerivationIndex
+	}
+	// Same derivation as payment: role=0, index=num
+	return accountKey.Derive(0).Derive(num), nil
+}
+
+// GetCalidusVKey creates a Calidus verification key file
+func GetCalidusVKey(calidusKey bip32.XPrv) (KeyFile, error) {
+	keyCbor, err := cbor.Encode(calidusKey.Public().PublicKey())
+	if err != nil {
+		return KeyFile{}, fmt.Errorf(
+			"failed to encode Calidus verification key CBOR: %w",
+			err,
+		)
+	}
+	kf := KeyFile{
+		Type:        "CalidusVerificationKeyShelley_ed25519",
+		Description: "Calidus Verification Key",
+		CborHex:     hex.EncodeToString(keyCbor),
+	}
+	kf.SetCbor(keyCbor)
+	return kf, nil
+}
+
+// GetCalidusSKey creates a Calidus signing key file
+func GetCalidusSKey(calidusKey bip32.XPrv) (KeyFile, error) {
+	return getExtendedSigningKeyFile(
+		calidusKey,
+		"CalidusExtendedSigningKeyShelley_ed25519_bip32",
+		"Calidus Extended Signing Key (BIP32)",
+	)
+}
+
+// GetCalidusExtendedSKey creates a Calidus extended signing key file
+func GetCalidusExtendedSKey(
+	calidusKey bip32.XPrv,
+) (KeyFile, error) {
+	return getExtendedSigningKeyFile(
+		calidusKey,
+		"CalidusExtendedSigningKeyShelley_ed25519_bip32",
+		"Calidus Extended Signing Key (BIP32)",
+	)
+}
+
+func GetStakeKey(accountKey bip32.XPrv, num uint32) (bip32.XPrv, error) {
+	if num >= 0x80000000 {
+		return nil, ErrInvalidDerivationIndex
+	}
+	return accountKey.Derive(2).Derive(num), nil
+}
+
+func GetStakeVKey(stakeKey bip32.XPrv) (KeyFile, error) {
+	// Encode just the raw public key bytes (cardano-cli compatible format)
+	keyCbor, err := cbor.Encode(stakeKey.Public().PublicKey())
+	if err != nil {
+		return KeyFile{}, fmt.Errorf(
+			"failed to encode stake verification key CBOR: %w",
+			err,
+		)
+	}
+	kf := KeyFile{
+		Type:        "StakeVerificationKeyShelley_ed25519",
+		Description: "Stake Verification Key",
+		CborHex:     hex.EncodeToString(keyCbor),
+	}
+	kf.SetCbor(keyCbor)
+	return kf, nil
+}
+
+func GetStakeSKey(stakeKey bip32.XPrv) (KeyFile, error) {
+	return getExtendedSigningKeyFile(
+		stakeKey,
+		"StakeExtendedSigningKeyShelley_ed25519_bip32",
+		"Stake Extended Signing Key (BIP32)",
+	)
+}
+
+func GetStakeExtendedSKey(stakeKey bip32.XPrv) (KeyFile, error) {
+	return getExtendedSigningKeyFile(
+		stakeKey,
+		"StakeExtendedSigningKeyShelley_ed25519_bip32",
+		"Stake Extended Signing Key (BIP32)",
+	)
+}
+
+func GetDRepKey(accountKey bip32.XPrv, num uint32) (bip32.XPrv, error) {
+	if num >= 0x80000000 {
+		return nil, ErrInvalidDerivationIndex
+	}
+	return accountKey.Derive(3).Derive(num), nil
+}
+
+func GetDRepVKey(drepKey bip32.XPrv) (KeyFile, error) {
+	// Encode just the raw public key bytes (cardano-cli compatible format)
+	keyCbor, err := cbor.Encode(drepKey.Public().PublicKey())
+	if err != nil {
+		return KeyFile{}, fmt.Errorf(
+			"failed to encode DRep verification key CBOR: %w",
+			err,
+		)
+	}
+	kf := KeyFile{
+		Type:        "DRepVerificationKey_ed25519",
+		Description: "DRep Verification Key",
+		CborHex:     hex.EncodeToString(keyCbor),
+	}
+	kf.SetCbor(keyCbor)
+	return kf, nil
+}
+
+func GetDRepSKey(drepKey bip32.XPrv) (KeyFile, error) {
+	return getExtendedSigningKeyFile(
+		drepKey,
+		"DRepExtendedSigningKey_ed25519_bip32",
+		"DRep Extended Signing Key (BIP32)",
+	)
+}
+
+func GetDRepExtendedSKey(drepKey bip32.XPrv) (KeyFile, error) {
+	return getExtendedSigningKeyFile(
+		drepKey,
+		"DRepExtendedSigningKey_ed25519_bip32",
+		"DRep Extended Signing Key (BIP32)",
+	)
+}
+
+func GetCommitteeColdKey(
+	accountKey bip32.XPrv,
+	num uint32,
+) (bip32.XPrv, error) {
+	if num >= 0x80000000 {
+		return nil, ErrInvalidDerivationIndex
+	}
+	return accountKey.Derive(4).Derive(num), nil
+}
+
+func GetCommitteeColdVKey(committeeKey bip32.XPrv) (KeyFile, error) {
+	// Encode just the raw public key bytes (cardano-cli compatible format)
+	keyCbor, err := cbor.Encode(committeeKey.Public().PublicKey())
+	if err != nil {
+		return KeyFile{}, fmt.Errorf(
+			"failed to encode Committee Cold verification key CBOR: %w",
+			err,
+		)
+	}
+	kf := KeyFile{
+		Type:        "ConstitutionalCommitteeColdVerificationKey_ed25519",
+		Description: "Committee Cold Verification Key",
+		CborHex:     hex.EncodeToString(keyCbor),
+	}
+	kf.SetCbor(keyCbor)
+	return kf, nil
+}
+
+func GetCommitteeColdSKey(committeeKey bip32.XPrv) (KeyFile, error) {
+	return getExtendedSigningKeyFile(
+		committeeKey,
+		"ConstitutionalCommitteeColdExtendedSigningKey_ed25519_bip32",
+		"Committee Cold Extended Signing Key (BIP32)",
+	)
+}
+
+func GetCommitteeColdExtendedSKey(committeeKey bip32.XPrv) (KeyFile, error) {
+	return getExtendedSigningKeyFile(
+		committeeKey,
+		"ConstitutionalCommitteeColdExtendedSigningKey_ed25519_bip32",
+		"Committee Cold Extended Signing Key (BIP32)",
+	)
+}
+
+func GetCommitteeHotKey(accountKey bip32.XPrv, num uint32) (bip32.XPrv, error) {
+	if num >= 0x80000000 {
+		return nil, ErrInvalidDerivationIndex
+	}
+	return accountKey.Derive(5).Derive(num), nil
+}
+
+func GetCommitteeHotVKey(committeeKey bip32.XPrv) (KeyFile, error) {
+	// Encode just the raw public key bytes (cardano-cli compatible format)
+	keyCbor, err := cbor.Encode(committeeKey.Public().PublicKey())
+	if err != nil {
+		return KeyFile{}, fmt.Errorf(
+			"failed to encode Committee Hot verification key CBOR: %w",
+			err,
+		)
+	}
+	kf := KeyFile{
+		Type:        "ConstitutionalCommitteeHotVerificationKey_ed25519",
+		Description: "Committee Hot Verification Key",
+		CborHex:     hex.EncodeToString(keyCbor),
+	}
+	kf.SetCbor(keyCbor)
+	return kf, nil
+}
+
+func GetCommitteeHotSKey(committeeKey bip32.XPrv) (KeyFile, error) {
+	return getExtendedSigningKeyFile(
+		committeeKey,
+		"ConstitutionalCommitteeHotExtendedSigningKey_ed25519_bip32",
+		"Committee Hot Extended Signing Key (BIP32)",
+	)
+}
+
+func GetCommitteeHotExtendedSKey(committeeKey bip32.XPrv) (KeyFile, error) {
+	return getExtendedSigningKeyFile(
+		committeeKey,
+		"ConstitutionalCommitteeHotExtendedSigningKey_ed25519_bip32",
+		"Committee Hot Extended Signing Key (BIP32)",
+	)
+}
+
+// GetPoolColdKey derives a stake pool cold key using CIP-1853 path: m/1853'/1815'/usecase'/index'
+// The usecase parameter is currently fixed to 0 as per CIP-1853 specification.
+// This function implements HD (Hierarchical Deterministic) derivation for stake pool cold keys.
+func GetPoolColdKey(
+	rootKey bip32.XPrv,
+	usecase uint32,
+	index uint32,
+) (bip32.XPrv, error) {
+	const harden = 0x80000000
+	// CIP-1853: All indices in the path must be hardened
+	if usecase >= 0x80000000 || index >= 0x80000000 {
+		return nil, ErrInvalidDerivationIndex
+	}
+	// m/1853'/1815'/usecase'/index'
+	return rootKey.
+		Derive(harden + 1853).
+		Derive(harden + 1815).
+		Derive(harden + usecase).
+		Derive(harden + index), nil
+}
+
+// GetPoolColdVKey creates a stake pool cold verification key file
+func GetPoolColdVKey(poolColdKey bip32.XPrv) (KeyFile, error) {
+	// Pool cold signing uses standard Ed25519 seeded from k_L, rather than the
+	// BIP32 extended public key derived from k_L. Export the matching public key
+	// so pool registration and operational certificates use the same key.
+	seed := poolColdKey.PrivateKey()[:ed25519.SeedSize]
+	vkey := ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)
+	keyCbor, err := cbor.Encode(vkey)
+	if err != nil {
+		return KeyFile{}, fmt.Errorf(
+			"failed to encode pool cold verification key CBOR: %w",
+			err,
+		)
+	}
+	kf := KeyFile{
+		Type:        "StakePoolVerificationKey_ed25519",
+		Description: "Stake Pool Cold Verification Key",
+		CborHex:     hex.EncodeToString(keyCbor),
+	}
+	kf.SetCbor(keyCbor)
+	return kf, nil
+}
+
+// GetPoolColdSKey creates a stake pool cold signing key file
+func GetPoolColdSKey(poolColdKey bip32.XPrv) (KeyFile, error) {
+	return getNonExtendedSigningKeyFile(
+		poolColdKey,
+		"StakePoolSigningKey_ed25519",
+		"Stake Pool Cold Signing Key",
+	)
+}
+
+// GetPoolColdExtendedSKey creates a stake pool cold extended signing key file (BIP32)
+func GetPoolColdExtendedSKey(poolColdKey bip32.XPrv) (KeyFile, error) {
+	// Pool-cold's canonical identity is the standard Ed25519 key derived from
+	// k_L as a seed. Expand that same seed into the scalar/prefix form expected
+	// by an extended envelope so both pool signing exports imply one pool ID.
+	seed := poolColdKey.PrivateKey()[:ed25519.SeedSize]
+	expanded := sha512.Sum512(seed)
+	expanded[0] &= 248
+	expanded[31] &= 63
+	expanded[31] |= 64
+	publicKey := ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)
+	return createExtendedSigningKeyFile(
+		expanded[:],
+		publicKey,
+		poolColdKey.ChainCode(),
+		"StakePoolExtendedSigningKeyShelley_ed25519_bip32",
+		"Stake Pool Cold Extended Signing Key (BIP32)",
+	)
+}
+
+// GetPolicyKey derives a forging policy key using CIP-1855 path: m/1855'/1815'/policy_ix'
+// This function implements HD derivation for native asset minting/burning policy keys.
+// All indices in the path are hardened as per CIP-1855 specification.
+func GetPolicyKey(rootKey bip32.XPrv, index uint32) (bip32.XPrv, error) {
+	const harden = 0x80000000
+	// CIP-1855: All indices in the path must be hardened
+	if index >= 0x80000000 {
+		return nil, ErrInvalidDerivationIndex
+	}
+	// m/1855'/1815'/policy_ix'
+	return rootKey.
+		Derive(harden + 1855).
+		Derive(harden + 1815).
+		Derive(harden + index), nil
+}
+
+// GetPolicyVKey creates a policy verification key file
+func GetPolicyVKey(policyKey bip32.XPrv) (KeyFile, error) {
+	// Encode just the raw public key bytes (cardano-cli compatible format)
+	keyCbor, err := cbor.Encode(policyKey.Public().PublicKey())
+	if err != nil {
+		return KeyFile{}, fmt.Errorf(
+			"failed to encode policy verification key CBOR: %w",
+			err,
+		)
+	}
+	kf := KeyFile{
+		Type:        "PolicyVerificationKeyShelley_ed25519",
+		Description: "Policy Verification Key",
+		CborHex:     hex.EncodeToString(keyCbor),
+	}
+	kf.SetCbor(keyCbor)
+	return kf, nil
+}
+
+// GetPolicySKey creates a policy signing key file
+func GetPolicySKey(policyKey bip32.XPrv) (KeyFile, error) {
+	return getExtendedSigningKeyFile(
+		policyKey,
+		"PolicyExtendedSigningKeyShelley_ed25519_bip32",
+		"Policy Extended Signing Key (BIP32)",
+	)
+}
+
+// GetPolicyExtendedSKey creates a policy extended signing key file (BIP32)
+func GetPolicyExtendedSKey(policyKey bip32.XPrv) (KeyFile, error) {
+	return getExtendedSigningKeyFile(
+		policyKey,
+		"PolicyExtendedSigningKeyShelley_ed25519_bip32",
+		"Policy Extended Signing Key (BIP32)",
+	)
+}
+
+// GetPolicyKeyHash returns the blake2b_224 hash of the policy verification key
+func GetPolicyKeyHash(policyKey bip32.XPrv) ([]byte, error) {
+	pubKey := policyKey.Public().PublicKey()
+	hash, err := blake2b.New(28, nil) // 224 bits = 28 bytes
+	if err != nil {
+		return nil, fmt.Errorf("failed to create blake2b hasher: %w", err)
+	}
+	_, err = hash.Write(pubKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to hash policy key: %w", err)
+	}
+	return hash.Sum(nil), nil
+}
+
+// GetVRFSeed derives a 32-byte VRF seed from a root key and index.
+// This provides deterministic VRF key generation from a mnemonic.
+// The seed is derived using blake2b-256 with a domain separator to ensure
+// it cannot collide with other key derivations.
+func GetVRFSeed(rootKey bip32.XPrv, index uint32) ([]byte, error) {
+	if index >= 0x80000000 {
+		return nil, ErrInvalidDerivationIndex
+	}
+	// Use blake2b-256 to derive a 32-byte seed from the root key
+	// Domain separator: "bursa-vrf-seed" || index (4 bytes big-endian)
+	hasher, err := blake2b.New256(nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create blake2b hasher: %w", err)
+	}
+	// Write domain separator
+	hasher.Write([]byte("bursa-vrf-seed"))
+	// Write index as 4 bytes big-endian
+	indexBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(indexBytes, index)
+	hasher.Write(indexBytes)
+	// Write the root key's private key material
+	hasher.Write(rootKey.PrivateKey())
+	return hasher.Sum(nil), nil
+}
+
+// GetVRFKeyPair generates a VRF key pair from a seed.
+// Returns (publicKey, secretKey, error) where:
+//   - publicKey is 32 bytes (VRF verification key)
+//   - secretKey is 32 bytes (VRF signing key/seed)
+func GetVRFKeyPair(seed []byte) ([]byte, []byte, error) {
+	if len(seed) != vrf.SeedSize {
+		return nil, nil, fmt.Errorf(
+			"invalid seed size: got %d, expected %d",
+			len(seed),
+			vrf.SeedSize,
+		)
+	}
+	return vrf.KeyGen(seed)
+}
+
+// GetVRFVKey creates a KeyFile for a VRF verification key
+func GetVRFVKey(vrfPubKey []byte) (KeyFile, error) {
+	if len(vrfPubKey) != vrf.PublicKeySize {
+		return KeyFile{}, fmt.Errorf(
+			"invalid VRF verification key size: got %d, expected %d",
+			len(vrfPubKey), vrf.PublicKeySize,
+		)
+	}
+	keyCbor, err := cbor.Encode(vrfPubKey)
+	if err != nil {
+		return KeyFile{}, fmt.Errorf(
+			"failed to encode VRF verification key CBOR: %w",
+			err,
+		)
+	}
+	kf := KeyFile{
+		Type:        "VrfVerificationKey_PraosVRF",
+		Description: "VRF Verification Key",
+		CborHex:     hex.EncodeToString(keyCbor),
+	}
+	kf.SetCbor(keyCbor)
+	return kf, nil
+}
+
+// GetVRFSKey creates a KeyFile for a VRF signing key. The envelope holds the
+// seed followed by the public key, which is the layout cardano-cli requires.
+// The input may be the 32-byte seed or the 64-byte seed||public-key form.
+func GetVRFSKey(vrfSecKey []byte) (KeyFile, error) {
+	switch len(vrfSecKey) {
+	case vrf.SeedSize:
+		derived, _, err := vrf.KeyGen(vrfSecKey)
+		if err != nil {
+			return KeyFile{}, fmt.Errorf("failed to derive VRF public key: %w", err)
+		}
+		vrfSecKey = append(append([]byte(nil), vrfSecKey...), derived...)
+	case vrf.SeedSize + vrf.PublicKeySize:
+		// Do not emit an envelope whose embedded identity disagrees with the
+		// seed.
+		derived, _, err := vrf.KeyGen(vrfSecKey[:vrf.SeedSize])
+		if err != nil {
+			return KeyFile{}, fmt.Errorf("failed to derive VRF public key: %w", err)
+		}
+		if subtle.ConstantTimeCompare(derived, vrfSecKey[vrf.SeedSize:]) != 1 {
+			return KeyFile{}, errors.New(
+				"invalid VRF signing key: embedded public key does not match the seed",
+			)
+		}
+	default:
+		return KeyFile{}, fmt.Errorf(
+			"invalid VRF signing key size: got %d, expected %d or %d",
+			len(vrfSecKey), vrf.SeedSize, vrf.SeedSize+vrf.PublicKeySize,
+		)
+	}
+	keyCbor, err := cbor.Encode(vrfSecKey)
+	if err != nil {
+		return KeyFile{}, fmt.Errorf(
+			"failed to encode VRF signing key CBOR: %w",
+			err,
+		)
+	}
+	kf := KeyFile{
+		Type:        "VrfSigningKey_PraosVRF",
+		Description: "VRF Signing Key",
+		CborHex:     hex.EncodeToString(keyCbor),
+	}
+	kf.SetCbor(keyCbor)
+	return kf, nil
+}
+
+// GetKESSeed derives a 32-byte KES seed from a root key and index.
+// This provides deterministic KES key generation from a mnemonic.
+// The seed is derived using blake2b-256 with a domain separator to ensure
+// it cannot collide with other key derivations.
+func GetKESSeed(rootKey bip32.XPrv, index uint32) ([]byte, error) {
+	if index >= 0x80000000 {
+		return nil, ErrInvalidDerivationIndex
+	}
+	// Use blake2b-256 to derive a 32-byte seed from the root key
+	// Domain separator: "bursa-kes-seed" || index (4 bytes big-endian)
+	hasher, err := blake2b.New256(nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create blake2b hasher: %w", err)
+	}
+	// Write domain separator
+	hasher.Write([]byte("bursa-kes-seed"))
+	// Write index as 4 bytes big-endian
+	indexBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(indexBytes, index)
+	hasher.Write(indexBytes)
+	// Write the root key's private key material
+	hasher.Write(rootKey.PrivateKey())
+	return hasher.Sum(nil), nil
+}
+
+// GetKESKeyPair generates a KES key pair from a seed using Cardano's depth (6).
+// Returns (secretKey, publicKey, error) where:
+//   - secretKey is 608 bytes (KES secret key for depth 6)
+//   - publicKey is 32 bytes (KES verification key)
+func GetKESKeyPair(seed []byte) (*kes.SecretKey, []byte, error) {
+	if len(seed) != kes.SeedSize {
+		return nil, nil, fmt.Errorf(
+			"invalid seed size: got %d, expected %d",
+			len(seed),
+			kes.SeedSize,
+		)
+	}
+	return kes.KeyGen(kes.CardanoKesDepth, seed)
+}
+
+// GetKESVKey creates a KeyFile for a KES verification key
+func GetKESVKey(kesPubKey []byte) (KeyFile, error) {
+	if len(kesPubKey) != kes.PublicKeySize {
+		return KeyFile{}, fmt.Errorf(
+			"invalid KES verification key size: got %d, expected %d",
+			len(kesPubKey), kes.PublicKeySize,
+		)
+	}
+	keyCbor, err := cbor.Encode(kesPubKey)
+	if err != nil {
+		return KeyFile{}, fmt.Errorf(
+			"failed to encode KES verification key CBOR: %w",
+			err,
+		)
+	}
+	kf := KeyFile{
+		Type:        "KesVerificationKey_ed25519_kes_2^6",
+		Description: "KES Verification Key",
+		CborHex:     hex.EncodeToString(keyCbor),
+	}
+	kf.SetCbor(keyCbor)
+	return kf, nil
+}
+
+// GetKESSKey creates a KeyFile for a KES signing key
+func GetKESSKey(kesSecKey *kes.SecretKey) (KeyFile, error) {
+	if kesSecKey == nil {
+		return KeyFile{}, errors.New("KES secret key cannot be nil")
+	}
+	if kesSecKey.Depth != kes.CardanoKesDepth {
+		return KeyFile{}, fmt.Errorf(
+			"invalid KES secret key depth: got %d, expected %d",
+			kesSecKey.Depth, kes.CardanoKesDepth,
+		)
+	}
+	if len(kesSecKey.Data) != kes.CardanoKesSecretKeySize {
+		return KeyFile{}, fmt.Errorf(
+			"invalid KES secret key size: got %d, expected %d",
+			len(kesSecKey.Data), kes.CardanoKesSecretKeySize,
+		)
+	}
+
+	keyCbor, err := cbor.Encode(kesSecKey.Data)
+	if err != nil {
+		return KeyFile{}, fmt.Errorf(
+			"failed to encode KES signing key CBOR: %w",
+			err,
+		)
+	}
+	kf := KeyFile{
+		Type:        "KesSigningKey_ed25519_kes_2^6",
+		Description: "KES Signing Key",
+		CborHex:     hex.EncodeToString(keyCbor),
+	}
+	kf.SetCbor(keyCbor)
+	return kf, nil
+}
+
+// OperationalCertificate represents an operational certificate for SPO block production.
+// It binds a KES verification key to the pool's cold key.
+type OperationalCertificate struct {
+	KesVkey       []byte // KES verification key (32 bytes)
+	IssueNumber   uint64 // Certificate sequence/issue number
+	KesPeriod     uint64 // KES period at certificate creation
+	ColdSignature []byte // Cold key signature (64 bytes)
+	ColdVkey      []byte // Cold (pool) verification key (32 bytes)
+}
+
+// CreateOperationalCertificate creates a new operational certificate by signing
+// the KES verification key with the pool cold signing key.
+//
+// Parameters:
+//   - kesVkey: the KES verification key (32 bytes)
+//   - issueNumber: the certificate issue/sequence number (increments each time)
+//   - kesPeriod: the KES period at which this certificate becomes valid
+//   - coldSkey: the pool's cold signing key (32 or 64 bytes)
+//
+// Returns the operational certificate or an error if signing fails.
+func CreateOperationalCertificate(
+	kesVkey []byte,
+	issueNumber uint64,
+	kesPeriod uint64,
+	coldSkey []byte,
+) (*OperationalCertificate, error) {
+	// Derive the cold (pool) verification key from the cold signing key so
+	// the canonical NodeOperationalCertificate envelope can carry it. A real
+	// node cert is a 2-element structure [inner_cert, cold_vkey]; without the
+	// cold vkey the certificate cannot be verified or round-tripped.
+	var coldVkey ed25519.PublicKey
+	switch len(coldSkey) {
+	case ed25519.SeedSize:
+		coldVkey = ed25519.NewKeyFromSeed(coldSkey).
+			Public().(ed25519.PublicKey)
+	case ed25519.PrivateKeySize:
+		coldVkey = ed25519.PrivateKey(coldSkey).
+			Public().(ed25519.PublicKey)
+	default:
+		return nil, fmt.Errorf(
+			"cold signing key must be %d or %d bytes, got %d",
+			ed25519.SeedSize,
+			ed25519.PrivateKeySize,
+			len(coldSkey),
+		)
+	}
+	opCert, err := ledger.CreateOpCert(
+		kesVkey,
+		issueNumber,
+		kesPeriod,
+		coldSkey,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to create operational certificate: %w",
+			err,
+		)
+	}
+
+	return &OperationalCertificate{
+		KesVkey:       opCert.KesVkey,
+		IssueNumber:   opCert.IssueNumber,
+		KesPeriod:     opCert.KesPeriod,
+		ColdSignature: opCert.ColdSignature,
+		ColdVkey:      coldVkey,
+	}, nil
+}
+
+// PoolRegistrationCertificate represents a stake pool registration
+// certificate (cert type 3).
+type PoolRegistrationCertificate struct {
+	Operator      lcommon.PoolKeyHash // Pool operator key hash
+	VrfKeyHash    lcommon.VrfKeyHash  // VRF key hash
+	Pledge        uint64              // Pledge amount in lovelace
+	Cost          uint64              // Fixed cost per epoch in lovelace
+	MarginNum     int64               // Margin numerator
+	MarginDenom   int64               // Margin denominator
+	RewardAccount []byte              // Reward account raw bytes
+	PoolOwners    []lcommon.AddrKeyHash
+	Relays        []lcommon.PoolRelay
+	MetadataURL   string
+	MetadataHash  lcommon.PoolMetadataHash
+}
+
+// CreatePoolRegistrationCertificate creates a CBOR-encoded pool
+// registration certificate. The reward account should be provided
+// as raw address bytes (decoded from bech32).
+func CreatePoolRegistrationCertificate(
+	cert *PoolRegistrationCertificate,
+) ([]byte, error) {
+	if cert == nil {
+		return nil, errors.New("pool registration certificate cannot be nil")
+	}
+	// Build the CBOR structure per Shelley spec:
+	// [3, operator, vrf_keyhash, pledge, cost, margin,
+	//  reward_account, pool_owners, relays, pool_metadata]
+	if cert.MarginDenom <= 0 {
+		return nil, errors.New("margin denominator must be positive")
+	}
+	if cert.MarginNum < 0 || cert.MarginNum > cert.MarginDenom {
+		return nil, errors.New("margin numerator must be between zero and denominator")
+	}
+	margin := lcommon.NewGenesisRat(
+		cert.MarginNum,
+		cert.MarginDenom,
+	)
+
+	// Pool owners as a tag-258 set, sorted and deduplicated to match
+	// cardano-cli
+	sorted := slices.SortedFunc(
+		slices.Values(cert.PoolOwners),
+		func(a, b lcommon.AddrKeyHash) int {
+			return bytes.Compare(a[:], b[:])
+		},
+	)
+	sorted = slices.Compact(sorted)
+	owners := make(cbor.Set, len(sorted))
+	for i, owner := range sorted {
+		owners[i] = cbor.NewByteString(owner[:])
+	}
+
+	// Build relays array
+	relays := make([]any, len(cert.Relays))
+	for i, relay := range cert.Relays {
+		relays[i] = relay
+	}
+
+	// Build pool metadata (nullable)
+	var metadata any
+	if cert.MetadataURL != "" {
+		metadata = []any{
+			cert.MetadataURL,
+			cbor.NewByteString(cert.MetadataHash[:]),
+		}
+	}
+
+	certData := []any{
+		uint(3), // cert type: pool registration
+		cbor.NewByteString(cert.Operator[:]),
+		cbor.NewByteString(cert.VrfKeyHash[:]),
+		cert.Pledge,
+		cert.Cost,
+		margin,
+		cbor.NewByteString(cert.RewardAccount),
+		owners,
+		relays,
+		metadata,
+	}
+
+	cborBytes, err := cbor.Encode(certData)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to encode pool registration certificate: %w",
+			err,
+		)
+	}
+	return cborBytes, nil
+}
+
+// PoolRetirementCertificateParams holds parameters for creating
+// a pool retirement certificate.
+type PoolRetirementCertificateParams struct {
+	PoolKeyHash lcommon.PoolKeyHash // Pool operator key hash
+	Epoch       uint64              // Retirement epoch
+}
+
+// CreatePoolRetirementCertificate creates a CBOR-encoded pool
+// retirement certificate (cert type 4).
+func CreatePoolRetirementCertificate(
+	params *PoolRetirementCertificateParams,
+) ([]byte, error) {
+	if params == nil {
+		return nil, errors.New("pool retirement certificate parameters cannot be nil")
+	}
+	// CBOR structure: [4, pool_keyhash, epoch]
+	certData := []any{
+		uint(4), // cert type: pool retirement
+		cbor.NewByteString(params.PoolKeyHash[:]),
+		params.Epoch,
+	}
+
+	cborBytes, err := cbor.Encode(certData)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to encode pool retirement certificate: %w",
+			err,
+		)
+	}
+	return cborBytes, nil
+}
+
+// GetMultiSigAccountKey derives a multi-signature account key using CIP-1854 path
+func GetMultiSigAccountKey(rootKey bip32.XPrv, num uint32) (bip32.XPrv, error) {
+	const harden = 0x80000000
+	if num > 0x7FFFFFFF {
+		return nil, ErrInvalidDerivationIndex
+	}
+	hardNum := harden + num
+	return rootKey.
+		Derive(uint32(harden + 1854)).
+		Derive(uint32(harden + 1815)).
+		Derive(uint32(hardNum)), nil
+}
+
+// GetMultiSigPaymentKey derives a multi-signature payment key
+func GetMultiSigPaymentKey(
+	accountKey bip32.XPrv,
+	num uint32,
+) (bip32.XPrv, error) {
+	if num >= 0x80000000 {
+		return nil, ErrInvalidDerivationIndex
+	}
+	return accountKey.Derive(0).Derive(num), nil
+}
+
+// createVerificationKeyFile creates a verification key file for the given key and type
+func createVerificationKeyFile(
+	key bip32.XPrv,
+	keyType, description string,
+) (KeyFile, error) {
+	// Encode just the raw public key bytes (cardano-cli compatible format)
+	keyCbor, err := cbor.Encode(key.Public().PublicKey())
+	if err != nil {
+		return KeyFile{}, fmt.Errorf(
+			"failed to encode %s CBOR: %w",
+			strings.ToLower(description),
+			err,
+		)
+	}
+	kf := KeyFile{
+		Type:        keyType,
+		Description: description,
+		CborHex:     hex.EncodeToString(keyCbor),
+	}
+	kf.SetCbor(keyCbor)
+	return kf, nil
+}
+
+// GetMultiSigPaymentVKey creates a verification key file for multi-sig payment key
+func GetMultiSigPaymentVKey(paymentKey bip32.XPrv) (KeyFile, error) {
+	return createVerificationKeyFile(
+		paymentKey,
+		"PaymentVerificationKeyShelley_ed25519",
+		"Multi-Sig Payment Verification Key",
+	)
+}
+
+// GetMultiSigPaymentSKey creates a signing key file for multi-sig payment key
+func GetMultiSigPaymentSKey(paymentKey bip32.XPrv) (KeyFile, error) {
+	return getExtendedSigningKeyFile(
+		paymentKey,
+		"PaymentExtendedSigningKeyShelley_ed25519_bip32",
+		"Multi-Sig Payment Extended Signing Key (BIP32)",
+	)
+}
+
+// GetMultiSigStakeKey derives a multi-signature stake key
+func GetMultiSigStakeKey(
+	accountKey bip32.XPrv,
+	num uint32,
+) (bip32.XPrv, error) {
+	if num >= 0x80000000 {
+		return nil, ErrInvalidDerivationIndex
+	}
+	return accountKey.Derive(2).Derive(num), nil
+}
+
+// GetMultiSigStakeVKey creates a verification key file for multi-sig stake key
+func GetMultiSigStakeVKey(stakeKey bip32.XPrv) (KeyFile, error) {
+	return createVerificationKeyFile(
+		stakeKey,
+		"StakeVerificationKeyShelley_ed25519",
+		"Multi-Sig Stake Verification Key",
+	)
+}
+
+// GetMultiSigStakeSKey creates a signing key file for multi-sig stake key
+func GetMultiSigStakeSKey(stakeKey bip32.XPrv) (KeyFile, error) {
+	return getExtendedSigningKeyFile(
+		stakeKey,
+		"StakeExtendedSigningKeyShelley_ed25519_bip32",
+		"Multi-Sig Stake Extended Signing Key (BIP32)",
+	)
+}
+
+// NewScriptSig creates a signature script requiring the given key hash
+// keyHash must be 28 bytes (Blake2b-224 hash of public key per CIP-1854)
+func NewScriptSig(keyHash []byte) (*NativeScript, error) {
+	if len(keyHash) != 28 {
+		return nil, fmt.Errorf(
+			"invalid key hash length: got %d bytes, expected 28 bytes (Blake2b-224)",
+			len(keyHash),
+		)
+	}
+	concrete := &NativeScriptPubkey{
+		Type: 0,
+		Hash: keyHash,
+	}
+	cborData, err := cbor.Encode(concrete)
+	if err != nil {
+		return nil, err
+	}
+	var script NativeScript
+	if _, err := cbor.Decode(cborData, &script); err != nil {
+		return nil, err
+	}
+	return &script, nil
+}
+
+// NewScriptAll creates an "all" script requiring all sub-scripts to be satisfied
+func NewScriptAll(scripts ...Script) (*NativeScript, error) {
+	if len(scripts) == 0 {
+		return nil, errors.New("at least one script required for all script")
+	}
+	nativeScripts := make([]NativeScript, len(scripts))
+	for i, script := range scripts {
+		nativeScript, ok := script.(*NativeScript)
+		if !ok {
+			return nil, errors.New("script must be a *NativeScript")
+		}
+		nativeScripts[i] = *nativeScript
+	}
+	concrete := &NativeScriptAll{
+		Type:    1,
+		Scripts: nativeScripts,
+	}
+	cborData, err := cbor.Encode(concrete)
+	if err != nil {
+		return nil, err
+	}
+	var script NativeScript
+	if _, err := cbor.Decode(cborData, &script); err != nil {
+		return nil, err
+	}
+	return &script, nil
+}
+
+// NewScriptAny creates an "any" script requiring any sub-script to be satisfied
+func NewScriptAny(scripts ...Script) (*NativeScript, error) {
+	if len(scripts) == 0 {
+		return nil, errors.New("at least one script required for any script")
+	}
+	nativeScripts := make([]NativeScript, len(scripts))
+	for i, script := range scripts {
+		nativeScript, ok := script.(*NativeScript)
+		if !ok {
+			return nil, errors.New("script must be a *NativeScript")
+		}
+		nativeScripts[i] = *nativeScript
+	}
+	concrete := &NativeScriptAny{
+		Type:    2,
+		Scripts: nativeScripts,
+	}
+	cborData, err := cbor.Encode(concrete)
+	if err != nil {
+		return nil, err
+	}
+	var script NativeScript
+	if _, err := cbor.Decode(cborData, &script); err != nil {
+		return nil, err
+	}
+	return &script, nil
+}
+
+// NewScriptNOf creates an "N-of-K" script requiring N out of K sub-scripts to be satisfied
+func NewScriptNOf(n int, scripts ...Script) (*NativeScript, error) {
+	if n < 1 || n > len(scripts) {
+		return nil, fmt.Errorf(
+			"invalid n value %d: must be between 1 and %d",
+			n,
+			len(scripts),
+		)
+	}
+	nativeScripts := make([]NativeScript, len(scripts))
+	for i, script := range scripts {
+		nativeScript, ok := script.(*NativeScript)
+		if !ok {
+			return nil, errors.New("script must be a *NativeScript")
+		}
+		nativeScripts[i] = *nativeScript
+	}
+	concrete := &NativeScriptNofK{
+		Type:    3,
+		N:       int64(n),
+		Scripts: nativeScripts,
+	}
+	cborData, err := cbor.Encode(concrete)
+	if err != nil {
+		return nil, err
+	}
+	var script NativeScript
+	if _, err := cbor.Decode(cborData, &script); err != nil {
+		return nil, err
+	}
+	return &script, nil
+}
+
+// NewScriptBefore creates a "before" script valid before the given slot
+// Per CIP-1854: InvalidHereafter means the script is invalid from this slot onwards (valid before)
+func NewScriptBefore(slot uint64) (*NativeScript, error) {
+	concrete := &NativeScriptInvalidHereafter{
+		Type: 5,
+		Slot: slot,
+	}
+	cborData, err := cbor.Encode(concrete)
+	if err != nil {
+		return nil, err
+	}
+	var script NativeScript
+	if _, err := cbor.Decode(cborData, &script); err != nil {
+		return nil, err
+	}
+	return &script, nil
+}
+
+// NewScriptAfter creates an "after" script valid after the given slot
+// Per CIP-1854: InvalidBefore means the script is invalid before this slot (valid after/at)
+func NewScriptAfter(slot uint64) (*NativeScript, error) {
+	concrete := &NativeScriptInvalidBefore{
+		Type: 4,
+		Slot: slot,
+	}
+	cborData, err := cbor.Encode(concrete)
+	if err != nil {
+		return nil, err
+	}
+	var script NativeScript
+	if _, err := cbor.Decode(cborData, &script); err != nil {
+		return nil, err
+	}
+	return &script, nil
+}
+
+// NewMultiSigScript creates an N-of-M multi-signature script
+// For example, NewMultiSigScript(2, keyHash1, keyHash2, keyHash3) creates a 2-of-3 script
+func NewMultiSigScript(
+	required int,
+	keyHashes ...[]byte,
+) (*NativeScript, error) {
+	if len(keyHashes) == 0 {
+		return nil, errors.New("at least one key hash required")
+	}
+	if required < 1 || required > len(keyHashes) {
+		return nil, fmt.Errorf(
+			"invalid required signatures count: %d (must be 1-%d)",
+			required,
+			len(keyHashes),
+		)
+	}
+
+	scripts := make([]Script, len(keyHashes))
+	for i, keyHash := range keyHashes {
+		script, err := NewScriptSig(keyHash)
+		if err != nil {
+			return nil, err
+		}
+		scripts[i] = script
+	}
+
+	return NewScriptNOf(required, scripts...)
+}
+
+// NewAllMultiSigScript creates an all-of multi-signature script (all keys must sign)
+func NewAllMultiSigScript(keyHashes ...[]byte) (*NativeScript, error) {
+	if len(keyHashes) == 0 {
+		return nil, errors.New("at least one key hash required")
+	}
+
+	scripts := make([]Script, len(keyHashes))
+	for i, keyHash := range keyHashes {
+		script, err := NewScriptSig(keyHash)
+		if err != nil {
+			return nil, err
+		}
+		scripts[i] = script
+	}
+
+	return NewScriptAll(scripts...)
+}
+
+// NewAnyMultiSigScript creates an any-of multi-signature script (any key can sign)
+func NewAnyMultiSigScript(keyHashes ...[]byte) (*NativeScript, error) {
+	if len(keyHashes) == 0 {
+		return nil, errors.New("at least one key hash required")
+	}
+
+	scripts := make([]Script, len(keyHashes))
+	for i, keyHash := range keyHashes {
+		script, err := NewScriptSig(keyHash)
+		if err != nil {
+			return nil, err
+		}
+		scripts[i] = script
+	}
+
+	return NewScriptAny(scripts...)
+}
+
+// NewTimelockedScript wraps a script with a timelock condition
+func NewTimelockedScript(
+	slot uint64,
+	before bool,
+	script Script,
+) (Script, error) {
+	// Validate that the script is a native script
+	nativeScript, ok := script.(*NativeScript)
+	if !ok {
+		return nil, errors.New("timelock wrapper only supports native scripts")
+	}
+
+	var timelockScript *NativeScript
+	var err error
+	if before {
+		timelockScript, err = NewScriptBefore(slot)
+	} else {
+		timelockScript, err = NewScriptAfter(slot)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return NewScriptAll(timelockScript, nativeScript)
+}
+
+// NewMultiSigScriptFromKeys creates an N-of-M script from public key hashes
+// This is a convenience function that extracts key hashes from Ed25519 public keys
+func NewMultiSigScriptFromKeys(
+	required int,
+	pubKeys ...ed25519.PublicKey,
+) (*NativeScript, error) {
+	keyHashes := make([][]byte, len(pubKeys))
+	for i, pubKey := range pubKeys {
+		// For Ed25519, the key hash is typically the Blake2b-224 hash of the public key
+		hasher, err := blake2b.New(28, nil)
+		if err != nil {
+			// This should never happen with valid parameters
+			return nil, fmt.Errorf("failed to create blake2b hasher: %w", err)
+		}
+		hasher.Write(pubKey)
+		keyHashes[i] = hasher.Sum(nil)
+	}
+	return NewMultiSigScript(required, keyHashes...)
+}
+
+// GetScriptHash computes the hash of a script for use in addresses
+func GetScriptHash(script Script) ([]byte, error) {
+	if script == nil {
+		return nil, errors.New("script cannot be nil")
+	}
+	scriptHash := script.Hash()
+	return scriptHash.Bytes(), nil
+}
+
+// GetScriptAddress creates an address from a script
+func GetScriptAddress(script Script, networkName string) (string, error) {
+	if networkName == "" {
+		return "", ErrInvalidNetwork
+	}
+	network, ok := ouroboros.NetworkByName(networkName)
+	if !ok {
+		return "", ErrInvalidNetwork
+	}
+	scriptHash, err := GetScriptHash(script)
+	if err != nil {
+		return "", fmt.Errorf("failed to get script hash: %w", err)
+	}
+	addr, err := lcommon.NewAddressFromParts(
+		lcommon.AddressTypeScriptNone,
+		network.Id,
+		scriptHash,
+		nil, // no stake part for script addresses
+	)
+	if err != nil {
+		return "", fmt.Errorf("error creating script address: %w", err)
+	}
+	return addr.String(), nil
+}
+
+// Native-script validation limits bound both recursive and broad scripts before
+// they can consume unbounded CPU or stack space on the API/CLI paths.
+const (
+	maxScriptDepth      = 20
+	maxScriptNodes      = 1024
+	maxScriptWidth      = 256
+	maxScriptSignatures = 256
+)
+
+type scriptValidationBudget struct {
+	nodes int
+	// witnessesByHash is built once at the public boundary. Signature leaves
+	// then inspect only witnesses for their key instead of rescanning the full
+	// witness list for every leaf.
+	witnessesByHash map[string][]ScriptWitness
+}
+
+// ValidateScript checks if a script is satisfied given witnesses and current slot.
+// message is the signed payload (e.g. a transaction body hash) that each
+// witness's signature is verified against. If requireSignatures is true,
+// ScriptSig scripts require a witness whose verification key hash matches the
+// script and whose signature verifies against message. If false, allows empty
+// witnesses for structural validation only.
+func ValidateScript(
+	script Script,
+	message []byte,
+	witnesses []ScriptWitness,
+	slot uint64,
+	requireSignatures bool,
+) bool {
+	// The signature-count bound belongs to signature checking. Structural
+	// validation is asked whether the script itself is well formed, and
+	// answering false because the caller happened to pass a long witness list
+	// reports a malformed script that is nothing of the kind.
+	if requireSignatures && len(witnesses) > maxScriptSignatures {
+		return false
+	}
+	witnessesByHash := make(map[string][]ScriptWitness, len(witnesses))
+	if requireSignatures {
+		for _, witness := range witnesses {
+			if len(witness.Vkey) != ed25519.PublicKeySize {
+				continue
+			}
+			keyHash := lcommon.Blake2b224Hash(witness.Vkey)
+			key := string(keyHash.Bytes())
+			witnessesByHash[key] = append(witnessesByHash[key], witness)
+		}
+	}
+	budget := &scriptValidationBudget{witnessesByHash: witnessesByHash}
+	return validateScriptWithDepth(
+		script,
+		message,
+		slot,
+		requireSignatures,
+		0,
+		budget,
+	)
+}
+
+// validateScriptWithDepth is the internal recursive validator with depth tracking
+func validateScriptWithDepth(
+	script Script,
+	message []byte,
+	slot uint64,
+	requireSignatures bool,
+	depth int,
+	budget *scriptValidationBudget,
+) bool {
+	if depth > maxScriptDepth || budget.nodes >= maxScriptNodes {
+		return false
+	}
+	budget.nodes++
+
+	nativeScript, ok := script.(*NativeScript)
+	if !ok {
+		return false
+	}
+
+	switch s := nativeScript.Item().(type) {
+	case *NativeScriptPubkey:
+		return validateScriptSig(s, message, budget.witnessesByHash, requireSignatures)
+	case *NativeScriptAll:
+		if len(s.Scripts) > maxScriptWidth {
+			return false
+		}
+		return validateScriptAllWithDepth(s, message, slot, requireSignatures, depth+1, budget)
+	case *NativeScriptAny:
+		if len(s.Scripts) > maxScriptWidth {
+			return false
+		}
+		return validateScriptAnyWithDepth(s, message, slot, requireSignatures, depth+1, budget)
+	case *NativeScriptNofK:
+		if len(s.Scripts) > maxScriptWidth {
+			return false
+		}
+		return validateScriptNOfWithDepth(s, message, slot, requireSignatures, depth+1, budget)
+	case *NativeScriptInvalidBefore:
+		return validateScriptInvalidBefore(s, slot)
+	case *NativeScriptInvalidHereafter:
+		return validateScriptInvalidHereafter(s, slot)
+	default:
+		return false
+	}
+}
+
+// validateScriptSig checks if a signature script is satisfied.
+//
+// If requireSignatures is true, at least one witness must carry a
+// verification key whose Blake2b-224 hash matches the script's key hash and
+// whose Ed25519 signature verifies against message. Random bytes, a witness
+// for an unrelated key, or a signature over the wrong payload are all
+// rejected because the cryptographic check fails.
+//
+// If requireSignatures is false, only the script's structure is considered
+// (structural-only validation); no witness is inspected.
+func validateScriptSig(
+	script *NativeScriptPubkey,
+	message []byte,
+	witnessesByHash map[string][]ScriptWitness,
+	requireSignatures bool,
+) bool {
+	if !requireSignatures {
+		// Structural validation only: ignore witnesses entirely.
+		return true
+	}
+	if len(script.Hash) != 28 {
+		return false
+	}
+	for _, witness := range witnessesByHash[string(script.Hash)] {
+		if lcommon.VerifyVKeySignature(witness.Vkey, witness.Signature, message) == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// validateScriptAllWithDepth checks if all sub-scripts are satisfied
+func validateScriptAllWithDepth(
+	script *NativeScriptAll,
+	message []byte,
+	slot uint64,
+	requireSignatures bool,
+	depth int,
+	budget *scriptValidationBudget,
+) bool {
+	for _, subScript := range script.Scripts {
+		if !validateScriptWithDepth(
+			&subScript,
+			message,
+			slot,
+			requireSignatures,
+			depth,
+			budget,
+		) {
+			return false
+		}
+	}
+	return true
+}
+
+// validateScriptAnyWithDepth checks if any sub-script is satisfied
+func validateScriptAnyWithDepth(
+	script *NativeScriptAny,
+	message []byte,
+	slot uint64,
+	requireSignatures bool,
+	depth int,
+	budget *scriptValidationBudget,
+) bool {
+	for _, subScript := range script.Scripts {
+		if validateScriptWithDepth(
+			&subScript,
+			message,
+			slot,
+			requireSignatures,
+			depth,
+			budget,
+		) {
+			return true
+		}
+	}
+	return false
+}
+
+// validateScriptNOfWithDepth checks if at least N sub-scripts are satisfied
+func validateScriptNOfWithDepth(
+	script *NativeScriptNofK,
+	message []byte,
+	slot uint64,
+	requireSignatures bool,
+	depth int,
+	budget *scriptValidationBudget,
+) bool {
+	// Safety check: N should be reasonable for cryptographic purposes
+	if script.N > 255 {
+		return false
+	}
+	satisfied := 0
+	for _, subScript := range script.Scripts {
+		if validateScriptWithDepth(
+			&subScript,
+			message,
+			slot,
+			requireSignatures,
+			depth,
+			budget,
+		) {
+			satisfied++
+		}
+	}
+	return satisfied >= int(script.N)
+}
+
+// validateScriptBefore checks if current slot is before the specified slot
+// Per CIP-1854: InvalidHereafter means script is invalid from this slot onwards (valid before)
+// validateScriptInvalidHereafter checks if current slot is before the specified slot
+// Per CIP-1854: InvalidHereafter means script is invalid at/after this slot (valid before)
+func validateScriptInvalidHereafter(
+	script *NativeScriptInvalidHereafter,
+	slot uint64,
+) bool {
+	return slot < script.Slot
+}
+
+// validateScriptInvalidBefore checks if current slot is at/after the specified slot
+// Per CIP-1854: InvalidBefore means script is invalid before this slot (valid at/after)
+func validateScriptInvalidBefore(
+	script *NativeScriptInvalidBefore,
+	slot uint64,
+) bool {
+	return slot >= script.Slot
+}
+
+// GetAddress derives a base address using payment key index num and the
+// account's default stake key at index 0.
+func GetAddress(
+	accountKey bip32.XPrv,
+	networkName string,
+	num uint32,
+) (*lcommon.Address, error) {
+	if networkName == "" {
+		return nil, ErrInvalidNetwork
+	}
+	network, ok := ouroboros.NetworkByName(networkName)
+	if !ok {
+		return nil, ErrInvalidNetwork
+	}
+	if num >= 0x80000000 {
+		return nil, ErrInvalidDerivationIndex
+	}
+	paymentKey, err := GetPaymentKey(accountKey, num)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get payment key: %w", err)
+	}
+	stakeKey, err := GetStakeKey(accountKey, 0)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get stake key: %w", err)
+	}
+	return newAddressFromKeys(paymentKey, stakeKey, network.Id)
+}
+
+func newAddressFromKeys(
+	paymentKey bip32.XPrv,
+	stakeKey bip32.XPrv,
+	networkID uint8,
+) (*lcommon.Address, error) {
+	paymentKeyPublicHash := paymentKey.Public().PublicKey().Hash()
+	stakeKeyPublicHash := stakeKey.Public().PublicKey().Hash()
+	addr, err := lcommon.NewAddressFromParts(
+		lcommon.AddressTypeKeyKey,
+		networkID,
+		paymentKeyPublicHash[:],
+		stakeKeyPublicHash[:],
+	)
+	if err != nil {
+		return nil, fmt.Errorf("error creating address: %w", err)
+	}
+	return &addr, nil
+}
+
+func GetRewardAddress(
+	stakeVKey KeyFile,
+	networkName string,
+) (*lcommon.Address, error) {
+	if networkName == "" {
+		return nil, ErrInvalidNetwork
+	}
+	network, ok := ouroboros.NetworkByName(networkName)
+	if !ok {
+		return nil, ErrInvalidNetwork
+	}
+
+	// Decode the stake verification key CBOR to get the public key
+	cborData, err := hex.DecodeString(stakeVKey.CborHex)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode stake vkey CBOR: %w", err)
+	}
+	// cardano-cli format: CBOR-encoded raw 32-byte public key
+	stakePubKeyBytes, err := decodeVerificationKey(cborData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode stake vkey: %w", err)
+	}
+
+	// Create stake public key and hash it
+	stakePubKey := bip32.PublicKey(stakePubKeyBytes)
+	stakeKeyPublicHash := stakePubKey.Hash()
+
+	// Create reward address (AddressTypeNoneKey with only stake key hash)
+	addr, err := lcommon.NewAddressFromParts(
+		lcommon.AddressTypeNoneKey,
+		network.Id,
+		nil, // no payment part for reward addresses
+		stakeKeyPublicHash[:],
+	)
+	if err != nil {
+		return nil, fmt.Errorf("error creating reward address: %w", err)
+	}
+	return &addr, nil
+}
+
+func GetExtendedPrivateKey(privateKey bip32.XPrv) bip32.XPrv {
+	// Create a defensive copy to prevent accidental mutation of the input key
+	xprv := make([]byte, 96)
+	// Copy the 64-byte private key (k_L || k_R) and the 32-byte chain code
+	copy(xprv[:64], privateKey.PrivateKey())
+	copy(xprv[64:], privateKey.ChainCode())
+	return xprv
+}
+
+func GetKeyFile(keyFile KeyFile) (string, error) {
+	// Use buffer pool to avoid allocations
+	buf := jsonBufferPool.Get().(*bytes.Buffer)
+	defer func() {
+		buf.Reset()
+		jsonBufferPool.Put(buf)
+	}()
+
+	// Use 4 spaces for indent
+	encoder := json.NewEncoder(buf)
+	encoder.SetIndent("", "    ")
+	if err := encoder.Encode(keyFile); err != nil {
+		return "", fmt.Errorf("failed to marshal key file: %w", err)
+	}
+
+	// Return the string with trailing newline for backward compatibility
+	result := buf.String()
+	return result, nil
+}
+
+// decodeKeyEnvelopeBytes decodes the single CBOR byte string carried by a
+// cardano-cli key envelope. An envelope holds exactly one CBOR value, so any
+// bytes left after it are rejected rather than ignored: a decoder that stops at
+// the first value would otherwise accept a file whose visible key is followed
+// by a second, unread payload.
+func decodeKeyEnvelopeBytes(cborData []byte, what string) ([]byte, error) {
+	var keyBytes []byte
+	read, err := cbor.Decode(cborData, &keyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal %s CBOR: %w", what, err)
+	}
+	if read != len(cborData) {
+		return nil, fmt.Errorf(
+			"invalid %s: %d trailing byte(s) after CBOR value",
+			what,
+			len(cborData)-read,
+		)
+	}
+	return keyBytes, nil
+}
+
+func decodeNonExtendedCborKey(skeyBytes []byte) ([]byte, []byte, error) {
+	// cardano-cli format: CBOR-encoded raw 32-byte seed
+	keyBytes, err := decodeKeyEnvelopeBytes(skeyBytes, "skey")
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(keyBytes) != 32 {
+		return nil, nil, errors.New("invalid skey bytes: expected 32 bytes")
+	}
+	key := ed25519.NewKeyFromSeed(keyBytes)
+	return key[:], key[32:], nil
+}
+
+func decodeExtendedCborKey(skeyBytes []byte) ([]byte, []byte, error) {
+	// cardano-cli format: CBOR-encoded 128-byte blob
+	// privKey (64) || pubKey (32) || chainCode (32)
+	keyBytes, err := decodeKeyEnvelopeBytes(skeyBytes, "extended skey")
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(keyBytes) != 128 {
+		return nil, nil, errors.New("invalid extended skey: expected 128 bytes")
+	}
+	// Create XPrv: privKey (64) || chainCode (32)
+	xprv := make([]byte, 96)
+	copy(xprv[0:64], keyBytes[0:64])
+	copy(xprv[64:96], keyBytes[96:128])
+	// The embedded public key is just another field of an untrusted file, so it
+	// is not the key's identity until it has been checked. Derive the identity
+	// from the private half and accept the envelope only when the two agree, so
+	// a caller can never sign with one key while presenting another.
+	derived := bip32.XPrv(xprv).PublicKey()
+	if subtle.ConstantTimeCompare(derived, keyBytes[64:96]) != 1 {
+		return nil, nil, errors.New(
+			"invalid extended skey: embedded public key does not match the key derived from the private key",
+		)
+	}
+	return xprv, derived, nil
+}
+
+func decodeVerificationKey(vkeyBytes []byte) ([]byte, error) {
+	// cardano-cli format: CBOR-encoded raw 32-byte public key
+	keyBytes, err := decodeKeyEnvelopeBytes(vkeyBytes, "vkey")
+	if err != nil {
+		return nil, err
+	}
+	if len(keyBytes) != 32 {
+		return nil, errors.New("invalid vkey bytes: expected 32 bytes")
+	}
+	return keyBytes, nil
+}
+
+// decodeVRFSKey decodes a VRF signing key from CBOR.
+// VRF signing keys can be stored as:
+// - 32 bytes: just the seed (written by earlier Bursa releases)
+// - 64 bytes: seed (32) + public key (32) (cardano-cli format)
+func decodeVRFSKey(skeyBytes []byte) ([]byte, []byte, error) {
+	keyBytes, err := decodeKeyEnvelopeBytes(skeyBytes, "VRF skey")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	switch len(keyBytes) {
+	case vrf.SeedSize:
+		// Just the seed - generate public key
+		pubKey, _, err := vrf.KeyGen(keyBytes)
+		if err != nil {
+			return nil, nil, fmt.Errorf(
+				"failed to derive VRF public key: %w",
+				err,
+			)
+		}
+		return keyBytes, pubKey, nil
+	case vrf.SeedSize + vrf.PublicKeySize:
+		// Seed + public key (cardano-cli format). Same rule as the extended
+		// Ed25519 case: the stored public key is checked against one derived
+		// from the seed instead of being taken on trust.
+		seed := make([]byte, vrf.SeedSize)
+		copy(seed, keyBytes[:vrf.SeedSize])
+		derived, _, err := vrf.KeyGen(seed)
+		if err != nil {
+			return nil, nil, fmt.Errorf(
+				"failed to derive VRF public key: %w",
+				err,
+			)
+		}
+		if subtle.ConstantTimeCompare(derived, keyBytes[vrf.SeedSize:]) != 1 {
+			return nil, nil, errors.New(
+				"invalid VRF skey: embedded public key does not match the key derived from the seed",
+			)
+		}
+		return seed, derived, nil
+	default:
+		return nil, nil, fmt.Errorf(
+			"invalid VRF skey bytes: expected %d or %d, got %d",
+			vrf.SeedSize,
+			vrf.SeedSize+vrf.PublicKeySize,
+			len(keyBytes),
+		)
+	}
+}
+
+// decodeKESSKey decodes a KES signing key from CBOR.
+// KES signing keys for depth 6 (Cardano) are 608 bytes.
+func decodeKESSKey(skeyBytes []byte) ([]byte, []byte, error) {
+	keyBytes, err := decodeKeyEnvelopeBytes(skeyBytes, "KES skey")
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(keyBytes) != kes.CardanoKesSecretKeySize {
+		return nil, nil, fmt.Errorf(
+			"invalid KES skey bytes: expected %d, got %d",
+			kes.CardanoKesSecretKeySize,
+			len(keyBytes),
+		)
+	}
+	// Create a SecretKey struct to extract the public key
+	sk := &kes.SecretKey{
+		Depth:  kes.CardanoKesDepth,
+		Period: 0, // Period is not encoded in the key file
+		Data:   keyBytes,
+	}
+	pubKey := kes.PublicKey(sk)
+	return keyBytes, pubKey, nil
+}
+
+func parseKeyEnvelope(fileBytes []byte) (*LoadedKey, error) {
+	var env KeyFile
+	if err := json.Unmarshal(fileBytes, &env); err != nil {
+		return nil, errors.New("could not parse key file envelope")
+	}
+
+	// Use cached CBOR data if available, otherwise decode from hex
+	var cborData []byte
+	if cached := env.Cbor(); len(cached) > 0 {
+		cborData = cached
+	} else {
+		var err error
+		cborData, err = hex.DecodeString(env.CborHex)
+		if err != nil {
+			return nil, fmt.Errorf("could not decode key from hex: %w", err)
+		}
+		// Cache the decoded CBOR data
+		env.SetCbor(cborData)
+	}
+
+	lk := &LoadedKey{
+		Type:        env.Type,
+		Description: env.Description,
+		RawCBOR:     cborData,
+	}
+	// Decode cbor encoded key bytes
+	switch env.Type {
+	case "AccountVerificationKeyShelley_ed25519",
+		"PaymentVerificationKeyShelley_ed25519",
+		"StakeVerificationKeyShelley_ed25519",
+		"DRepVerificationKeyShelley_ed25519",
+		"DRepVerificationKey_ed25519",
+		"CommitteeColdVerificationKeyShelley_ed25519",
+		"ConstitutionalCommitteeColdVerificationKey_ed25519",
+		"CommitteeHotVerificationKeyShelley_ed25519",
+		"ConstitutionalCommitteeHotVerificationKey_ed25519",
+		"StakePoolVerificationKey_ed25519",
+		"StakePoolVerificationKeyShelley_ed25519",
+		"PolicyVerificationKeyShelley_ed25519",
+		"CalidusVerificationKeyShelley_ed25519":
+		vk, err := decodeVerificationKey(cborData)
+		if err != nil {
+			return nil, err
+		}
+		lk.VKey = vk
+		return lk, nil
+	case "SigningKeyShelley_ed25519",
+		"AccountSigningKeyShelley_ed25519",
+		"PaymentSigningKeyShelley_ed25519",
+		"StakeSigningKeyShelley_ed25519",
+		"DRepSigningKeyShelley_ed25519",
+		"DRepSigningKey_ed25519",
+		"CommitteeColdSigningKeyShelley_ed25519",
+		"ConstitutionalCommitteeColdSigningKey_ed25519",
+		"CommitteeHotSigningKeyShelley_ed25519",
+		"ConstitutionalCommitteeHotSigningKey_ed25519",
+		"StakePoolSigningKey_ed25519",
+		"StakePoolSigningKeyShelley_ed25519",
+		"PolicySigningKeyShelley_ed25519",
+		"CalidusSigningKeyShelley_ed25519":
+		sk, vk, err := decodeNonExtendedCborKey(cborData)
+		if err != nil {
+			return nil, err
+		}
+		lk.SKey, lk.VKey = sk, vk
+		return lk, nil
+	case "RootExtendedSigningKeyShelley_ed25519_bip32",
+		"AccountExtendedSigningKeyShelley_ed25519_bip32",
+		"PaymentExtendedSigningKeyShelley_ed25519_bip32",
+		"StakeExtendedSigningKeyShelley_ed25519_bip32",
+		"DRepExtendedSigningKeyShelley_ed25519_bip32",
+		"DRepExtendedSigningKey_ed25519_bip32",
+		"CommitteeColdExtendedSigningKeyShelley_ed25519_bip32",
+		"ConstitutionalCommitteeColdExtendedSigningKey_ed25519_bip32",
+		"CommitteeHotExtendedSigningKeyShelley_ed25519_bip32",
+		"ConstitutionalCommitteeHotExtendedSigningKey_ed25519_bip32",
+		"StakePoolExtendedSigningKeyShelley_ed25519_bip32",
+		"PolicyExtendedSigningKeyShelley_ed25519_bip32",
+		"CalidusExtendedSigningKeyShelley_ed25519_bip32":
+		sk, vk, err := decodeExtendedCborKey(cborData)
+		if err != nil {
+			return nil, err
+		}
+		lk.SKey, lk.VKey = sk, vk
+		return lk, nil
+	// VRF keys (both cardano-cli and bursa naming conventions)
+	case "VrfVerificationKey_PraosVRF",
+		"VRFVerificationKey_PraosVRF":
+		vk, err := decodeVerificationKey(cborData)
+		if err != nil {
+			return nil, err
+		}
+		lk.VKey = vk
+		return lk, nil
+	case "VrfSigningKey_PraosVRF",
+		"VRFSigningKey_PraosVRF":
+		sk, vk, err := decodeVRFSKey(cborData)
+		if err != nil {
+			return nil, err
+		}
+		lk.SKey, lk.VKey = sk, vk
+		return lk, nil
+	// KES keys (both cardano-cli and bursa naming conventions)
+	case "KesVerificationKey_ed25519_kes_2^6",
+		"KESVerificationKey_PraosV2":
+		vk, err := decodeVerificationKey(cborData)
+		if err != nil {
+			return nil, err
+		}
+		lk.VKey = vk
+		return lk, nil
+	case "KesSigningKey_ed25519_kes_2^6",
+		"KESSigningKey_PraosV2":
+		sk, vk, err := decodeKESSKey(cborData)
+		if err != nil {
+			return nil, err
+		}
+		lk.SKey, lk.VKey = sk, vk
+		return lk, nil
+	case "BlsVerificationKey_bls12-381-BLS-Signature-Minimal-Signature-Size":
+		vk, err := decodeBLSVerificationKey(cborData)
+		if err != nil {
+			return nil, err
+		}
+		lk.VKey = vk
+		return lk, nil
+	case "BlsSigningKey_bls12-381-BLS-Signature-Minimal-Signature-Size":
+		sk, vk, err := decodeBLSSigningKey(cborData)
+		if err != nil {
+			return nil, err
+		}
+		lk.SKey, lk.VKey = sk, vk
+		return lk, nil
+	// Operational Certificate
+	case "NodeOperationalCertificate":
+		dec, err := DecodeOpCert(cborData)
+		if err != nil {
+			return nil, err
+		}
+		lk.VKey = dec.KESVKey
+		lk.OpCertIssueNumber = dec.IssueNumber
+		lk.OpCertKesPeriod = dec.KESPeriod
+		lk.OpCertSignature = dec.ColdSig
+		lk.OpCertColdVKey = dec.ColdVKey
+		return lk, nil
+	default:
+		return nil, fmt.Errorf("unknown key type: %s", env.Type)
+	}
+}
+
+// LoadKeyFromBytes loads a key from JSON-encoded bytes (cardano-cli format).
+// Supports all key types including VRF, KES, and operational certificates.
+func LoadKeyFromBytes(data []byte) (*LoadedKey, error) {
+	return parseKeyEnvelope(data)
+}
+
+// LoadKeyFromFile loads a key from a file path (cardano-cli format).
+// Supports all key types including VRF, KES, and operational certificates.
+func LoadKeyFromFile(path string) (*LoadedKey, error) {
+	file, err := openSecretKeyFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open key file %q: %w", path, err)
+	}
+	defer file.Close() //nolint:errcheck // read-only handle
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat key file %q: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("key file %q is not a regular file (mode %s)", path, info.Mode())
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxSecretKeyFileSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read key file %q: %w", path, err)
+	}
+	if len(data) > maxSecretKeyFileSize {
+		return nil, fmt.Errorf(
+			"key file %q exceeds maximum size of %d bytes",
+			path,
+			maxSecretKeyFileSize,
+		)
+	}
+	key, err := parseKeyEnvelope(data)
+	if err != nil {
+		return nil, err
+	}
+	if len(key.SKey) > 0 {
+		if err := checkOpenFilePermissions(file); err != nil {
+			return nil, err
+		}
+	}
+	key.File = filepath.Base(path)
+	return key, nil
+}
+
+const maxSecretKeyFileSize = 1 << 20
+
+// ReadSecretKeyFile reads a secret-key file after checking the permissions of
+// the open file handle. It preserves the raw formats accepted by callers that
+// parse key bytes themselves.
+func ReadSecretKeyFile(path string) ([]byte, error) {
+	file, err := openSecretKeyFile(path)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to open secret key file %q: %w",
+			path,
+			err,
+		)
+	}
+	defer file.Close() //nolint:errcheck // read-only handle
+
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to stat secret key file %q: %w",
+			path,
+			err,
+		)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf(
+			"secret key file %q is not a regular file (mode %s)",
+			path, info.Mode(),
+		)
+	}
+	if err := checkOpenFilePermissions(file); err != nil {
+		return nil, err
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxSecretKeyFileSize+1))
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to read secret key file %q: %w",
+			path,
+			err,
+		)
+	}
+	if len(data) > maxSecretKeyFileSize {
+		return nil, fmt.Errorf(
+			"secret key file %q exceeds maximum size of %d bytes",
+			path, maxSecretKeyFileSize,
+		)
+	}
+	return data, nil
+}
+
+// WriteSecretKeyFile atomically replaces a secret-key file with owner-only
+// contents. The destination is left untouched until the secured temporary file
+// has been written and synced.
+func WriteSecretKeyFile(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	file, err := CreateSecretKeyTempFile(
+		dir,
+		"."+filepath.Base(path)+".tmp-",
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create temporary secret key file: %w", err)
+	}
+	tmpName := file.Name()
+	removeTmp := true
+	defer func() {
+		if removeTmp {
+			_ = file.Close()
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if _, err := file.Write(data); err != nil {
+		return fmt.Errorf("failed to write temporary secret key file: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("failed to sync temporary secret key file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("failed to close temporary secret key file: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("failed to replace secret key file %q: %w", path, err)
+	}
+	if err := syncSecretKeyDirectory(dir); err != nil {
+		return fmt.Errorf("failed to sync secret key directory: %w", err)
+	}
+	removeTmp = false
+	return nil
+}
+
+// CreateSecretKeyFile exclusively creates an owner-only secret-key file.
+func CreateSecretKeyFile(path string) (*os.File, error) {
+	file, err := createSecretKeyFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := restrictSecretKeyFilePermissions(file); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return nil, err
+	}
+	return file, nil
+}
+
+// CreateSecretKeyTempFile creates a uniquely named owner-only temporary file
+// without closing and reopening the handle, preserving exclusive creation.
+func CreateSecretKeyTempFile(dir, pattern string) (*os.File, error) {
+	var suffix [8]byte
+	for range 100 {
+		if _, err := crand.Read(suffix[:]); err != nil {
+			return nil, err
+		}
+		path := filepath.Join(dir, pattern+hex.EncodeToString(suffix[:]))
+		file, err := createSecretKeyFileExclusive(path)
+		if err == nil {
+			if err := restrictSecretKeyFilePermissions(file); err != nil {
+				_ = file.Close()
+				_ = os.Remove(path)
+				return nil, err
+			}
+			return file, nil
+		}
+		if errors.Is(err, fs.ErrExist) {
+			continue
+		}
+		return nil, err
+	}
+	return nil, fmt.Errorf("failed to create unique secret key file in %q", dir)
+}
+
+// RestrictSecretKeyFilePermissions applies the platform-specific owner-only
+// permissions to an already-open secret file. Callers can use this for an
+// atomic temporary-file workflow before renaming the file into place.
+func RestrictSecretKeyFilePermissions(file *os.File) error {
+	return restrictSecretKeyFilePermissions(file)
+}
+
+// LoadSecretKeyFromFile loads a secret key from a file after checking the
+// permissions of the open file handle. Use this for secret key files that must
+// not be readable by group or other users. LoadKeyFromFile remains available
+// for public artifacts such as operational certificates.
+func LoadSecretKeyFromFile(path string) (*LoadedKey, error) {
+	data, err := ReadSecretKeyFile(path)
+	if err != nil {
+		return nil, err
+	}
+	key, err := LoadKeyFromBytes(data)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to parse secret key file %q: %w",
+			path,
+			err,
+		)
+	}
+	if len(key.SKey) == 0 {
+		return nil, fmt.Errorf(
+			"key file %q does not contain a secret key",
+			path,
+		)
+	}
+	key.File = filepath.Base(path)
+	return key, nil
+}
+
+func LoadWalletDir(dir string, showSecrets bool) ([]*LoadedKey, error) {
+	if dir == "" {
+		return nil, errors.New("directory path cannot be empty")
+	}
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read directory %q: %w", dir, err)
+	}
+
+	// Pre-allocate slice with estimated capacity to reduce allocations
+	// Most wallets have around 6 key files
+	out := make([]*LoadedKey, 0, 8)
+
+	// firstInsecure records the first secret key rejected for insecure
+	// permissions, so that a directory whose only key files are all
+	// permission-rejected surfaces that reason instead of the misleading
+	// fs.ErrNotExist returned for an empty result.
+	var firstInsecure error
+
+	for _, e := range files {
+		if e.IsDir() {
+			continue
+		}
+		n := e.Name()
+		if !strings.HasSuffix(n, ".vkey") &&
+			!strings.HasSuffix(n, ".skey") {
+			continue
+		}
+		p := filepath.Join(dir, n)
+		var loadedKeyFile *LoadedKey
+		if strings.HasSuffix(n, ".skey") {
+			loadedKeyFile, err = LoadSecretKeyFromFile(p)
+		} else {
+			loadedKeyFile, err = LoadKeyFromFile(p)
+		}
+		if err != nil || loadedKeyFile == nil {
+			// Skip files that can't be parsed, but remember an insecure-mode
+			// rejection so it can be surfaced if nothing else loads.
+			if firstInsecure == nil && errors.Is(err, ErrInsecureFileMode) {
+				firstInsecure = fmt.Errorf(
+					"secret key file %q has insecure permissions: %w", p, err,
+				)
+			}
+			continue
+		}
+		loadedKeyFile.File = n
+		out = append(out, loadedKeyFile)
+	}
+	if len(out) == 0 {
+		if firstInsecure != nil {
+			return nil, firstInsecure
+		}
+		return nil, fs.ErrNotExist
+	}
+
+	return out, nil
+}
+
+func PrintLoadedKeys(keys []*LoadedKey, showSecrets bool) {
+	// Pre-allocate buffer for output to reduce allocations
+	var buf bytes.Buffer
+	buf.Grow(4096) // Pre-allocate reasonable size
+
+	for _, k := range keys {
+		switch {
+		case len(k.SKey) > 0 && len(k.VKey) > 0:
+			if showSecrets {
+				fmt.Fprintf(
+					&buf,
+					"%s | %s | Private Key (skey): %dB %s | Public Key (vkey): 32B %s\n",
+					k.File,
+					k.Type,
+					len(k.SKey),
+					hex.EncodeToString(k.SKey),
+					hex.EncodeToString(k.VKey),
+				)
+			} else {
+				fmt.Fprintf(&buf, "%s | %s | skey=%dB | vkey=32B %s\n",
+					k.File, k.Type, len(k.SKey), hex.EncodeToString(k.VKey))
+			}
+		case len(k.VKey) == 32:
+			fmt.Fprintf(&buf,
+				"%s | %s | Public Key (vkey): 32B %s\n",
+				k.File, k.Type, hex.EncodeToString(k.VKey))
+		default:
+			fmt.Fprintf(&buf, "%s | %s | unsupported\n", k.File, k.Type)
+		}
+	}
+
+	fmt.Print(buf.String())
+}
+
+// ScriptData represents a script with metadata for serialization
+type ScriptData struct {
+	Type    string         `json:"type"`
+	Script  map[string]any `json:"script"`
+	Address string         `json:"address,omitempty"`
+	Hash    string         `json:"hash,omitempty"`
+}
+
+// MarshalScript serializes a script to JSON with metadata
+func MarshalScript(script Script, network string) (*ScriptData, error) {
+	scriptMap, err := scriptToMap(script)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert script to map: %w", err)
+	}
+
+	data := &ScriptData{
+		Type:   "NativeScript",
+		Script: scriptMap,
+	}
+
+	// Generate address if network is provided
+	if network != "" {
+		address, err := GetScriptAddress(script, network)
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate script address: %w", err)
+		}
+		data.Address = address
+	}
+
+	// Generate script hash
+	hash, err := GetScriptHash(script)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate script hash: %w", err)
+	}
+	data.Hash = hex.EncodeToString(hash)
+
+	return data, nil
+}
+
+// UnmarshalScript deserializes a script from JSON
+func UnmarshalScript(data *ScriptData) (Script, error) {
+	if data.Type != "NativeScript" {
+		return nil, fmt.Errorf("unsupported script type: %s", data.Type)
+	}
+	budget := &scriptConstructionBudget{}
+	return mapToScriptWithBudget(data.Script, 0, budget)
+}
+
+// scriptToMap converts a Script to a map for JSON serialization
+func scriptToMap(script Script) (map[string]any, error) {
+	if script == nil {
+		return nil, errors.New("script cannot be nil")
+	}
+	nativeScript, ok := script.(*NativeScript)
+	if !ok {
+		return nil, errors.New("unsupported script type")
+	}
+
+	switch s := nativeScript.Item().(type) {
+	case *NativeScriptPubkey:
+		return map[string]any{
+			"type":    "sig",
+			"keyHash": hex.EncodeToString(s.Hash),
+		}, nil
+	case *NativeScriptAll:
+		scripts := make([]any, len(s.Scripts))
+		for i, subScript := range s.Scripts {
+			subMap, err := scriptToMap(&subScript)
+			if err != nil {
+				return nil, err
+			}
+			scripts[i] = subMap
+		}
+		return map[string]any{
+			"type":    "all",
+			"scripts": scripts,
+		}, nil
+	case *NativeScriptAny:
+		scripts := make([]any, len(s.Scripts))
+		for i, subScript := range s.Scripts {
+			subMap, err := scriptToMap(&subScript)
+			if err != nil {
+				return nil, err
+			}
+			scripts[i] = subMap
+		}
+		return map[string]any{
+			"type":    "any",
+			"scripts": scripts,
+		}, nil
+	case *NativeScriptNofK:
+		scripts := make([]any, len(s.Scripts))
+		for i, subScript := range s.Scripts {
+			subMap, err := scriptToMap(&subScript)
+			if err != nil {
+				return nil, err
+			}
+			scripts[i] = subMap
+		}
+		return map[string]any{
+			"type":    "nOf",
+			"n":       s.N,
+			"scripts": scripts,
+		}, nil
+	case *NativeScriptInvalidBefore:
+		return map[string]any{
+			"type": "after",
+			"slot": s.Slot,
+		}, nil
+	case *NativeScriptInvalidHereafter:
+		return map[string]any{
+			"type": "before",
+			"slot": s.Slot,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported script type: %T", script)
+	}
+}
+
+type scriptConstructionBudget struct {
+	nodes int
+}
+
+func mapToScriptWithBudget(
+	m map[string]any,
+	depth int,
+	budget *scriptConstructionBudget,
+) (Script, error) {
+	if depth > maxScriptDepth || budget.nodes >= maxScriptNodes {
+		return nil, errors.New("script exceeds validation limits")
+	}
+	budget.nodes++
+
+	scriptType, ok := m["type"].(string)
+	if !ok {
+		return nil, errors.New("missing or invalid script type")
+	}
+
+	switch scriptType {
+	case "sig":
+		keyHashStr, ok := m["keyHash"].(string)
+		if !ok {
+			return nil, errors.New("missing or invalid keyHash for sig script")
+		}
+		keyHash, err := hex.DecodeString(keyHashStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid keyHash hex: %w", err)
+		}
+		script, err := NewScriptSig(keyHash)
+		if err != nil {
+			return nil, err
+		}
+		return script, nil
+	case "all":
+		scriptsInterface, ok := m["scripts"].([]any)
+		if !ok {
+			return nil, errors.New("missing or invalid scripts for all script")
+		}
+		if len(scriptsInterface) > maxScriptWidth {
+			return nil, errors.New("all script exceeds width limit")
+		}
+		scripts := make([]Script, len(scriptsInterface))
+		for i, scriptInterface := range scriptsInterface {
+			scriptMap, ok := scriptInterface.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("invalid script at index %d", i)
+			}
+			script, err := mapToScriptWithBudget(scriptMap, depth+1, budget)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"failed to parse script at index %d: %w",
+					i,
+					err,
+				)
+			}
+			scripts[i] = script
+		}
+		return NewScriptAll(scripts...)
+	case "any":
+		scriptsInterface, ok := m["scripts"].([]any)
+		if !ok {
+			return nil, errors.New("missing or invalid scripts for any script")
+		}
+		if len(scriptsInterface) > maxScriptWidth {
+			return nil, errors.New("any script exceeds width limit")
+		}
+		scripts := make([]Script, len(scriptsInterface))
+		for i, scriptInterface := range scriptsInterface {
+			scriptMap, ok := scriptInterface.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("invalid script at index %d", i)
+			}
+			script, err := mapToScriptWithBudget(scriptMap, depth+1, budget)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"failed to parse script at index %d: %w",
+					i,
+					err,
+				)
+			}
+			scripts[i] = script
+		}
+		return NewScriptAny(scripts...)
+	case "nOf":
+		nFloat, ok := m["n"].(float64)
+		if !ok {
+			return nil, errors.New("missing or invalid n for nOf script")
+		}
+		// Validate integer precision and reasonable range
+		if nFloat < 1 || nFloat > 255 || nFloat != float64(int(nFloat)) {
+			return nil, errors.New(
+				"n must be an integer between 1 and 255 for nOf script",
+			)
+		}
+		n := int(nFloat)
+		scriptsInterface, ok := m["scripts"].([]any)
+		if !ok {
+			return nil, errors.New("missing or invalid scripts for nOf script")
+		}
+		if n < 1 || n > len(scriptsInterface) {
+			return nil, fmt.Errorf(
+				"invalid n value %d: must be between 1 and %d",
+				n,
+				len(scriptsInterface),
+			)
+		}
+		if len(scriptsInterface) > maxScriptWidth {
+			return nil, errors.New("nOf script exceeds width limit")
+		}
+		scripts := make([]Script, len(scriptsInterface))
+		for i, scriptInterface := range scriptsInterface {
+			scriptMap, ok := scriptInterface.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("invalid script at index %d", i)
+			}
+			script, err := mapToScriptWithBudget(scriptMap, depth+1, budget)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"failed to parse script at index %d: %w",
+					i,
+					err,
+				)
+			}
+			scripts[i] = script
+		}
+		return NewScriptNOf(n, scripts...)
+	case "before":
+		slotFloat, ok := m["slot"].(float64)
+		if !ok {
+			return nil, errors.New("missing or invalid slot for before script")
+		}
+		// Check for overflow: float64 loses precision above 2^53-1
+		const maxExactInt = 9007199254740991.0 // (1<<53) - 1
+		if slotFloat < 0 || slotFloat > maxExactInt {
+			return nil, errors.New(
+				"invalid slot: must be a non-negative integer <= 9007199254740991 (within float64 exact integer range)",
+			)
+		}
+		// Verify integer precision
+		if slotFloat != float64(uint64(slotFloat)) {
+			return nil, errors.New(
+				"invalid slot: must be an integer value",
+			)
+		}
+		slot := uint64(slotFloat)
+		return NewScriptBefore(slot)
+	case "after":
+		slotFloat, ok := m["slot"].(float64)
+		if !ok {
+			return nil, errors.New("missing or invalid slot for after script")
+		}
+		// Check for overflow: float64 loses precision above 2^53-1
+		const maxExactInt = 9007199254740991.0 // (1<<53) - 1
+		if slotFloat < 0 || slotFloat > maxExactInt {
+			return nil, errors.New(
+				"invalid slot: must be a non-negative integer <= 9007199254740991 (within float64 exact integer range)",
+			)
+		}
+		// Verify integer precision
+		if slotFloat != float64(uint64(slotFloat)) {
+			return nil, errors.New(
+				"invalid slot: must be an integer value",
+			)
+		}
+		slot := uint64(slotFloat)
+		return NewScriptAfter(slot)
+	default:
+		return nil, fmt.Errorf("unsupported script type: %s", scriptType)
+	}
+}

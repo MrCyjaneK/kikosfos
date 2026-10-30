@@ -1,0 +1,83 @@
+// Copyright 2026 Blink Labs Software
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package syn provides the syntax layer for Untyped Plutus Core (UPLC),
+// including parsing, AST definitions, and serialization.
+//
+// # Key Types
+//
+//   - [Term] - Interface for all AST node types
+//   - [Program] - A complete UPLC program with version
+//   - [Name], [DeBruijn], [NamedDeBruijn] - Variable representations
+//
+// # Term Types
+//
+// The AST is generic over variable representation T:
+//
+//   - [Var] - Variable reference
+//   - [Lambda] - Lambda abstraction
+//   - [Apply] - Function application
+//   - [Delay] - Delayed computation
+//   - [Force] - Force a delayed computation
+//   - [Constant] - Constant values (integers, bytestrings, etc.)
+//   - [Builtin] - Builtin function reference
+//   - [Constr] - Constructor (sums-of-products)
+//   - [Case] - Pattern matching
+//   - [Error] - Error term
+//
+// # Variable Representations
+//
+// Terms can use different variable representations:
+//
+//   - [Name] - String names, used immediately after parsing
+//   - [DeBruijn] - De Bruijn indices, required for evaluation
+//   - [NamedDeBruijn] - Both name and index, useful for debugging
+//
+// # Basic Usage
+//
+//	// Parse UPLC text
+//	program, err := syn.Parse(input)
+//	if err != nil {
+//	    // Handle parse error
+//	}
+//
+//	// Convert to De Bruijn indices for evaluation
+//	dbProgram, err := syn.NameToDeBruijn(program)
+//	if err != nil {
+//	    // Handle conversion error
+//	}
+//
+//	// Pretty-print a term
+//	output := syn.PrettyTerm[syn.DeBruijn](term)
+//
+// # Serialization
+//
+// The package supports two serialization formats:
+//
+//   - Text format via [Parse] and [PrettyTerm]
+//   - FLAT binary format via [Decode] (used on-chain)
+//   - Validated text and FLAT entry points via [ParseWithContext] and
+//     [DecodeWithContext], which require the selected ledger language and
+//     protocol version. These perform decode-time (phase-1) well-formedness
+//     checks only; callers about to execute a decoded program through the CEK
+//     machine must additionally apply the execution-time (phase-2) term
+//     version gate, either by decoding through
+//     [DecodeDeBruijnForExecution] or by calling
+//     [ValidateTermVersionForExecution] themselves
+//
+// # Binder Interface
+//
+// Types that can bind variables implement the [Binder] interface.
+// Types that can be evaluated implement [Eval] (subset of Binder).
+package syn

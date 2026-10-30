@@ -1,0 +1,459 @@
+// Copyright 2014-2018 Tyler Smith
+// Copyright 2026 Blink Labs Software
+//
+// Use of this source code is governed by an MIT-style
+// license that can be found in the LICENSE file or at
+// https://opensource.org/licenses/MIT.
+
+// Package bip39 is the Golang implementation of the BIP39 spec.
+//
+// The official BIP39 spec can be found at
+// https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki
+package bip39
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/sha512"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"math/big"
+	"strings"
+	"sync/atomic"
+	"unicode"
+
+	"github.com/blinklabs-io/go-bip39/wordlists"
+	"golang.org/x/crypto/pbkdf2"
+	"golang.org/x/text/unicode/norm"
+)
+
+var (
+	// Some bitwise operands for working with big.Ints
+	last11BitsMask  = big.NewInt(2047)
+	shift11BitsMask = big.NewInt(2048)
+	bigOne          = big.NewInt(1)
+	bigTwo          = big.NewInt(2)
+
+	// used to isolate the checksum bits from the entropy+checksum byte array
+	wordLengthChecksumMasksMapping = map[int]*big.Int{
+		12: big.NewInt(15),
+		15: big.NewInt(31),
+		18: big.NewInt(63),
+		21: big.NewInt(127),
+		24: big.NewInt(255),
+	}
+	// used to use only the desired x of 8 available checksum bits.
+	// 256 bit (word length 24) requires all 8 bits of the checksum,
+	// and thus no shifting is needed for it (we would get a divByZero crash if we did)
+	wordLengthChecksumShiftMapping = map[int]*big.Int{
+		12: big.NewInt(16),
+		15: big.NewInt(8),
+		18: big.NewInt(4),
+		21: big.NewInt(2),
+	}
+
+	// activeWordList holds the current word list snapshot. A snapshot is
+	// never modified after it is published, so a reader that loads it once
+	// sees one consistent list and reverse index for its whole operation.
+	activeWordList atomic.Pointer[wordListState]
+)
+
+// wordListState is an immutable word list with its reverse index.
+type wordListState struct {
+	words []string
+	index map[string]int
+}
+
+// wordListSize is the number of words BIP-39 requires in a word list.
+const wordListSize = 2048
+
+var (
+	// ErrInvalidMnemonic is returned when trying to use a malformed mnemonic.
+	ErrInvalidMnemonic = errors.New("invalid mnemonic")
+
+	// ErrEntropyLengthInvalid is returned when trying to use an entropy set with
+	// an invalid size.
+	ErrEntropyLengthInvalid = errors.New("entropy length must be [128, 256] and a multiple of 32")
+
+	// ErrValidatedSeedLengthMismatch is returned when a validated seed is not the
+	// same size as the given seed. This should never happen is present only as a
+	// sanity assertion.
+	ErrValidatedSeedLengthMismatch = errors.New("seed length does not match validated seed length")
+
+	// ErrChecksumIncorrect is returned when entropy has the incorrect checksum.
+	ErrChecksumIncorrect = errors.New("checksum incorrect")
+
+	// ErrInvalidWordList is returned by ValidateWordList for a list that
+	// cannot back mnemonics.
+	ErrInvalidWordList = errors.New("invalid word list")
+)
+
+func init() {
+	SetWordList(wordlists.English)
+}
+
+// ValidateWordList reports whether list can back mnemonics: exactly 2048
+// words, each non-empty, free of whitespace, in NFKD form, and unique. A word
+// outside NFKD form could never match a mnemonic, which is normalized before
+// lookup, and a word containing whitespace could never survive tokenizing.
+// The position of a word is its 11-bit value, so the order given is kept.
+func ValidateWordList(list []string) error {
+	if len(list) != wordListSize {
+		return fmt.Errorf("%w: has %d words, need %d", ErrInvalidWordList, len(list), wordListSize)
+	}
+	seen := make(map[string]struct{}, len(list))
+	for i, w := range list {
+		if w == "" {
+			return fmt.Errorf("%w: word %d is empty", ErrInvalidWordList, i)
+		}
+		if strings.IndexFunc(w, unicode.IsSpace) >= 0 {
+			return fmt.Errorf("%w: word %d contains whitespace", ErrInvalidWordList, i)
+		}
+		if normalizeString(w) != w {
+			return fmt.Errorf("%w: word %d is not NFKD normalized", ErrInvalidWordList, i)
+		}
+		if _, dup := seen[w]; dup {
+			return fmt.Errorf("%w: word %d is a duplicate", ErrInvalidWordList, i)
+		}
+		seen[w] = struct{}{}
+	}
+	return nil
+}
+
+// SetWordList sets the list of words to use for mnemonics. Currently the list
+// that is set is used package-wide. The list is copied, so later changes to
+// the caller's slice do not affect the package. A nil list, or one that fails
+// ValidateWordList, is ignored and the current list stays in place. It is safe
+// to call concurrently with every other function in this package.
+func SetWordList(list []string) {
+	if list == nil || ValidateWordList(list) != nil {
+		return
+	}
+	state := &wordListState{
+		words: append([]string(nil), list...),
+		index: make(map[string]int, len(list)),
+	}
+	for i, v := range state.words {
+		state.index[v] = i
+	}
+	activeWordList.Store(state)
+}
+
+// GetWordList gets the list of words to use for mnemonics. The result is a
+// copy that the caller may modify freely.
+func GetWordList() []string {
+	return append([]string(nil), activeWordList.Load().words...)
+}
+
+// GetWordIndex gets the index of word in the current word list.
+func GetWordIndex(word string) (int, bool) {
+	idx, ok := activeWordList.Load().index[word]
+	return idx, ok
+}
+
+// NewEntropy will create random entropy bytes
+// so long as the requested size bitSize is an appropriate size.
+//
+// bitSize has to be a multiple 32 and be within the inclusive range of {128, 256}
+func NewEntropy(bitSize int) ([]byte, error) {
+	err := validateEntropyBitSize(bitSize)
+	if err != nil {
+		return nil, err
+	}
+
+	entropy := make([]byte, bitSize/8)
+	_, err = rand.Read(entropy)
+	return entropy, err
+}
+
+// EntropyFromMnemonic takes a mnemonic generated by this library,
+// and returns the input entropy used to generate the given mnemonic.
+// An error is returned if the given mnemonic is invalid.
+func EntropyFromMnemonic(mnemonic string) ([]byte, error) {
+	return entropyFromMnemonic(activeWordList.Load(), mnemonic)
+}
+
+// entropyFromMnemonic decodes mnemonic against one word list snapshot.
+func entropyFromMnemonic(state *wordListState, mnemonic string) ([]byte, error) {
+	mnemonicSlice, isValid := splitMnemonicWords(mnemonic)
+	if !isValid {
+		return nil, ErrInvalidMnemonic
+	}
+
+	wordMap := state.index
+
+	// Decode the words into a big.Int.
+	b := big.NewInt(0)
+	for _, v := range mnemonicSlice {
+		index, found := wordMap[v]
+		if !found {
+			return nil, fmt.Errorf("word `%v` not found in reverse map", v)
+		}
+		var wordBytes [2]byte
+		binary.BigEndian.PutUint16(wordBytes[:], uint16(index))
+		b = b.Mul(b, shift11BitsMask)
+		b = b.Or(b, big.NewInt(0).SetBytes(wordBytes[:]))
+	}
+
+	// Build and add the checksum to the big.Int.
+	checksum := big.NewInt(0)
+	checksumMask := wordLengthChecksumMasksMapping[len(mnemonicSlice)]
+	checksum = checksum.And(b, checksumMask)
+
+	b.Div(b, big.NewInt(0).Add(checksumMask, bigOne))
+
+	// The entropy is the underlying bytes of the big.Int. Any upper bytes of
+	// all 0's are not returned so we pad the beginning of the slice with empty
+	// bytes if necessary.
+	entropy := b.Bytes()
+	entropy = padByteSlice(entropy, len(mnemonicSlice)/3*4)
+
+	// Generate the checksum and compare with the one we got from the mneomnic.
+	entropyChecksumBytes := computeChecksum(entropy)
+	entropyChecksum := big.NewInt(int64(entropyChecksumBytes[0]))
+	if l := len(mnemonicSlice); l != 24 {
+		checksumShift := wordLengthChecksumShiftMapping[l]
+		entropyChecksum.Div(entropyChecksum, checksumShift)
+	}
+
+	if checksum.Cmp(entropyChecksum) != 0 {
+		return nil, ErrChecksumIncorrect
+	}
+
+	return entropy, nil
+}
+
+// NewMnemonic will return a string consisting of the mnemonic words for
+// the given entropy.
+// If the provide entropy is invalid, an error will be returned.
+func NewMnemonic(entropy []byte) (string, error) {
+	// Compute some lengths for convenience.
+	entropyBitLength := len(entropy) * 8
+	checksumBitLength := entropyBitLength / 32
+	sentenceLength := (entropyBitLength + checksumBitLength) / 11
+
+	// Validate that the requested size is supported.
+	err := validateEntropyBitSize(entropyBitLength)
+	if err != nil {
+		return "", err
+	}
+
+	// Add checksum to entropy.
+	entropy = addChecksum(entropy)
+
+	// Break entropy up into sentenceLength chunks of 11 bits.
+	// For each word AND mask the rightmost 11 bits and find the word at that index.
+	// Then bitshift entropy 11 bits right and repeat.
+	// Add to the last empty slot so we can work with LSBs instead of MSB.
+
+	// Entropy as an int so we can bitmask without worrying about bytes slices.
+	entropyInt := new(big.Int).SetBytes(entropy)
+
+	wordList := activeWordList.Load().words
+
+	// Slice to hold words in.
+	words := make([]string, sentenceLength)
+
+	// Throw away big.Int for AND masking.
+	word := big.NewInt(0)
+
+	for i := sentenceLength - 1; i >= 0; i-- {
+		// Get 11 right most bits and bitshift 11 to the right for next time.
+		word.And(entropyInt, last11BitsMask)
+		entropyInt.Div(entropyInt, shift11BitsMask)
+
+		// Get the bytes representing the 11 bits as a 2 byte slice.
+		wordBytes := padByteSlice(word.Bytes(), 2)
+
+		// Convert bytes to an index and add that word to the list.
+		words[i] = wordList[binary.BigEndian.Uint16(wordBytes)]
+	}
+
+	return strings.Join(words, " "), nil
+}
+
+// MnemonicToByteArray takes a mnemonic string and turns it into a byte array
+// suitable for creating another mnemonic.
+// An error is returned if the mnemonic is invalid.
+func MnemonicToByteArray(mnemonic string, raw ...bool) ([]byte, error) {
+	mnemonicSlice, isWellFormed := splitMnemonicWords(mnemonic)
+	if !isWellFormed {
+		return nil, ErrInvalidMnemonic
+	}
+
+	var (
+		entropyBitSize   = len(mnemonicSlice) * 11
+		checksumBitSize  = entropyBitSize % 32
+		fullByteSize     = (entropyBitSize-checksumBitSize)/8 + 1
+		checksumByteSize = fullByteSize - (fullByteSize % 4)
+	)
+
+	// Pre validate that the mnemonic is well formed and only contains words that
+	// are present in the word list.
+	state := activeWordList.Load()
+	wordMap := state.index
+	if _, err := entropyFromMnemonic(state, mnemonic); err != nil {
+		return nil, ErrInvalidMnemonic
+	}
+
+	// Convert word indices to a big.Int representing the entropy.
+	checksummedEntropy := big.NewInt(0)
+	modulo := big.NewInt(2048)
+	for _, v := range mnemonicSlice {
+		index := big.NewInt(int64(wordMap[v]))
+		checksummedEntropy.Mul(checksummedEntropy, modulo)
+		checksummedEntropy.Add(checksummedEntropy, index)
+	}
+
+	// Calculate the unchecksummed entropy so we can validate that the checksum is
+	// correct.
+	checksumModulo := big.NewInt(0).Exp(bigTwo, big.NewInt(int64(checksumBitSize)), nil)
+	rawEntropy := big.NewInt(0).Div(checksummedEntropy, checksumModulo)
+
+	// Convert big.Ints to byte padded byte slices.
+	rawEntropyBytes := padByteSlice(rawEntropy.Bytes(), checksumByteSize)
+	checksummedEntropyBytes := padByteSlice(checksummedEntropy.Bytes(), fullByteSize)
+
+	// Validate that the checksum is correct.
+	newChecksummedEntropyBytes := padByteSlice(addChecksum(rawEntropyBytes), fullByteSize)
+	if !compareByteSlices(checksummedEntropyBytes, newChecksummedEntropyBytes) {
+		return nil, ErrChecksumIncorrect
+	}
+
+	if len(raw) > 0 && raw[0] {
+		return rawEntropyBytes, nil
+	}
+
+	return checksummedEntropyBytes, nil
+}
+
+// NewSeedWithErrorChecking creates a hashed seed output given the mnemonic string and a password.
+// An error is returned if the mnemonic is not convertible to a byte array.
+func NewSeedWithErrorChecking(mnemonic string, password string) ([]byte, error) {
+	_, err := MnemonicToByteArray(mnemonic)
+	if err != nil {
+		return nil, err
+	}
+	return NewSeed(mnemonic, password), nil
+}
+
+// NewSeed creates a hashed seed output given a provided string and password.
+// Both are normalized to NFKD, as BIP-39 requires, before the PBKDF2
+// derivation. The mnemonic's whitespace is preserved. The password keeps its
+// own spacing, since that is part of the passphrase. No checking is performed
+// to validate that the string provided is a valid mnemonic.
+func NewSeed(mnemonic string, password string) []byte {
+	return pbkdf2.Key(
+		[]byte(normalizeString(mnemonic)),
+		[]byte("mnemonic"+normalizeString(password)),
+		2048,
+		64,
+		sha512.New,
+	)
+}
+
+// normalizeString applies the NFKD normalization BIP-39 mandates for the
+// mnemonic sentence and the passphrase. It is the identity on ASCII, so seeds
+// derived from ASCII inputs are unaffected. The bundled word lists are already
+// in NFKD form, so normalizing before word lookup also lets a composed
+// mnemonic - the form the published Japanese vectors are written in - resolve
+// against them.
+func normalizeString(s string) string {
+	return norm.NFKD.String(s)
+}
+
+// IsMnemonicValid attempts to verify that the provided mnemonic is valid.
+// Validity is determined by both the number of words being appropriate,
+// and that all the words in the mnemonic are present in the word list.
+func IsMnemonicValid(mnemonic string) bool {
+	_, err := EntropyFromMnemonic(mnemonic)
+	return err == nil
+}
+
+// Appends to data the first (len(data) / 32)bits of the result of sha256(data)
+// Currently only supports data up to 32 bytes
+func addChecksum(data []byte) []byte {
+	// Get first byte of sha256
+	hash := computeChecksum(data)
+	firstChecksumByte := hash[0]
+
+	// len() is in bytes so we divide by 4
+	checksumBitLength := uint(len(data) / 4)
+
+	// For each bit of check sum we want we shift the data one the left
+	// and then set the (new) right most bit equal to checksum bit at that index
+	// staring from the left
+	dataBigInt := new(big.Int).SetBytes(data)
+	for i := uint(0); i < checksumBitLength; i++ {
+		// Bitshift 1 left
+		dataBigInt.Mul(dataBigInt, bigTwo)
+
+		// Set rightmost bit if leftmost checksum bit is set
+		if uint8(firstChecksumByte&(1<<(7-i))) > 0 {
+			dataBigInt.Or(dataBigInt, bigOne)
+		}
+	}
+
+	return dataBigInt.Bytes()
+}
+
+func computeChecksum(data []byte) []byte {
+	hasher := sha256.New()
+	hasher.Write(data)
+	return hasher.Sum(nil)
+}
+
+// validateEntropyBitSize ensures that entropy is the correct size for being a
+// mnemonic.
+func validateEntropyBitSize(bitSize int) error {
+	if (bitSize%32) != 0 || bitSize < 128 || bitSize > 256 {
+		return ErrEntropyLengthInvalid
+	}
+	return nil
+}
+
+// padByteSlice returns a byte slice of the given size with contents of the
+// given slice left padded and any empty spaces filled with 0's.
+func padByteSlice(slice []byte, length int) []byte {
+	offset := length - len(slice)
+	if offset <= 0 {
+		return slice
+	}
+	newSlice := make([]byte, length)
+	copy(newSlice[offset:], slice)
+	return newSlice
+}
+
+// compareByteSlices returns true of the byte slices have equal contents and
+// returns false otherwise.
+func compareByteSlices(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// splitMnemonicWords is the only tokenizer in this package. Normalization runs
+// first because BIP-39 defines the word separator on the normalized sentence:
+// the ideographic space U+3000 that the Japanese vectors use decomposes to a
+// plain U+0020 under NFKD, so splitting before normalizing would disagree with
+// the sentence that NewSeed hashes.
+func splitMnemonicWords(mnemonic string) ([]string, bool) {
+	// Create a list of all the words in the mnemonic sentence
+	words := strings.Fields(normalizeString(mnemonic))
+
+	// Get num of words
+	numOfWords := len(words)
+
+	// The number of words should be 12, 15, 18, 21 or 24
+	if numOfWords%3 != 0 || numOfWords < 12 || numOfWords > 24 {
+		return nil, false
+	}
+	return words, true
+}

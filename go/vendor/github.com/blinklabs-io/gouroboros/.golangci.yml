@@ -1,0 +1,94 @@
+version: "2"
+run:
+  issues-exit-code: 1
+  tests: false
+linters:
+  enable:
+    - asasalint
+    - asciicheck
+    - bidichk
+    - bodyclose
+    - contextcheck
+    - copyloopvar
+    - durationcheck
+    - errchkjson
+    - errorlint
+    - exhaustive
+    - fatcontext
+    - gocheckcompilerdirectives
+    - gochecksumtype
+    - gomodguard_v2
+    - gosec
+    - gosmopolitan
+    - loggercheck
+    - makezero
+    - musttag
+    - nilerr
+    - nilnesserr
+    - perfsprint
+    - prealloc
+    - protogetter
+    - recvcheck
+    - reassign
+    - rowserrcheck
+    - spancheck
+    - sqlclosecheck
+    - testifylint
+    - unparam
+    - usestdlibvars
+    - whitespace
+    - zerologlint
+  disable:
+    - depguard
+    - noctx
+  settings:
+    recvcheck:
+      # Codec methods follow the encoding/json convention: Marshal* may use a
+      # value receiver while Unmarshal* must use a pointer receiver. A
+      # MarshalJSON on a pointer receiver would be skipped by json.Marshal for
+      # non-addressable values, which would emit raw struct fields instead.
+      exclusions:
+        - "*.MarshalJSON"
+        - "*.MarshalCBOR"
+        - "*.UnmarshalCBOR"
+        - "*.UnmarshalJSON"
+        - "*.MarshalText"
+        - "*.UnmarshalText"
+        # Embedded by value so Cbor is promoted to value receivers; the
+        # setters must mutate the embedded state.
+        - "DecodeStoreCbor.Cbor"
+        # Nil-tolerant accessors on *Address coexist with value accessors.
+        - "Address.StakeCredential"
+        - "Address.RewardAccountCredential"
+        - "Address.populateFromBytes"
+        # In-place decode helpers called from the pointer UnmarshalCBOR.
+        - "AddressPayloadPointer.decode"
+        - "ShelleyTransactionInput.unmarshalCBORFields"
+        # Validate rejects a nil receiver.
+        - "UpdateCommitteeGovAction.Validate"
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - docs
+      - third_party$
+      - builtin$
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - docs
+      - third_party$
+      - builtin$

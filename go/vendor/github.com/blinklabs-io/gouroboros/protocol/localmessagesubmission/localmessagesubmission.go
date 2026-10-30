@@ -1,0 +1,289 @@
+// Copyright 2025 Blink Labs Software
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package localmessagesubmission implements the Ouroboros local-message-submission protocol (CIP-0137)
+package localmessagesubmission
+
+import (
+	"sync"
+	"time"
+
+	"github.com/blinklabs-io/gouroboros/connection"
+	"github.com/blinklabs-io/gouroboros/protocol"
+	pcommon "github.com/blinklabs-io/gouroboros/protocol/common"
+)
+
+const (
+	ProtocolName            = "LocalMessageSubmission"
+	defaultMaxReplayEntries = 10000
+	// ProtocolID is the DMQ N2C mini-protocol number. dmq-node reference
+	// (DMQ.NodeToClient: localMsgSubmission miniProtocolNum =
+	// MiniProtocolNum 14) and Pallas (PROTOCOL_N2C_MSG_SUBMISSION = 14)
+	// both use 14.
+	ProtocolID = 14
+)
+
+// State timeouts for Local Message Submission protocol
+const (
+	IdleTimeout = 300 * time.Second // Timeout for client to send SubmitMessage when idle
+	BusyTimeout = 30 * time.Second  // Timeout for server to reply with Accept/Reject
+)
+
+// State machine states for Local Message Submission protocol
+const (
+	stateIdleId = 1
+	stateBusyId = 2
+	stateDoneId = 3
+)
+
+var (
+	protocolStateIdle = protocol.NewState(stateIdleId, "idle")
+	protocolStateBusy = protocol.NewState(stateBusyId, "busy")
+	protocolStateDone = protocol.NewState(stateDoneId, "done")
+	stateMap          = protocol.StateMap{
+		protocolStateIdle: protocol.StateMapEntry{
+			Agency:                  protocol.AgencyClient,
+			PendingMessageByteLimit: 0,
+			Timeout:                 IdleTimeout,
+			Transitions: []protocol.StateTransition{
+				{
+					MsgType:  MessageTypeSubmitMessage,
+					NewState: protocolStateBusy,
+				},
+				{
+					MsgType:  MessageTypeDone,
+					NewState: protocolStateDone,
+				},
+			},
+		},
+		protocolStateBusy: protocol.StateMapEntry{
+			Agency:                  protocol.AgencyServer,
+			PendingMessageByteLimit: 0,
+			Timeout:                 BusyTimeout,
+			Transitions: []protocol.StateTransition{
+				{
+					MsgType:  MessageTypeAcceptMessage,
+					NewState: protocolStateIdle,
+				},
+				{
+					MsgType:  MessageTypeRejectMessage,
+					NewState: protocolStateIdle,
+				},
+			},
+		},
+		protocolStateDone: protocol.StateMapEntry{
+			Agency:                  protocol.AgencyNone,
+			PendingMessageByteLimit: 0,
+		},
+	}
+)
+
+// LocalMessageSubmission is a wrapper object that holds the client and server instances
+type LocalMessageSubmission struct {
+	Client *Client
+	Server *Server
+}
+
+// Config is used to configure the LocalMessageSubmission protocol instance
+type Config struct {
+	// Client callbacks
+	AcceptMessageFunc AcceptMessageFunc
+	RejectMessageFunc RejectMessageFunc
+
+	// Server callbacks
+	SubmitMessageFunc SubmitMessageFunc
+	// SubmitRefusedFunc, when set, is called with each submission the server
+	// rejects before invoking SubmitMessageFunc, such as a message that fails
+	// authentication or TTL validation or whose ID is already reserved. It is
+	// called before the rejection is sent, may be called concurrently from
+	// connections sharing the Config, and must not block.
+	SubmitRefusedFunc SubmitRefusedFunc
+
+	// Shared configuration
+	Authenticator *pcommon.MessageAuthenticator
+	TTLValidator  *pcommon.TTLValidator
+	Timeout       time.Duration
+	// MaxReplayEntries bounds authenticated message IDs retained until their
+	// expiration time. Zero selects the default. An ID is reserved while
+	// SubmitMessageFunc runs and is retained only if the callback accepts the
+	// message, so a rejected message may be submitted again.
+	//
+	// The replay cache is scoped to the Config created by NewConfig and is
+	// shared by copies of it. Separate NewConfig calls do not share replay
+	// state, so a host serving many connections must create one Config
+	// outside its accept loop and reuse it for every connection.
+	MaxReplayEntries int
+	replayState      *submissionReplayState
+}
+
+var replayStateInitMu sync.Mutex
+
+func replayStateForConfig(cfg *Config) *submissionReplayState {
+	replayStateInitMu.Lock()
+	defer replayStateInitMu.Unlock()
+	if cfg.replayState == nil {
+		cfg.replayState = newSubmissionReplayState()
+	}
+	return cfg.replayState
+}
+
+// CallbackContext provides context for callback functions
+type CallbackContext struct {
+	ConnectionId connection.ConnectionId
+	Client       *Client
+	Server       *Server
+}
+
+// Callback function types
+type (
+	SubmitMessageFunc func(CallbackContext, *pcommon.DmqMessage) pcommon.RejectReason
+	SubmitRefusedFunc func(
+		CallbackContext,
+		*pcommon.DmqMessage,
+		pcommon.RejectReason,
+	)
+	AcceptMessageFunc func(CallbackContext)
+	RejectMessageFunc func(CallbackContext, pcommon.RejectReason)
+)
+
+// New returns a new LocalMessageSubmission object
+func New(
+	protoOptions protocol.ProtocolOptions,
+	cfg *Config,
+) *LocalMessageSubmission {
+	l := &LocalMessageSubmission{
+		Client: NewClient(protoOptions, cfg),
+		Server: NewServer(protoOptions, cfg),
+	}
+	return l
+}
+
+// LocalMessageSubmissionOptionFunc represents a function used to modify the LocalMessageSubmission protocol config
+type LocalMessageSubmissionOptionFunc func(*Config)
+
+// NewConfig returns a new LocalMessageSubmission config object with the provided options
+func NewConfig(options ...LocalMessageSubmissionOptionFunc) Config {
+	c := Config{
+		Timeout:          BusyTimeout,
+		MaxReplayEntries: defaultMaxReplayEntries,
+		replayState:      newSubmissionReplayState(),
+	}
+	// Apply provided options functions
+	for _, option := range options {
+		option(&c)
+	}
+	// Set defaults
+	// Authenticator has no default: constructing a real one requires a
+	// StakeAuthority backed by live chain state, which this package has no
+	// access to. A nil Authenticator is a deliberate fail-closed
+	// configuration error (see server.go/client.go) rather than a silent
+	// skip of verification -- callers must explicitly supply one via
+	// WithAuthenticator, or common.NewNoOpAuthenticator() to intentionally
+	// disable authentication.
+	if c.TTLValidator == nil {
+		c.TTLValidator = pcommon.NewTTLValidator(0, nil)
+	}
+	return c
+}
+
+func normalizeConfig(cfg *Config) Config {
+	if cfg == nil {
+		return NewConfig()
+	}
+	replayState := replayStateForConfig(cfg)
+	ret := *cfg
+	ret.replayState = replayState
+	if ret.Timeout == 0 {
+		ret.Timeout = BusyTimeout
+	}
+	if ret.MaxReplayEntries == 0 {
+		ret.MaxReplayEntries = defaultMaxReplayEntries
+	}
+	if ret.TTLValidator == nil {
+		ret.TTLValidator = pcommon.NewTTLValidator(0, nil)
+	}
+	return ret
+}
+
+// WithMaxReplayEntries sets the maximum authenticated message IDs retained by
+// the server for replay protection.
+func WithMaxReplayEntries(
+	maxReplayEntries int,
+) LocalMessageSubmissionOptionFunc {
+	return func(c *Config) {
+		c.MaxReplayEntries = maxReplayEntries
+	}
+}
+
+// WithSubmitMessageFunc specifies the callback function when a message is submitted when acting as a server
+func WithSubmitMessageFunc(
+	submitMessageFunc SubmitMessageFunc,
+) LocalMessageSubmissionOptionFunc {
+	return func(c *Config) {
+		c.SubmitMessageFunc = submitMessageFunc
+	}
+}
+
+// WithSubmitRefusedFunc specifies the callback function when the server
+// rejects a submitted message before invoking SubmitMessageFunc
+func WithSubmitRefusedFunc(
+	submitRefusedFunc SubmitRefusedFunc,
+) LocalMessageSubmissionOptionFunc {
+	return func(c *Config) {
+		c.SubmitRefusedFunc = submitRefusedFunc
+	}
+}
+
+// WithAcceptMessageFunc specifies the callback function when a message is accepted when acting as a client
+func WithAcceptMessageFunc(
+	acceptMessageFunc AcceptMessageFunc,
+) LocalMessageSubmissionOptionFunc {
+	return func(c *Config) {
+		c.AcceptMessageFunc = acceptMessageFunc
+	}
+}
+
+// WithRejectMessageFunc specifies the callback function when a message is rejected when acting as a client
+func WithRejectMessageFunc(
+	rejectMessageFunc RejectMessageFunc,
+) LocalMessageSubmissionOptionFunc {
+	return func(c *Config) {
+		c.RejectMessageFunc = rejectMessageFunc
+	}
+}
+
+// WithAuthenticator specifies the message authenticator to use for message verification
+func WithAuthenticator(
+	authenticator *pcommon.MessageAuthenticator,
+) LocalMessageSubmissionOptionFunc {
+	return func(c *Config) {
+		c.Authenticator = authenticator
+	}
+}
+
+// WithTTLValidator specifies the TTL validator to use for message TTL validation
+func WithTTLValidator(
+	ttlValidator *pcommon.TTLValidator,
+) LocalMessageSubmissionOptionFunc {
+	return func(c *Config) {
+		c.TTLValidator = ttlValidator
+	}
+}
+
+// WithTimeout specifies the timeout for message submit operations when acting as a client
+func WithTimeout(timeout time.Duration) LocalMessageSubmissionOptionFunc {
+	return func(c *Config) {
+		c.Timeout = timeout
+	}
+}

@@ -1,0 +1,343 @@
+// Copyright 2026 Blink Labs Software
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package byron
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+
+	"github.com/blinklabs-io/gouroboros/ledger/common"
+)
+
+// ErrBodyProofMismatch reports a Byron block whose body does not match the
+// proof carried in its header. The header, and therefore the block hash, can
+// be genuine while the body has been substituted, so this is the only check
+// that binds the two together.
+var ErrBodyProofMismatch = errors.New("byron block body proof mismatch")
+
+// ErrMalformedBodyProof reports a Byron header whose body proof does not
+// have the wire shape the format requires, so no body hash can be read out
+// of it at all. This is distinct from ErrBodyProofMismatch, which reports a
+// well-formed proof that disagrees with the body.
+var ErrMalformedBodyProof = errors.New("byron block body proof is malformed")
+
+// Indices into the Byron header's body proof, which is
+// [tx_proof, ssc_proof, dlg_proof, upd_proof].
+const (
+	bodyProofTxIndex  = 0
+	bodyProofSscIndex = 1
+	bodyProofDlgIndex = 2
+	bodyProofUpdIndex = 3
+	bodyProofLength   = 4
+)
+
+// Indices into the Byron tx proof, which is
+// [tx_count, tx_merkle_root, witnesses_hash].
+const (
+	txProofCountIndex     = 0
+	txProofMerkleIndex    = 1
+	txProofWitnessesIndex = 2
+	txProofLength         = 3
+)
+
+// ValidateBodyProof recomputes the transaction, delegation, update, and SSC
+// proofs from the block body and checks them against the header.
+//
+// The transaction proof is the load-bearing one: it covers the count, a
+// merkle root over transaction bodies, and a hash over the witness list, so
+// altering, adding, or removing any transaction changes it. tx_proof,
+// dlg_proof, and upd_proof are always checked by full hash comparison: real
+// mainnet blocks going through cardano-node's own decoder for years is a
+// safety net for those three fields being both correct and safe to enforce
+// unconditionally.
+//
+// The SSC proof hashes and delegation/update payload signatures are part of
+// the block's consensus evidence. A caller that needs parse-only behavior must
+// use NewByronMainBlockFromCbor with SkipBodyHashValidation and run the desired
+// validation explicitly before trusting the result.
+func (b *ByronMainBlock) ValidateBodyProof() error {
+	proof, err := b.bodyProofArray()
+	if err != nil {
+		return err
+	}
+	if err := b.validateTxProof(proof[bodyProofTxIndex]); err != nil {
+		return err
+	}
+	if err := b.ValidateSscProof(); err != nil {
+		return err
+	}
+	if err := checkPayloadHash(
+		"delegation", proof[bodyProofDlgIndex], b.Body.DlgPayloadCbor(),
+	); err != nil {
+		return err
+	}
+	if err := checkPayloadHash(
+		"update", proof[bodyProofUpdIndex], b.Body.UpdPayloadCbor(),
+	); err != nil {
+		return err
+	}
+	return b.ValidatePayloads()
+}
+
+// ValidateSscProof validates only a Byron main block's ssc_proof, entirely
+// from that block's own payload, including a full comparison of every hash
+// it carries against the header (see checkSscProofLocal's doc comment).
+//
+// ValidateBodyProof runs this by default. It is exposed separately for callers
+// that have already validated tx_proof/dlg_proof/upd_proof through
+// some other, independently implemented pipeline and want to add a real
+// ssc_proof check without paying for a second, redundant pass over the
+// transaction merkle root and the other body components ValidateBodyProof
+// would otherwise repeat. See ValidateSscProofShape for the parse-only
+// structural check.
+func (b *ByronMainBlock) ValidateSscProof() error {
+	return b.checkSscProof(true)
+}
+
+// ValidateSscProofShape validates only a Byron main block's ssc_proof, and
+// only as far as cardano-ledger's dropSscProof does: the proof's tag, its
+// element count for that tag, that each hash slot is a byte string, and
+// the payload's element count for the payload's own tag. See
+// checkSscProofShape for the reference decoders that bound it.
+func (b *ByronMainBlock) ValidateSscProofShape() error {
+	return b.checkSscProof(false)
+}
+
+// checkSscProof implements both ValidateSscProof (verifyHashes=true) and
+// ValidateSscProofShape (verifyHashes=false), which do not share an
+// implementation below the payload decode: the shape form is bounded by
+// dropSscProof, the hash form is not.
+func (b *ByronMainBlock) checkSscProof(verifyHashes bool) error {
+	if b == nil || b.BlockHeader == nil {
+		return fmt.Errorf(
+			"%w: block or block header is nil", ErrBodyProofMismatch,
+		)
+	}
+	proof, err := b.bodyProofArray()
+	if err != nil {
+		return err
+	}
+	payloadType, rest, err := decodeSscPayloadParts(b.Body.SscPayload)
+	if err != nil {
+		return fmt.Errorf("%w: ssc payload: %w", ErrBodyProofMismatch, err)
+	}
+	if verifyHashes {
+		return checkSscProofLocal(proof[bodyProofSscIndex], payloadType, rest)
+	}
+	return checkSscProofShape(proof[bodyProofSscIndex], payloadType, rest)
+}
+
+// bodyProofArray returns the header's body proof as a validated array,
+// guarding against a nil receiver or nil BlockHeader.
+func (b *ByronMainBlock) bodyProofArray() ([]any, error) {
+	if b == nil || b.BlockHeader == nil {
+		return nil, fmt.Errorf(
+			"%w: block or block header is nil", ErrBodyProofMismatch,
+		)
+	}
+	proof, ok := b.BlockHeader.BodyProof.([]any)
+	if !ok || len(proof) != bodyProofLength {
+		return nil, fmt.Errorf(
+			"%w: header body proof is not a %d-element array, "+
+				"got %T with %d elements",
+			ErrBodyProofMismatch, bodyProofLength,
+			b.BlockHeader.BodyProof, len(proof),
+		)
+	}
+	return proof, nil
+}
+
+func (b *ByronMainBlock) validateTxProof(rawProof any) error {
+	txProof, ok := rawProof.([]any)
+	if !ok || len(txProof) != txProofLength {
+		return fmt.Errorf(
+			"%w: tx proof is not a %d-element array, got %T with %d elements",
+			ErrBodyProofMismatch, txProofLength, rawProof, len(txProof),
+		)
+	}
+
+	expectedCount, err := asUint(txProof[txProofCountIndex])
+	if err != nil {
+		return fmt.Errorf("%w: tx count: %w", ErrBodyProofMismatch, err)
+	}
+	actualCount := uint64(len(b.Body.TxPayload))
+	if expectedCount != actualCount {
+		return fmt.Errorf(
+			"%w: header declares %d transactions, body carries %d",
+			ErrBodyProofMismatch, expectedCount, actualCount,
+		)
+	}
+
+	// Merkle leaves are the transaction bodies; witnesses are covered
+	// separately by a hash over the encoded witness list.
+	bodies := make([][]byte, 0, len(b.Body.TxPayload))
+	witnesses := make([][]byte, 0, len(b.Body.TxPayload))
+	for i, tx := range b.Body.TxPayload {
+		body := tx.Body.Cbor()
+		if len(body) == 0 {
+			return fmt.Errorf(
+				"%w: transaction %d has no preserved body CBOR",
+				ErrBodyProofMismatch, i,
+			)
+		}
+		bodies = append(bodies, body)
+		witness := tx.WitnessesCbor()
+		if len(witness) == 0 {
+			return fmt.Errorf(
+				"%w: transaction %d has no preserved witness CBOR",
+				ErrBodyProofMismatch, i,
+			)
+		}
+		witnesses = append(witnesses, witness)
+	}
+
+	if err := checkHash(
+		"tx merkle root", txProof[txProofMerkleIndex], MerkleRoot(bodies),
+	); err != nil {
+		return err
+	}
+
+	return checkHash(
+		"witnesses hash",
+		txProof[txProofWitnessesIndex],
+		common.Blake2b256Hash(encodeWitnessList(witnesses)),
+	)
+}
+
+// encodeWitnessList frames the preserved per-transaction witness CBOR as the
+// indefinite-length array Byron hashes.
+//
+// The array is assembled by hand rather than through the encoder because the
+// element bytes must survive untouched, and because the length must stay
+// indefinite: a definite-length array over the same elements hashes
+// differently and would reject every real block.
+func encodeWitnessList(witnesses [][]byte) []byte {
+	const (
+		indefiniteArrayStart byte = 0x9f
+		indefiniteBreak      byte = 0xff
+	)
+	size := 2
+	for _, w := range witnesses {
+		size += len(w)
+	}
+	encoded := make([]byte, 0, size)
+	encoded = append(encoded, indefiniteArrayStart)
+	for _, w := range witnesses {
+		encoded = append(encoded, w...)
+	}
+	return append(encoded, indefiniteBreak)
+}
+
+// ValidateBodyProof checks an epoch boundary block's header body-proof field
+// for wire well-formedness only.
+//
+// Unlike a main block's [tx_proof, ssc_proof, dlg_proof, upd_proof], an EBB's
+// body proof has no protocol meaning: the Byron reference decoder decodes it
+// as a plain byte string and never interprets or compares it against the
+// block body (Cardano/Chain/Block/Header.hs's decCBORABoundaryHeader, under
+// the comment "-- BoundaryBodyProof", followed by a bare dropBytes), and it
+// imposes no length restriction on it beyond "byte string" -- see
+// https://github.com/blinklabs-io/gouroboros/issues/2341. A 31-byte proof,
+// and an arbitrary incorrect 32-byte value, are both valid to the reference
+// and must decode here too.
+func (b *ByronEpochBoundaryBlock) ValidateBodyProof() error {
+	if b == nil || b.BlockHeader == nil {
+		return fmt.Errorf(
+			"%w: block or block header is nil", ErrMalformedBodyProof,
+		)
+	}
+	if _, ok := b.BlockHeader.BodyProof.([]byte); !ok {
+		return fmt.Errorf(
+			"%w: epoch boundary block header body proof is %T, "+
+				"expected a byte string",
+			ErrMalformedBodyProof, b.BlockHeader.BodyProof,
+		)
+	}
+	return nil
+}
+
+// checkPayloadHash compares a proof entry against the hash of the payload's
+// original CBOR.
+func checkPayloadHash(label string, expected any, payload []byte) error {
+	if len(payload) == 0 {
+		return fmt.Errorf(
+			"%w: %s payload has no preserved CBOR",
+			ErrBodyProofMismatch, label,
+		)
+	}
+	return checkHash(label, expected, common.Blake2b256Hash(payload))
+}
+
+// checkHash compares a proof entry, which decodes as raw bytes, against a
+// locally computed hash.
+func checkHash(
+	label string,
+	expected any,
+	actual common.Blake2b256,
+) error {
+	expectedBytes, err := checkHashShapeBytes(label, expected)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(expectedBytes, actual[:]) {
+		return fmt.Errorf(
+			"%w: %s is %x, computed %x",
+			ErrBodyProofMismatch, label, expectedBytes, actual[:],
+		)
+	}
+	return nil
+}
+
+// checkHashShapeBytes asserts that a proof entry is a 32-byte hash and
+// returns its bytes. The three genuinely fixed proof slots are Hash types
+// in the reference and keep this bound: the transaction merkle root and
+// witness hash (Cardano/Chain/UTxO/TxProof.hs:45-49) and the delegation
+// and update proofs (Cardano/Chain/Block/Proof.hs:44-45), all enforced by
+// Hashing.hs:154-165. Only the ssc slot is dropped there, and it no longer
+// reaches this.
+func checkHashShapeBytes(label string, expected any) ([]byte, error) {
+	expectedBytes, ok := expected.([]byte)
+	if !ok || len(expectedBytes) != common.Blake2b256Size {
+		return nil, fmt.Errorf(
+			"%w: %s in header is not a %d-byte hash",
+			ErrBodyProofMismatch, label, common.Blake2b256Size,
+		)
+	}
+	return expectedBytes, nil
+}
+
+// asUint normalises the integer types the CBOR decoder may produce for a
+// count field.
+func asUint(v any) (uint64, error) {
+	switch n := v.(type) {
+	case uint64:
+		return n, nil
+	case uint:
+		return uint64(n), nil
+	case int64:
+		if n < 0 {
+			return 0, fmt.Errorf("negative count %d", n)
+		}
+		return uint64(n), nil
+	case int:
+		if n < 0 {
+			return 0, fmt.Errorf("negative count %d", n)
+		}
+		return uint64(n), nil
+	default:
+		return 0, fmt.Errorf("unexpected type %T", v)
+	}
+}

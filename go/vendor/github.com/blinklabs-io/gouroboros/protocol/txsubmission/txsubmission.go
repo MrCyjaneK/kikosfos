@@ -1,0 +1,334 @@
+// Copyright 2026 Blink Labs Software
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package txsubmission implements the Ouroboros TxSubmission protocol
+package txsubmission
+
+import (
+	"time"
+
+	"github.com/blinklabs-io/gouroboros/connection"
+	"github.com/blinklabs-io/gouroboros/protocol"
+)
+
+// Protocol identifiers
+const (
+	ProtocolName        = "tx-submission"
+	ProtocolId   uint16 = 4
+)
+
+var (
+	stateInit             = protocol.NewState(1, "Init")
+	stateIdle             = protocol.NewState(2, "Idle")
+	stateTxIdsBlocking    = protocol.NewState(3, "TxIdsBlocking")
+	stateTxIdsNonblocking = protocol.NewState(4, "TxIdsNonBlocking")
+	stateTxs              = protocol.NewState(5, "Txs")
+	stateDone             = protocol.NewState(6, "Done")
+)
+
+// TxSubmission protocol state machine
+var StateMap = protocol.StateMap{
+	stateInit: protocol.StateMapEntry{
+		Agency:                  protocol.AgencyClient,
+		PendingMessageByteLimit: SmallMaxPendingMessageBytes,
+		Timeout:                 InitTimeout, // Timeout for client to send init message
+		Transitions: []protocol.StateTransition{
+			{
+				MsgType:  MessageTypeInit,
+				NewState: stateIdle,
+			},
+		},
+	},
+	stateIdle: protocol.StateMapEntry{
+		Agency:                  protocol.AgencyServer,
+		PendingMessageByteLimit: SmallMaxPendingMessageBytes,
+		Timeout:                 IdleTimeout, // Timeout for server to send tx request when idle
+		Transitions: []protocol.StateTransition{
+			{
+				MsgType:  MessageTypeRequestTxIds,
+				NewState: stateTxIdsBlocking,
+				// Match if blocking
+				MatchFunc: func(context any, msg protocol.Message) bool {
+					msgRequestTxIds := msg.(*MsgRequestTxIds)
+					return msgRequestTxIds.Blocking
+				},
+			},
+			{
+				MsgType:  MessageTypeRequestTxIds,
+				NewState: stateTxIdsNonblocking,
+				// Metch if non-blocking
+				MatchFunc: func(context any, msg protocol.Message) bool {
+					msgRequestTxIds := msg.(*MsgRequestTxIds)
+					return !msgRequestTxIds.Blocking
+				},
+			},
+			{
+				MsgType:  MessageTypeRequestTxs,
+				NewState: stateTxs,
+			},
+		},
+	},
+	stateTxIdsBlocking: protocol.StateMapEntry{
+		Agency:                  protocol.AgencyClient,
+		PendingMessageByteLimit: LargeMaxPendingMessageBytes,
+		Timeout:                 TxIdsBlockingTimeout, // No timeout per spec: client blocks until tx available
+		Transitions: []protocol.StateTransition{
+			{
+				MsgType:  MessageTypeReplyTxIds,
+				NewState: stateIdle,
+			},
+			{
+				MsgType:  MessageTypeDone,
+				NewState: stateDone,
+			},
+		},
+	},
+	stateTxIdsNonblocking: protocol.StateMapEntry{
+		Agency:                  protocol.AgencyClient,
+		PendingMessageByteLimit: LargeMaxPendingMessageBytes,
+		Timeout:                 TxIdsNonblockingTimeout, // Timeout for client to reply with tx IDs (non-blocking)
+		// A server pipelines further requests behind one the client has not
+		// answered yet. A blocking request is never pipelined behind others,
+		// so TxIdsBlocking declares none.
+		PipelinedMessageTypes: []uint8{
+			MessageTypeRequestTxIds,
+			MessageTypeRequestTxs,
+		},
+		Transitions: []protocol.StateTransition{
+			{
+				MsgType:  MessageTypeReplyTxIds,
+				NewState: stateIdle,
+			},
+		},
+	},
+	stateTxs: protocol.StateMapEntry{
+		Agency:                  protocol.AgencyClient,
+		PendingMessageByteLimit: LargeMaxPendingMessageBytes,
+		Timeout:                 TxsTimeout, // Timeout for client to reply with full transactions
+		// A server pipelines further requests behind one the client has not
+		// answered yet.
+		PipelinedMessageTypes: []uint8{
+			MessageTypeRequestTxIds,
+			MessageTypeRequestTxs,
+		},
+		Transitions: []protocol.StateTransition{
+			{
+				MsgType:  MessageTypeReplyTxs,
+				NewState: stateIdle,
+			},
+		},
+	},
+	stateDone: protocol.StateMapEntry{
+		Agency:                  protocol.AgencyNone,
+		PendingMessageByteLimit: SmallMaxPendingMessageBytes,
+	},
+}
+
+// TxSubmission is a wrapper object that holds the client and server instances
+type TxSubmission struct {
+	Client *Client
+	Server *Server
+}
+
+// Config is used to configure the TxSubmission protocol instance
+type Config struct {
+	// RequestTxIdsFunc supplies the client's next transaction IDs.
+	RequestTxIdsFunc RequestTxIdsFunc
+	// RequestTxsFunc supplies the client's transaction bodies.
+	RequestTxsFunc RequestTxsFunc
+	// Deprecated: use OnInit for notifications.
+	InitFunc InitFunc
+	// Deprecated: use OnDone for notifications.
+	DoneFunc DoneFunc
+	// OnInit is an optional notification called on the server when the
+	// client sends Init.
+	OnInit func(connection.ConnectionId)
+	// OnDone is an optional notification called on the server when the
+	// client ends the session with Done.
+	OnDone func(connection.ConnectionId)
+}
+
+// Wire ranges of the MsgRequestTxIds count fields. They are the ranges of the
+// uint16 fields, not an in-flight window, so they do not bound a request:
+// MaxUnackedTxIds does. See the window check in Client.handleRequestTxIds and
+// Server.RequestTxIds.
+const (
+	// MaxRequestCount is the range of the MsgRequestTxIds request field.
+	MaxRequestCount = 65535
+	// MaxAckCount is the range of the MsgRequestTxIds acknowledgement field.
+	MaxAckCount = 65535
+	// DefaultRequestLimit is an exported guidance constant. It is not a
+	// configuration field, is not applied automatically, and exceeds
+	// MaxUnackedTxIds, so a request of this size is refused.
+	DefaultRequestLimit = 1000
+	// DefaultAckLimit is an exported guidance constant. It is not a
+	// configuration field and is not applied automatically.
+	DefaultAckLimit = 1000
+)
+
+// Pending-message byte limits, set per state as the reference implementation
+// does. Protocol.readLoop rejects an oversized single message and applies
+// inbound backpressure only while a state's
+// PendingMessageByteLimit is nonzero, and Protocol.SendMessage checks the
+// outbound queue against it on the same condition. TxSubmission is
+// node-to-node, so a zero limit leaves an untrusted peer unbounded on both
+// paths.
+const (
+	// MaxTxSizeBytes is the largest MsgReplyTxs transaction body a peer may
+	// send, matching max_TX_SIZE in the reference implementation
+	// (ouroboros-network, Ouroboros.Network.TxSubmission.Inbound.V2.Policy).
+	// It is deliberately larger than any Cardano protocol maxTxSize to date,
+	// because a peer's reply is bounded by the wire limit rather than by the
+	// era's protocol parameters.
+	MaxTxSizeBytes = 65540
+	// TxIdReplyEntryBytes is the wire cost of one (txId, size) pair in a
+	// MsgReplyTxIds: 4 bytes of CBOR structure, a 34-byte transaction ID and
+	// a 6-byte size, per the reference implementation's derivation of the
+	// same limit.
+	TxIdReplyEntryBytes = 44
+	// MaxUnackedTxIds is the number of transaction IDs a peer may leave
+	// unacknowledged, and therefore the number of transactions it can have
+	// in flight. It matches txSubmissionMaxUnacked in the reference
+	// implementation. MaxRequestCount and MaxAckCount are the uint16 wire
+	// ranges of the count fields, not an in-flight window, so they cannot
+	// serve as the multiplier here. Every txid and tx request is bounded
+	// against this window, so a request a peer could not satisfy within
+	// MaxPendingMessageBytes is refused rather than attempted.
+	MaxUnackedTxIds = 10
+	// MaxDecodedTxBytes bounds the total serialized transaction bytes passed
+	// to the ledger decoder for one reply. It is separate from the retained
+	// message-byte limit, which includes CBOR framing and protects ingress.
+	MaxDecodedTxBytes = MaxUnackedTxIds * MaxTxSizeBytes
+	// MaxPendingMessageBytes is a full unacknowledged window of maximum-size
+	// transactions plus the tx-id reply that announced them, with the
+	// reference implementation's 10% safety margin. It is the protocol's mux
+	// ingress limit, matching maximumIngressQueue in the reference
+	// txSubmissionProtocolLimits, and the retained-byte budget of one reply.
+	// It is separate from the per-state message limits below, as the
+	// reference's ingress queue is separate from its codec byte limits.
+	MaxPendingMessageBytes = MaxUnackedTxIds *
+		(TxIdReplyEntryBytes + MaxTxSizeBytes) * 11 / 10
+	// SmallMaxPendingMessageBytes is the pending-message limit of the Init,
+	// Idle and Done states, whose messages are a few bytes. It matches
+	// smallByteLimit in byteLimitsTxSubmission2 (ouroboros-network,
+	// Ouroboros.Network.Protocol.TxSubmission2.Codec).
+	SmallMaxPendingMessageBytes = 65535
+	// LargeMaxPendingMessageBytes is the pending-message limit of the
+	// TxIdsBlocking, TxIdsNonblocking and Txs states, which carry replies.
+	// It matches largeByteLimit in the same reference table.
+	LargeMaxPendingMessageBytes = 2500000
+)
+
+// Protocol state timeout constants per Ouroboros Network Specification (Table 3.11).
+const (
+	InitTimeout             = time.Duration(0) // No timeout per spec
+	IdleTimeout             = time.Duration(0) // No timeout per spec
+	TxIdsBlockingTimeout    = time.Duration(0) // No timeout per spec (blocking waits indefinitely)
+	TxIdsNonblockingTimeout = 10 * time.Second // Timeout for client to reply with tx IDs (non-blocking)
+	TxsTimeout              = 10 * time.Second // Timeout for client to reply with full transactions
+)
+
+// Callback context
+type CallbackContext struct {
+	ConnectionId connection.ConnectionId
+	Client       *Client
+	Server       *Server
+	DoneChan     <-chan struct{}
+}
+
+// Callback function types
+type (
+	RequestTxIdsFunc func(CallbackContext, bool, uint16, uint16) ([]TxIdAndSize, error)
+	RequestTxsFunc   func(CallbackContext, []TxId) ([]TxBody, error)
+	// InitFunc is the legacy Init callback.
+	//
+	// Deprecated: use OnInit.
+	InitFunc func(CallbackContext) error
+	// DoneFunc is the legacy Done callback.
+	//
+	// Deprecated: use OnDone.
+	DoneFunc func(CallbackContext) error
+)
+
+// New returns a new TxSubmission object
+func New(protoOptions protocol.ProtocolOptions, cfg *Config) *TxSubmission {
+	t := &TxSubmission{
+		Client: NewClient(protoOptions, cfg),
+		Server: NewServer(protoOptions, cfg),
+	}
+	return t
+}
+
+// TxSubmissionOptionFunc represents a function used to modify the TxSubmission protocol config
+type TxSubmissionOptionFunc func(*Config)
+
+// NewConfig returns a new TxSubmission config object with the provided options
+func NewConfig(options ...TxSubmissionOptionFunc) Config {
+	c := Config{}
+	// Apply provided options functions
+	for _, option := range options {
+		option(&c)
+	}
+	return c
+}
+
+// WithRequestTxIdsFunc specifies the RequestTxIds callback function
+func WithRequestTxIdsFunc(
+	requestTxIdsFunc RequestTxIdsFunc,
+) TxSubmissionOptionFunc {
+	return func(c *Config) {
+		c.RequestTxIdsFunc = requestTxIdsFunc
+	}
+}
+
+// WithRequestTxsFunc specifies the RequestTxs callback function
+func WithRequestTxsFunc(requestTxsFunc RequestTxsFunc) TxSubmissionOptionFunc {
+	return func(c *Config) {
+		c.RequestTxsFunc = requestTxsFunc
+	}
+}
+
+// WithInitFunc specifies the Init callback function
+//
+// Deprecated: use WithOnInit.
+func WithInitFunc(initFunc InitFunc) TxSubmissionOptionFunc {
+	return func(c *Config) {
+		c.InitFunc = initFunc
+	}
+}
+
+// WithDoneFunc specifies the Done callback function
+//
+// Deprecated: use WithOnDone.
+func WithDoneFunc(doneFunc DoneFunc) TxSubmissionOptionFunc {
+	return func(c *Config) {
+		c.DoneFunc = doneFunc
+	}
+}
+
+// WithOnInit sets an optional notification called on the server when the
+// client sends Init.
+func WithOnInit(callback func(connection.ConnectionId)) TxSubmissionOptionFunc {
+	return func(c *Config) {
+		c.OnInit = callback
+	}
+}
+
+// WithOnDone sets an optional notification called on the server when the
+// client ends the session with Done.
+func WithOnDone(callback func(connection.ConnectionId)) TxSubmissionOptionFunc {
+	return func(c *Config) {
+		c.OnDone = callback
+	}
+}

@@ -1,0 +1,210 @@
+// Copyright 2024 Blink Labs Software
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package keepalive
+
+import (
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/blinklabs-io/gouroboros/protocol"
+)
+
+// Client implements the keep-alive protocol client, responsible for sending keep-alive messages and handling responses.
+type Client struct {
+	*protocol.Protocol
+	config          *Config
+	cookie          uint16
+	inFlight        bool
+	cookieMutex     sync.Mutex
+	callbackContext CallbackContext
+	timer           *time.Timer
+	timerMutex      sync.Mutex
+	onceStart       sync.Once
+	// scheduleHook is test-only synchronization for the shutdown race.
+	scheduleHook func()
+}
+
+// NewClient creates and returns a new keep-alive protocol client with the given options and configuration.
+func NewClient(protoOptions protocol.ProtocolOptions, cfg *Config) *Client {
+	if cfg == nil {
+		tmpCfg := NewConfig()
+		cfg = &tmpCfg
+	}
+	c := &Client{
+		config: cfg,
+		cookie: cfg.Cookie,
+	}
+	c.callbackContext = CallbackContext{
+		Client:       c,
+		ConnectionId: protoOptions.ConnectionId,
+	}
+	// Update state map with timeout
+	stateMap := StateMap.Copy()
+	if entry, ok := stateMap[StateServer]; ok {
+		entry.Timeout = c.config.Timeout
+		stateMap[StateServer] = entry
+	}
+	// Configure underlying Protocol
+	protoConfig := protocol.ProtocolConfig{
+		Name:                ProtocolName,
+		ProtocolId:          ProtocolId,
+		Muxer:               protoOptions.Muxer,
+		Logger:              protoOptions.Logger,
+		ErrorChan:           protoOptions.ErrorChan,
+		Mode:                protoOptions.Mode,
+		Role:                protocol.ProtocolRoleClient,
+		MessageHandlerFunc:  c.messageHandler,
+		MessageFromCborFunc: NewMsgFromCbor,
+		StateMap:            stateMap,
+		InitialState:        StateClient,
+	}
+	c.Protocol = protocol.New(protoConfig)
+	return c
+}
+
+// Start begins the keep-alive protocol client and starts sending keep-alive messages at the configured interval.
+func (c *Client) Start() {
+	c.onceStart.Do(func() {
+		c.cookieMutex.Lock()
+		c.cookie = c.config.Cookie
+		c.cookieMutex.Unlock()
+		c.Protocol.Logger().
+			Debug("starting client protocol",
+				"component", "network",
+				"protocol", ProtocolName,
+				"connection_id", c.callbackContext.ConnectionId.String(),
+			)
+		c.Protocol.Start()
+		// Start goroutine to cleanup resources on protocol shutdown
+		go func() {
+			<-c.DoneChan()
+			// Stop any existing timer
+			c.timerMutex.Lock()
+			if c.timer != nil {
+				c.timer.Stop()
+			}
+			c.timerMutex.Unlock()
+		}()
+		c.sendKeepAlive()
+	})
+}
+
+// sendKeepAlive sends a keep-alive message and schedules the next one.
+func (c *Client) sendKeepAlive() {
+	c.cookieMutex.Lock()
+	if c.inFlight {
+		c.cookieMutex.Unlock()
+		c.startTimer()
+		return
+	}
+	cookie := c.cookie
+	c.inFlight = true
+	c.cookieMutex.Unlock()
+	msg := NewMsgKeepAlive(cookie)
+	if err := c.SendMessage(msg); err != nil {
+		c.cookieMutex.Lock()
+		c.inFlight = false
+		c.cookieMutex.Unlock()
+		c.SendError(err)
+	}
+	// Schedule timer
+	if c.scheduleHook != nil {
+		c.scheduleHook()
+	}
+	c.startTimer()
+}
+
+// startTimer starts or resets the keep-alive timer for periodic keep-alive messages.
+func (c *Client) startTimer() {
+	if c.IsStopping() || c.IsDone() {
+		return
+	}
+	c.timerMutex.Lock()
+	defer c.timerMutex.Unlock()
+	if c.IsStopping() || c.IsDone() {
+		return
+	}
+	// Stop any existing timer
+	if c.timer != nil {
+		c.timer.Stop()
+	}
+	// Create new timer
+	c.timer = time.AfterFunc(c.config.Period, c.sendKeepAlive)
+}
+
+// Stop stops the keep-alive protocol client and cancels any pending timers.
+func (c *Client) Stop() {
+	c.timerMutex.Lock()
+	if c.timer != nil {
+		c.timer.Stop()
+		c.timer = nil
+	}
+	c.timerMutex.Unlock()
+	c.Protocol.Stop()
+}
+
+// messageHandler handles incoming protocol messages for the client.
+func (c *Client) messageHandler(msg protocol.Message) error {
+	var err error
+	switch msg.Type() {
+	case MessageTypeKeepAliveResponse:
+		err = c.handleKeepAliveResponse(msg)
+	default:
+		err = fmt.Errorf(
+			"%s: received unexpected message type %d",
+			ProtocolName,
+			msg.Type(),
+		)
+	}
+	return err
+}
+
+// handleKeepAliveResponse processes a keep-alive response message from the server.
+func (c *Client) handleKeepAliveResponse(msgGeneric protocol.Message) error {
+	c.Protocol.Logger().
+		Debug("keepalive response",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	msg := msgGeneric.(*MsgKeepAliveResponse)
+	c.cookieMutex.Lock()
+	expectedCookie := c.cookie
+	if msg.Cookie == expectedCookie {
+		c.cookie++
+		c.inFlight = false
+	}
+	c.cookieMutex.Unlock()
+	if msg.Cookie != expectedCookie {
+		return fmt.Errorf(
+			"%s: unexpected cookie in response, expected %d but received %d",
+			ProtocolName,
+			expectedCookie,
+			msg.Cookie,
+		)
+	}
+
+	if c.config != nil && c.config.KeepAliveResponseFunc != nil {
+		return c.config.KeepAliveResponseFunc(c.callbackContext, msg.Cookie)
+	}
+	// Call optional notification callback if provided
+	if c.config != nil && c.config.OnKeepAliveResponseReceived != nil {
+		c.config.OnKeepAliveResponseReceived(c.callbackContext.ConnectionId, msg.Cookie)
+	}
+
+	return nil
+}

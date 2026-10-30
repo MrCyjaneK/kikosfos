@@ -1,0 +1,790 @@
+// Copyright 2026 Blink Labs Software
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package cbor
+
+import (
+	"errors"
+	"fmt"
+	"math"
+	"sync/atomic"
+)
+
+// AddressFormatter converts raw address bytes to a human-readable string
+// (typically bech32 for Shelley-era and base58 for Byron). It must return
+// false on the second value when the input is not recognised as an address.
+type AddressFormatter func(addr []byte) (string, bool)
+
+var addressFormatter atomic.Pointer[AddressFormatter]
+
+// RegisterAddressFormatter installs a hook used by AnnotateAddresses and
+// the Cardano-aware formatters to convert raw address byte strings into
+// their bech32/base58 representation. The ledger/common package registers
+// the production formatter in its init(), so consumers that import the
+// ledger package get annotations for free; consumers using the cbor
+// package in isolation must call this themselves. Passing nil clears the
+// hook.
+func RegisterAddressFormatter(fn AddressFormatter) {
+	if fn == nil {
+		addressFormatter.Store(nil)
+		return
+	}
+	addressFormatter.Store(&fn)
+}
+
+func formatAddress(raw []byte) (string, bool) {
+	ptr := addressFormatter.Load()
+	if ptr == nil || *ptr == nil {
+		return "", false
+	}
+	return (*ptr)(raw)
+}
+
+// FormatTransactionDiagnostic renders a Cardano transaction
+// ([body, witness_set, is_valid?, auxiliary_data?]) using Cardano-aware
+// labels for the body/witness keys and the surrounding array positions.
+func FormatTransactionDiagnostic(
+	txData []byte,
+	opts DiagnosticOptions,
+) (string, error) {
+	node, err := ParseDiagnosticWithLimits(txData, opts.ParseLimits)
+	if err != nil {
+		return "", err
+	}
+	if node.Type != DiagTypeArray {
+		return "", fmt.Errorf(
+			"transaction must be an array, got %s",
+			diagTypeName(node.Type),
+		)
+	}
+	opts.normalize()
+	opts.CardanoAware = true
+	w := &cardanoWriter{
+		b:    newDiagnosticWriter(opts, node),
+		opts: opts,
+	}
+	w.writeTransaction(node, 0)
+	return w.b.result("\n"), nil
+}
+
+// FormatBlockDiagnostic renders a Cardano block. The outer CBOR shape is a
+// tag-wrapped 2-element array [era, block]. Shelley through Conway blocks use
+// [header, tx_bodies, tx_witnesses, auxiliary_data_set, invalid_transactions];
+// Dijkstra appends nullable leios_cert and peras_cert slots. Either the wrapped
+// form or the inner block array alone is accepted.
+func FormatBlockDiagnostic(
+	blockData []byte,
+	opts DiagnosticOptions,
+) (string, error) {
+	node, budget, err := parseDiagnosticWithBudget(
+		blockData,
+		opts.ParseLimits,
+		nil,
+	)
+	if err != nil {
+		return "", err
+	}
+	inner := node
+	era := -1
+	if inner.Type == DiagTypeTag {
+		// Tag 24 wraps a byte string whose contents are an embedded CBOR
+		// item — we have to decode that payload before we can walk it.
+		// Other tag wrappers (rare for blocks) are unwrapped to their
+		// single CBOR child directly.
+		if inner.Tag != nil && *inner.Tag == CborTagCbor {
+			if len(inner.Children) == 0 ||
+				inner.Children[0].Type != DiagTypeBytes {
+				return "", errors.New(
+					"tag-24 block payload is not a byte string",
+				)
+			}
+			payload, ok := inner.Children[0].Value.([]byte)
+			if !ok {
+				return "", errors.New("tag-24 block payload missing bytes")
+			}
+			decoded, _, err := parseDiagnosticWithBudget(
+				payload,
+				opts.ParseLimits,
+				budget,
+			)
+			if err != nil {
+				return "", fmt.Errorf("decode tag-24 block payload: %w", err)
+			}
+			inner = decoded
+		} else {
+			if len(inner.Children) == 0 {
+				return "", errors.New("empty tag-wrapped block")
+			}
+			inner = &inner.Children[0]
+		}
+	}
+	if inner.Type == DiagTypeArray && len(inner.Children) == 2 {
+		if eraNode := &inner.Children[0]; eraNode.Type == DiagTypeUint {
+			if v, ok := eraNode.Value.(uint64); ok && v <= math.MaxInt32 {
+				era = int(v) //nolint:gosec // bounded above
+			}
+		}
+		inner = &inner.Children[1]
+	}
+	if inner.Type != DiagTypeArray {
+		return "", fmt.Errorf(
+			"block body must be an array, got %s",
+			diagTypeName(inner.Type),
+		)
+	}
+	opts.normalize()
+	opts.CardanoAware = true
+	w := &cardanoWriter{
+		b:    newDiagnosticWriter(opts, inner),
+		opts: opts,
+	}
+	w.writeBlock(inner, era, 0)
+	return w.b.result("\n"), nil
+}
+
+// FormatPlutusData renders Plutus data using compact constructor notation
+// (e.g. Constr_0([...])) when the tag falls in the recognised ranges, and
+// falling back to the underlying CBOR otherwise.
+func FormatPlutusData(
+	data []byte,
+	opts DiagnosticOptions,
+) (string, error) {
+	node, err := ParseDiagnosticWithLimits(data, opts.ParseLimits)
+	if err != nil {
+		return "", err
+	}
+	opts.normalize()
+	opts.CardanoAware = true
+	w := &cardanoWriter{
+		b:    newDiagnosticWriter(opts, node),
+		opts: opts,
+	}
+	w.writePlutusData(node, 0)
+	return w.b.result("\n"), nil
+}
+
+// FormatNativeScript renders a native script array using its logic-operator
+// name (script_pubkey, script_all, script_any, script_n_of_k,
+// invalid_before, invalid_hereafter).
+func FormatNativeScript(
+	data []byte,
+	opts DiagnosticOptions,
+) (string, error) {
+	node, err := ParseDiagnosticWithLimits(data, opts.ParseLimits)
+	if err != nil {
+		return "", err
+	}
+	if node.Type != DiagTypeArray || len(node.Children) == 0 {
+		return "", errors.New("native script must be a non-empty array")
+	}
+	opts.normalize()
+	opts.CardanoAware = true
+	w := &cardanoWriter{
+		b:    newDiagnosticWriter(opts, node),
+		opts: opts,
+	}
+	w.writeNativeScript(node, 0)
+	return w.b.result("\n"), nil
+}
+
+// AnnotateAddresses walks a diagnostic tree and attaches a bech32/base58
+// rendering to every byte-string node whose value is recognised as an
+// address. The returned node is the same root with annotations appended to
+// matching leaves; the original tree is mutated in place for convenience.
+// If no address formatter is registered, the tree is returned unchanged.
+func AnnotateAddresses(node *DiagnosticNode) *DiagnosticNode {
+	if node == nil {
+		return nil
+	}
+	if addressFormatter.Load() == nil {
+		return node
+	}
+	annotateAddresses(node)
+	return node
+}
+
+func annotateAddresses(n *DiagnosticNode) {
+	if n == nil {
+		return
+	}
+	if n.Type == DiagTypeBytes && !n.Indefinite {
+		if raw, ok := n.Value.([]byte); ok && looksLikeAddress(raw) {
+			if encoded, ok := formatAddress(raw); ok {
+				n.Comment = encoded
+			}
+		}
+	}
+	for i := range n.Children {
+		annotateAddresses(&n.Children[i])
+	}
+}
+
+// looksLikeAddress is a cheap pre-filter for AnnotateAddresses so we don't
+// hand every byte string to the formatter. Shelley-era addresses are 29..57
+// bytes (1 header + 28..56 payload); Byron addresses encode to roughly
+// 30..200 bytes after base58 decoding. We accept the union with a generous
+// upper bound.
+func looksLikeAddress(b []byte) bool {
+	if len(b) < 29 || len(b) > 200 {
+		return false
+	}
+	return true
+}
+
+// diagTypeName returns the string name of a DiagnosticType.
+func diagTypeName(t DiagnosticType) string {
+	switch t {
+	case DiagTypeUint:
+		return "uint"
+	case DiagTypeNint:
+		return "nint"
+	case DiagTypeBytes:
+		return "bytes"
+	case DiagTypeText:
+		return "text"
+	case DiagTypeArray:
+		return "array"
+	case DiagTypeMap:
+		return "map"
+	case DiagTypeTag:
+		return "tag"
+	case DiagTypeSimple:
+		return "simple"
+	case DiagTypeFloat:
+		return "float"
+	}
+	return "unknown"
+}
+
+// cardanoWriter renders DiagnosticNodes with Cardano-specific labels emitted
+// as RFC 8949 / comment / markers on each line. Output is multi-line and
+// indented; depth tracks nesting for the indent prefix.
+//
+// depth only sets the indentation. level counts the CBOR nodes open on the
+// current path, which can exceed depth because tag contents share their
+// tag's line, and is what MaxDepth bounds.
+type cardanoWriter struct {
+	b     *diagnosticWriter
+	opts  DiagnosticOptions
+	level int
+}
+
+// enter opens one CBOR nesting level for the node about to be rendered. At
+// MaxDepth it writes "..." in place of the node and returns false; otherwise
+// the caller must call leave once the node is rendered.
+func (w *cardanoWriter) enter() bool {
+	if w.b.truncated {
+		return false
+	}
+	if w.opts.MaxDepth > 0 && w.level >= w.opts.MaxDepth {
+		w.b.write("...")
+		return false
+	}
+	w.level++
+	return true
+}
+
+func (w *cardanoWriter) leave() {
+	w.level--
+}
+
+// itemLimit returns how many of count collection entries to render.
+func (w *cardanoWriter) itemLimit(count int) int {
+	if w.opts.MaxArrayItems > 0 && count > w.opts.MaxArrayItems {
+		return w.opts.MaxArrayItems
+	}
+	return count
+}
+
+// compact writes an entered node on one line, continuing the MaxDepth count
+// from that node's own level. It streams into the shared writer so that a
+// leaf too large for the output cap is neither built nor left to continue
+// rendering after the cap is reached.
+func (w *cardanoWriter) compact(n *DiagnosticNode) {
+	n.writeCompact(w.b, w.opts, w.level-1)
+}
+
+// writeElided writes the marker for collection entries beyond MaxArrayItems.
+func (w *cardanoWriter) writeElided(depth int) {
+	w.b.writeRepeat(w.opts.IndentString, depth)
+	w.b.write("...\n")
+}
+
+func (w *cardanoWriter) writeTransaction(n *DiagnosticNode, depth int) {
+	w.b.writeRepeat(w.opts.IndentString, depth)
+	if !w.enter() {
+		return
+	}
+	defer w.leave()
+	w.b.write("transaction [")
+	w.writeRange(n)
+	w.b.write("\n")
+	labels := txArrayLabelsFor(n)
+	limit := w.itemLimit(len(n.Children))
+	for i := 0; i < limit && !w.b.truncated; i++ {
+		label := "extra"
+		if i < len(labels) {
+			label = labels[i]
+		}
+		w.b.writeRepeat(w.opts.IndentString, depth+1)
+		w.b.write(label)
+		w.b.write(": ")
+		switch label {
+		case "body":
+			w.writeLabelledMap(&n.Children[i], CardanoTxBodyLabels, depth+1)
+		case "witness_set":
+			w.writeLabelledMap(&n.Children[i], CardanoWitnessLabels, depth+1)
+		default:
+			w.writeValue(&n.Children[i], depth+1)
+		}
+		if i < len(n.Children)-1 {
+			w.b.write(",")
+		}
+		w.b.write("\n")
+	}
+	if limit < len(n.Children) {
+		w.writeElided(depth + 1)
+	}
+	w.b.writeRepeat(w.opts.IndentString, depth)
+	w.b.write("]")
+}
+
+// txArrayLabelsFor returns the field-label slice appropriate for the
+// transaction array shape. Alonzo introduced the is_valid bool at index 2,
+// shifting auxiliary_data from index 2 to index 3; pre-Alonzo transactions
+// are 3-element [body, witness_set, auxiliary_data]. We distinguish on
+// length, with a defensive type check on element 2 so a future shape change
+// (or a malformed payload) doesn't silently misname fields.
+func txArrayLabelsFor(n *DiagnosticNode) []string {
+	if len(n.Children) <= 3 {
+		return []string{"body", "witness_set", "auxiliary_data"}
+	}
+	// 4 or more elements: trust the Alonzo+ ordering only if element 2
+	// looks like a bool. Otherwise fall back to numeric-suffix labels so
+	// an unexpected layout shows up plainly in the output.
+	if n.Children[2].Type == DiagTypeSimple {
+		if _, ok := n.Children[2].Value.(bool); ok {
+			return CardanoTxArrayLabels
+		}
+	}
+	return []string{"body", "witness_set", "field_2", "auxiliary_data"}
+}
+
+func (w *cardanoWriter) writeBlock(n *DiagnosticNode, era int, depth int) {
+	w.b.writeRepeat(w.opts.IndentString, depth)
+	if !w.enter() {
+		return
+	}
+	defer w.leave()
+	w.b.write("block [")
+	if era >= 0 {
+		w.b.printf("  / era %d /", era)
+	}
+	w.writeRange(n)
+	w.b.write("\n")
+	limit := w.itemLimit(len(n.Children))
+	for i := 0; i < limit && !w.b.truncated; i++ {
+		label := fmt.Sprintf("field_%d", i)
+		if i < len(CardanoBlockLabels) {
+			label = CardanoBlockLabels[i]
+		}
+		w.b.writeRepeat(w.opts.IndentString, depth+1)
+		w.b.write(label)
+		w.b.write(": ")
+		w.writeValue(&n.Children[i], depth+1)
+		if i < len(n.Children)-1 {
+			w.b.write(",")
+		}
+		w.b.write("\n")
+	}
+	if limit < len(n.Children) {
+		w.writeElided(depth + 1)
+	}
+	w.b.writeRepeat(w.opts.IndentString, depth)
+	w.b.write("]")
+}
+
+func (w *cardanoWriter) writeLabelledMap(
+	n *DiagnosticNode,
+	labels map[int]string,
+	depth int,
+) {
+	if n.Type != DiagTypeMap {
+		w.writeValue(n, depth)
+		return
+	}
+	if !w.enter() {
+		return
+	}
+	defer w.leave()
+	w.b.write("{")
+	w.writeRange(n)
+	w.b.write("\n")
+	pairs := len(n.Children) / 2
+	limit := w.itemLimit(pairs)
+	for i := 0; i < limit && !w.b.truncated; i++ {
+		keyNode := &n.Children[i*2]
+		valNode := &n.Children[i*2+1]
+		w.b.writeRepeat(w.opts.IndentString, depth+1)
+		// The key is not entered, so its level is the map's child level.
+		keyNode.writeCompact(w.b, w.opts, w.level)
+		w.b.write(": ")
+		w.writeValue(valNode, depth+1)
+		if label, ok := mapLabelForKey(keyNode, labels); ok {
+			w.b.printf("  / %s /", label)
+		}
+		if i < pairs-1 {
+			w.b.write(",")
+		}
+		w.b.write("\n")
+	}
+	if limit < pairs {
+		w.writeElided(depth + 1)
+	}
+	w.b.writeRepeat(w.opts.IndentString, depth)
+	w.b.write("}")
+}
+
+// mapLabelForKey returns the Cardano label string for a numeric map key, if
+// the key is a uint that maps into the provided label table.
+func mapLabelForKey(key *DiagnosticNode, labels map[int]string) (string, bool) {
+	if key.Type != DiagTypeUint {
+		return "", false
+	}
+	idx, ok := key.Value.(uint64)
+	if !ok || idx > math.MaxInt32 {
+		return "", false
+	}
+	label, ok := labels[int(idx)] //nolint:gosec // bounded above
+	return label, ok
+}
+
+// writeValue dispatches on node type. Bytes recognised as addresses (or
+// carrying a Comment from AnnotateAddresses) get an annotated rendering.
+func (w *cardanoWriter) writeValue(n *DiagnosticNode, depth int) {
+	if !w.enter() {
+		return
+	}
+	defer w.leave()
+	switch n.Type {
+	case DiagTypeArray:
+		w.writeArray(n, depth)
+	case DiagTypeMap:
+		w.writeMap(n, depth)
+	case DiagTypeTag:
+		w.writeTag(n, depth)
+	case DiagTypeBytes:
+		w.writeBytes(n)
+	case DiagTypeUint,
+		DiagTypeNint,
+		DiagTypeText,
+		DiagTypeSimple,
+		DiagTypeFloat:
+		w.compact(n)
+	default:
+		w.compact(n)
+	}
+}
+
+func (w *cardanoWriter) writeBytes(n *DiagnosticNode) {
+	raw, _ := n.Value.([]byte)
+	w.compact(n)
+	if comment := w.byteComment(n, raw); comment != "" {
+		w.b.printf("  / %s /", comment)
+	}
+}
+
+func (w *cardanoWriter) byteComment(n *DiagnosticNode, raw []byte) string {
+	if n.Comment != "" {
+		return n.Comment
+	}
+	if !looksLikeAddress(raw) {
+		return ""
+	}
+	if encoded, ok := formatAddress(raw); ok {
+		return encoded
+	}
+	return ""
+}
+
+func (w *cardanoWriter) writeArray(n *DiagnosticNode, depth int) {
+	if len(n.Children) == 0 {
+		w.b.write("[]")
+		return
+	}
+	w.b.write("[")
+	w.writeRange(n)
+	w.b.write("\n")
+	limit := w.itemLimit(len(n.Children))
+	for i := 0; i < limit && !w.b.truncated; i++ {
+		w.b.writeRepeat(w.opts.IndentString, depth+1)
+		w.writeValue(&n.Children[i], depth+1)
+		if i < len(n.Children)-1 {
+			w.b.write(",")
+		}
+		w.b.write("\n")
+	}
+	if limit < len(n.Children) {
+		w.writeElided(depth + 1)
+	}
+	w.b.writeRepeat(w.opts.IndentString, depth)
+	w.b.write("]")
+}
+
+func (w *cardanoWriter) writeMap(n *DiagnosticNode, depth int) {
+	if len(n.Children) == 0 {
+		w.b.write("{}")
+		return
+	}
+	w.b.write("{")
+	w.writeRange(n)
+	w.b.write("\n")
+	pairs := len(n.Children) / 2
+	limit := w.itemLimit(pairs)
+	for i := 0; i < limit && !w.b.truncated; i++ {
+		w.b.writeRepeat(w.opts.IndentString, depth+1)
+		w.writeValue(&n.Children[i*2], depth+1)
+		w.b.write(": ")
+		w.writeValue(&n.Children[i*2+1], depth+1)
+		if i < pairs-1 {
+			w.b.write(",")
+		}
+		w.b.write("\n")
+	}
+	if limit < pairs {
+		w.writeElided(depth + 1)
+	}
+	w.b.writeRepeat(w.opts.IndentString, depth)
+	w.b.write("}")
+}
+
+func (w *cardanoWriter) writeTag(n *DiagnosticNode, depth int) {
+	tagNum := uint64(0)
+	if n.Tag != nil {
+		tagNum = *n.Tag
+	}
+	if idx, ok := PlutusConstrFromTag(tagNum); ok {
+		w.b.printf("Constr_%d(", idx)
+		if len(n.Children) > 0 {
+			w.writeValue(&n.Children[0], depth)
+		}
+		w.b.write(")")
+		return
+	}
+	w.compact(n)
+}
+
+// writeRange appends an "@start-end" comment when ShowOffsets is enabled.
+func (w *cardanoWriter) writeRange(n *DiagnosticNode) {
+	if !w.opts.ShowOffsets {
+		return
+	}
+	w.b.printf("  / @%d-%d /", n.Offset, n.Offset+n.Length)
+}
+
+// writePlutusData formats a parsed CBOR node as Plutus data: constructor
+// tags render as Constr_N(...) and integer maps/arrays/bytestrings get
+// their natural RFC 8949 form, indented for nesting.
+func (w *cardanoWriter) writePlutusData(n *DiagnosticNode, depth int) {
+	if !w.enter() {
+		return
+	}
+	defer w.leave()
+	if n.Type == DiagTypeTag && n.Tag != nil {
+		if idx, ok := PlutusConstrFromTag(*n.Tag); ok {
+			w.b.printf("Constr_%d(", idx)
+			if len(n.Children) > 0 {
+				w.writePlutusData(&n.Children[0], depth)
+			}
+			w.b.write(")")
+			return
+		}
+		if *n.Tag == PlutusConstrGeneral && len(n.Children) > 0 {
+			// Tag 102: [index, fields]
+			payload := &n.Children[0]
+			if payload.Type == DiagTypeArray && len(payload.Children) == 2 {
+				if idxNode := &payload.Children[0]; idxNode.Type == DiagTypeUint {
+					if idx, ok := idxNode.Value.(uint64); ok {
+						w.b.printf("Constr_%d(", idx)
+						// The [index, fields] payload is a level
+						// between the tag and its fields.
+						if w.enter() {
+							w.writePlutusData(&payload.Children[1], depth)
+							w.leave()
+						}
+						w.b.write(")")
+						return
+					}
+				}
+			}
+		}
+	}
+	switch n.Type {
+	case DiagTypeArray:
+		// Recurse through writePlutusData for each element so nested
+		// constructors (including tag 102) keep their Constr_N(...) form.
+		if len(n.Children) == 0 {
+			w.b.write("[]")
+			return
+		}
+		w.b.write("[")
+		w.writeRange(n)
+		w.b.write("\n")
+		limit := w.itemLimit(len(n.Children))
+		for i := 0; i < limit && !w.b.truncated; i++ {
+			w.b.writeRepeat(w.opts.IndentString, depth+1)
+			w.writePlutusData(&n.Children[i], depth+1)
+			if i < len(n.Children)-1 {
+				w.b.write(",")
+			}
+			w.b.write("\n")
+		}
+		if limit < len(n.Children) {
+			w.writeElided(depth + 1)
+		}
+		w.b.writeRepeat(w.opts.IndentString, depth)
+		w.b.write("]")
+	case DiagTypeMap:
+		// Plutus maps are written as {k: v, ...} but values may themselves
+		// be Plutus data: recurse with writePlutusData.
+		if len(n.Children) == 0 {
+			w.b.write("{}")
+			return
+		}
+		w.b.write("{")
+		w.writeRange(n)
+		w.b.write("\n")
+		pairs := len(n.Children) / 2
+		limit := w.itemLimit(pairs)
+		for i := 0; i < limit && !w.b.truncated; i++ {
+			w.b.writeRepeat(w.opts.IndentString, depth+1)
+			w.writePlutusData(&n.Children[i*2], depth+1)
+			w.b.write(": ")
+			w.writePlutusData(&n.Children[i*2+1], depth+1)
+			if i < pairs-1 {
+				w.b.write(",")
+			}
+			w.b.write("\n")
+		}
+		if limit < pairs {
+			w.writeElided(depth + 1)
+		}
+		w.b.writeRepeat(w.opts.IndentString, depth)
+		w.b.write("}")
+	case DiagTypeUint,
+		DiagTypeNint,
+		DiagTypeBytes,
+		DiagTypeText,
+		DiagTypeTag,
+		DiagTypeSimple,
+		DiagTypeFloat:
+		w.compact(n)
+	default:
+		w.compact(n)
+	}
+}
+
+func (w *cardanoWriter) writeNativeScript(n *DiagnosticNode, depth int) {
+	if !w.enter() {
+		return
+	}
+	defer w.leave()
+	typeID := -1
+	if len(n.Children) > 0 && n.Children[0].Type == DiagTypeUint {
+		if v, ok := n.Children[0].Value.(uint64); ok && v <= math.MaxInt32 {
+			typeID = int(v) //nolint:gosec // bounded above
+		}
+	}
+	label, ok := CardanoNativeScriptLabels[typeID]
+	if !ok {
+		label = fmt.Sprintf("native_script_unknown_%d", typeID)
+	}
+	w.b.write(label)
+	w.b.write("(")
+	switch typeID {
+	case 0:
+		// [type, key_hash]
+		if len(n.Children) >= 2 {
+			w.b.write("key_hash: ")
+			w.writeValue(&n.Children[1], depth+1)
+		}
+	case 1, 2:
+		// [type, scripts]
+		if len(n.Children) >= 2 {
+			w.b.write("scripts: ")
+			w.writeScriptArray(&n.Children[1], depth+1)
+		}
+	case 3:
+		// [type, n, scripts]
+		if len(n.Children) >= 3 {
+			w.b.write("n: ")
+			w.writeValue(&n.Children[1], depth+1)
+			w.b.write(", scripts: ")
+			w.writeScriptArray(&n.Children[2], depth+1)
+		}
+	case 4, 5:
+		// [type, slot]
+		if len(n.Children) >= 2 {
+			w.b.write("slot: ")
+			w.writeValue(&n.Children[1], depth+1)
+		}
+	default:
+		// Unknown — fall back to raw rendering of trailing fields.
+		fields := max(len(n.Children)-1, 0)
+		limit := w.itemLimit(fields)
+		for i := 0; i < limit && !w.b.truncated; i++ {
+			if i > 0 {
+				w.b.write(", ")
+			}
+			w.writeValue(&n.Children[i+1], depth+1)
+		}
+		if limit < fields {
+			if limit > 0 {
+				w.b.write(", ")
+			}
+			w.b.write("...")
+		}
+	}
+	w.b.write(")")
+}
+
+func (w *cardanoWriter) writeScriptArray(n *DiagnosticNode, depth int) {
+	if n.Type != DiagTypeArray {
+		w.writeValue(n, depth)
+		return
+	}
+	if !w.enter() {
+		return
+	}
+	defer w.leave()
+	if len(n.Children) == 0 {
+		w.b.write("[]")
+		return
+	}
+	w.b.write("[\n")
+	limit := w.itemLimit(len(n.Children))
+	for i := 0; i < limit && !w.b.truncated; i++ {
+		w.b.writeRepeat(w.opts.IndentString, depth+1)
+		w.writeNativeScript(&n.Children[i], depth+1)
+		if i < len(n.Children)-1 {
+			w.b.write(",")
+		}
+		w.b.write("\n")
+	}
+	if limit < len(n.Children) {
+		w.writeElided(depth + 1)
+	}
+	w.b.writeRepeat(w.opts.IndentString, depth)
+	w.b.write("]")
+}

@@ -1,0 +1,1555 @@
+// Copyright 2026 Blink Labs Software
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package syn
+
+import (
+	"errors"
+	"fmt"
+	"math/big"
+	"strconv"
+
+	"github.com/blinklabs-io/plutigo/builtin"
+	"github.com/blinklabs-io/plutigo/data"
+	"github.com/blinklabs-io/plutigo/lang"
+	"github.com/blinklabs-io/plutigo/syn/lex"
+	bls "github.com/consensys/gnark-crypto/ecc/bls12-381"
+)
+
+// maxParseDepth bounds the nesting depth of parsed terms, constants, data and
+// type specs. The recursive-descent parser would otherwise overflow the Go
+// stack (a fatal, unrecoverable crash) on deeply nested untrusted input.
+const maxParseDepth = 100_000
+
+type Parser struct {
+	lexer         *lex.Lexer
+	curToken      lex.Token
+	peekToken     lex.Token
+	interned      map[string]Unique
+	uniqueCounter Unique
+	version       lang.LanguageVersion
+	depth         int
+	inputLen      int
+	// nodes counts terms and constant or PlutusData collection items parsed so
+	// far.
+	nodes int
+	// maxConstrFields is the widest constr field list accepted.
+	maxConstrFields int
+}
+
+// node charges one term or collection item against the program's node budget.
+func (p *Parser) node() error {
+	p.nodes++
+	if p.nodes > maxProgramNodes {
+		return errors.New("program has too many nodes")
+	}
+	return nil
+}
+
+// enter records descent into a nested construct and fails if the nesting limit
+// is exceeded. Each successful enter must be paired with a leave (via defer) so
+// sibling constructs do not accumulate depth.
+func (p *Parser) enter() error {
+	if p.depth >= maxParseDepth {
+		return errors.New("term nesting too deep")
+	}
+	p.depth++
+	return nil
+}
+
+func (p *Parser) leave() {
+	p.depth--
+}
+
+func NewParser(input string) *Parser {
+	p := &Parser{
+		interned:      make(map[string]Unique),
+		uniqueCounter: 0,
+		inputLen:      len(input),
+
+		maxConstrFields: maxCollectionWidth,
+	}
+
+	if p.inputLen > maxInputBytes {
+		return p
+	}
+	p.lexer = lex.NewLexer(input)
+	p.curToken = p.lexer.NextToken()
+	p.peekToken = p.lexer.NextToken()
+
+	return p
+}
+
+func (p *Parser) nextToken() {
+	p.curToken = p.peekToken
+
+	p.peekToken = p.lexer.NextToken()
+}
+
+func (p *Parser) expect(typ lex.TokenType) error {
+	if p.curToken.Type != typ {
+		return fmt.Errorf(
+			"expected %v, got %v at position %d",
+			typ,
+			p.curToken.Type,
+			p.curToken.Position,
+		)
+	}
+
+	p.nextToken()
+
+	return nil
+}
+
+func (p *Parser) internName(text string) Name {
+	if unique, exists := p.interned[text]; exists {
+		return Name{Text: text, Unique: unique}
+	}
+
+	unique := p.uniqueCounter
+
+	p.interned[text] = unique
+
+	p.uniqueCounter++
+
+	return Name{Text: text, Unique: unique}
+}
+
+func Parse(input string) (*Program[Name], error) {
+	p := NewParser(input)
+
+	return p.ParseProgram()
+}
+
+func (p *Parser) ParseProgram() (*Program[Name], error) {
+	if p.inputLen > maxInputBytes {
+		return nil, errors.New("input too large")
+	}
+
+	if err := p.expect(lex.TokenLParen); err != nil {
+		return nil, err
+	}
+
+	if err := p.expect(lex.TokenProgram); err != nil {
+		return nil, err
+	}
+
+	var version lang.LanguageVersion
+
+	for i := range 3 {
+		if p.curToken.Type != lex.TokenNumber {
+			return nil, fmt.Errorf(
+				"expected version number, got %v at position %d",
+				p.curToken.Type,
+				p.curToken.Position,
+			)
+		}
+
+		n, err := strconv.ParseUint(p.curToken.Literal, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"invalid version number %s at position %d: %w",
+				p.curToken.Literal,
+				p.curToken.Position,
+				err,
+			)
+		}
+
+		version[i] = uint32(n)
+
+		p.nextToken()
+
+		if i < 2 {
+			if err := p.expect(lex.TokenDot); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	p.version = version
+
+	term, err := p.ParseTerm()
+	if err != nil {
+		return nil, err
+	}
+
+	if err := p.expect(lex.TokenRParen); err != nil {
+		return nil, err
+	}
+
+	if p.curToken.Type != lex.TokenEOF {
+		return nil, fmt.Errorf(
+			"unexpected token %v after program at position %d",
+			p.curToken.Type,
+			p.curToken.Position,
+		)
+	}
+
+	return &Program[Name]{Version: version, Term: term}, nil
+}
+
+func (p *Parser) ParseTerm() (Term[Name], error) {
+	if p.inputLen > maxInputBytes {
+		return nil, errors.New("input too large")
+	}
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
+	if err := p.node(); err != nil {
+		return nil, err
+	}
+
+	switch p.curToken.Type {
+	case lex.TokenIdentifier:
+		name := p.internName(p.curToken.Literal)
+
+		p.nextToken()
+
+		return &Var[Name]{Name: name}, nil
+	case lex.TokenLParen:
+		p.nextToken()
+		switch p.curToken.Type {
+		case lex.TokenLam:
+			return p.parseLambda()
+		case lex.TokenDelay:
+			return p.parseDelay()
+		case lex.TokenForce:
+			return p.parseForce()
+		case lex.TokenBuiltin:
+			return p.parseBuiltin()
+		case lex.TokenConstr:
+			return p.parseConstr()
+		case lex.TokenCase:
+			return p.parseCase()
+		case lex.TokenCon:
+			return p.parseConstant()
+		case lex.TokenErrorTerm:
+			p.nextToken()
+
+			if err := p.expect(lex.TokenRParen); err != nil {
+				return nil, err
+			}
+
+			return &Error{}, nil
+		default:
+			return nil, fmt.Errorf(
+				"unexpected token %v in term at position %d",
+				p.curToken.Type,
+				p.curToken.Position,
+			)
+		}
+	case lex.TokenLBracket:
+		return p.parseApply()
+	default:
+		return nil, fmt.Errorf(
+			"unexpected token %v in term at position %d",
+			p.curToken.Type,
+			p.curToken.Position,
+		)
+	}
+}
+
+func (p *Parser) parseLambda() (Term[Name], error) {
+	if err := p.expect(lex.TokenLam); err != nil {
+		return nil, err
+	}
+
+	if p.curToken.Type != lex.TokenIdentifier {
+		return nil, fmt.Errorf(
+			"expected identifier, got %v at position %d",
+			p.curToken.Type,
+			p.curToken.Position,
+		)
+	}
+
+	name := p.internName(p.curToken.Literal)
+
+	p.nextToken()
+
+	body, err := p.ParseTerm()
+	if err != nil {
+		return nil, err
+	}
+
+	if err := p.expect(lex.TokenRParen); err != nil {
+		return nil, err
+	}
+
+	return &Lambda[Name]{ParameterName: name, Body: body}, nil
+}
+
+func (p *Parser) parseDelay() (Term[Name], error) {
+	if err := p.expect(lex.TokenDelay); err != nil {
+		return nil, err
+	}
+
+	term, err := p.ParseTerm()
+	if err != nil {
+		return nil, err
+	}
+
+	if err := p.expect(lex.TokenRParen); err != nil {
+		return nil, err
+	}
+
+	return &Delay[Name]{Term: term}, nil
+}
+
+func (p *Parser) parseForce() (Term[Name], error) {
+	if err := p.expect(lex.TokenForce); err != nil {
+		return nil, err
+	}
+
+	term, err := p.ParseTerm()
+	if err != nil {
+		return nil, err
+	}
+
+	if err := p.expect(lex.TokenRParen); err != nil {
+		return nil, err
+	}
+
+	return &Force[Name]{Term: term}, nil
+}
+
+func (p *Parser) parseBuiltin() (Term[Name], error) {
+	if err := p.expect(lex.TokenBuiltin); err != nil {
+		return nil, err
+	}
+
+	if p.curToken.Type != lex.TokenIdentifier {
+		return nil, fmt.Errorf(
+			"expected builtin name, got %v at position %d",
+			p.curToken.Type,
+			p.curToken.Position,
+		)
+	}
+
+	name := p.curToken.Literal
+
+	fn, ok := builtin.Builtins[name]
+
+	if !ok {
+		return nil, fmt.Errorf(
+			"unknown builtin function %s at position %d",
+			name,
+			p.curToken.Position,
+		)
+	}
+
+	p.nextToken()
+
+	if err := p.expect(lex.TokenRParen); err != nil {
+		return nil, err
+	}
+
+	return &Builtin{DefaultFunction: fn}, nil // Adjust based on builtin package
+}
+
+func (p *Parser) parseConstr() (Term[Name], error) {
+	if p.isBefore_v1_1_0() {
+		return nil, errors.New("constr can't be used before 1.1.0")
+	}
+
+	if err := p.expect(lex.TokenConstr); err != nil {
+		return nil, err
+	}
+
+	if p.curToken.Type != lex.TokenNumber {
+		return nil, fmt.Errorf(
+			"expected tag number, got %v at position %d",
+			p.curToken.Type,
+			p.curToken.Position,
+		)
+	}
+
+	n, err := strconv.ParseUint(p.curToken.Literal, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"invalid constr tag %s at position %d: %w",
+			p.curToken.Literal,
+			p.curToken.Position,
+			err,
+		)
+	}
+
+	p.nextToken()
+
+	fields := make([]Term[Name], 0, 8)
+
+	for p.curToken.Type != lex.TokenRParen {
+		if len(fields) >= p.maxConstrFields {
+			return nil, errTooMany("term list items", p.maxConstrFields)
+		}
+		term, err := p.ParseTerm()
+		if err != nil {
+			return nil, err
+		}
+
+		fields = append(fields, term)
+	}
+
+	if err := p.expect(lex.TokenRParen); err != nil {
+		return nil, err
+	}
+
+	return &Constr[Name]{Tag: n, Fields: fields}, nil
+}
+
+func (p *Parser) parseCase() (Term[Name], error) {
+	if p.isBefore_v1_1_0() {
+		return nil, errors.New("case can't be used before 1.1.0")
+	}
+
+	if err := p.expect(lex.TokenCase); err != nil {
+		return nil, err
+	}
+
+	constr, err := p.ParseTerm()
+	if err != nil {
+		return nil, err
+	}
+
+	branches := make([]Term[Name], 0, 4)
+
+	for p.curToken.Type != lex.TokenRParen {
+		if len(branches) >= maxCollectionWidth {
+			return nil, errTooMany("term list items", maxCollectionWidth)
+		}
+		branch, err := p.ParseTerm()
+		if err != nil {
+			return nil, err
+		}
+
+		branches = append(branches, branch)
+	}
+
+	if err := p.expect(lex.TokenRParen); err != nil {
+		return nil, err
+	}
+
+	return &Case[Name]{Constr: constr, Branches: branches}, nil
+}
+
+func (p *Parser) parseConstant() (Term[Name], error) {
+	if err := p.expect(lex.TokenCon); err != nil {
+		return nil, err
+	}
+
+	typeSpec, err := p.parseTypeSpec()
+	if err != nil {
+		return nil, err
+	}
+
+	switch ts := typeSpec.(type) {
+	case *TInteger:
+		if p.curToken.Type != lex.TokenNumber {
+			return nil, fmt.Errorf("expected integer value, got %v at position %d", p.curToken.Type, p.curToken.Position)
+		}
+
+		n, ok := p.curToken.Value.(*big.Int)
+		if !ok {
+			return nil, fmt.Errorf("invalid integer value %s at position %d", p.curToken.Literal, p.curToken.Position)
+		}
+
+		p.nextToken()
+
+		if err := p.expect(lex.TokenRParen); err != nil {
+			return nil, err
+		}
+
+		return &Constant{Con: newInteger(n)}, nil
+	case *TByteString:
+		if p.curToken.Type != lex.TokenByteString {
+			return nil, fmt.Errorf("expected bytestring value, got %v at position %d", p.curToken.Type, p.curToken.Position)
+		}
+
+		b, ok := p.curToken.Value.([]byte)
+		if !ok {
+			return nil, fmt.Errorf("invalid bytestring value %s at position %d", p.curToken.Literal, p.curToken.Position)
+		}
+
+		p.nextToken()
+
+		if err := p.expect(lex.TokenRParen); err != nil {
+			return nil, err
+		}
+
+		return &Constant{Con: &ByteString{Inner: b}}, nil
+	case *TString:
+		if p.curToken.Type != lex.TokenString {
+			return nil, fmt.Errorf("expected string value, got %v at position %d", p.curToken.Type, p.curToken.Position)
+		}
+
+		s, ok := p.curToken.Value.(string)
+		if !ok {
+			return nil, fmt.Errorf("invalid string value %s at position %d", p.curToken.Literal, p.curToken.Position)
+		}
+
+		p.nextToken()
+
+		if err := p.expect(lex.TokenRParen); err != nil {
+			return nil, err
+		}
+
+		return &Constant{Con: &String{Inner: s}}, nil
+	case *TBool:
+		var b bool
+
+		switch p.curToken.Type {
+		case lex.TokenTrue:
+			b = true
+		case lex.TokenFalse:
+			b = false
+		default:
+			return nil, fmt.Errorf("expected bool value, got %v at position %d", p.curToken.Type, p.curToken.Position)
+		}
+
+		p.nextToken()
+
+		if err := p.expect(lex.TokenRParen); err != nil {
+			return nil, err
+		}
+
+		return &Constant{Con: &Bool{Inner: b}}, nil
+	case *TUnit:
+		if p.curToken.Type != lex.TokenUnit {
+			return nil, fmt.Errorf("expected unit value, got %v at position %d", p.curToken.Type, p.curToken.Position)
+		}
+
+		p.nextToken()
+
+		if err := p.expect(lex.TokenRParen); err != nil {
+			return nil, err
+		}
+
+		return &Constant{Con: &Unit{}}, nil
+	case *TData:
+		if err := p.expect(lex.TokenLParen); err != nil {
+			return nil, err
+		}
+
+		dataVal, err := p.parsePlutusData()
+		if err != nil {
+			return nil, err
+		}
+
+		if err := p.expect(lex.TokenRParen); err != nil {
+			return nil, err
+		}
+
+		if err := p.expect(lex.TokenRParen); err != nil {
+			return nil, err
+		}
+
+		return &Constant{Con: &Data{Inner: dataVal}}, nil
+	case *TList:
+		items, err := p.parseConstantCollection(ts.Typ, "list")
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expect(lex.TokenRParen); err != nil {
+			return nil, err
+		}
+		return &Constant{Con: &ProtoList{LTyp: ts.Typ, List: items}}, nil
+	case *TArray:
+		items, err := p.parseConstantCollection(ts.Typ, "array")
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expect(lex.TokenRParen); err != nil {
+			return nil, err
+		}
+		return &Constant{Con: &ProtoArray{ATyp: ts.Typ, Array: items}}, nil
+	case *TPair:
+		if err := p.expect(lex.TokenLParen); err != nil {
+			return nil, err
+		}
+
+		first, err := p.parseConstantValue(ts.First)
+		if err != nil {
+			return nil, err
+		}
+
+		if !EqualType(first.Typ(), ts.First) {
+			return nil, fmt.Errorf("pair first element of type %T does not match expected type %T at position %d", first.Typ(), ts.First, p.curToken.Position)
+		}
+
+		if err := p.expect(lex.TokenComma); err != nil {
+			return nil, err
+		}
+
+		second, err := p.parseConstantValue(ts.Second)
+		if err != nil {
+			return nil, err
+		}
+
+		if !EqualType(second.Typ(), ts.Second) {
+			return nil, fmt.Errorf("pair second element of type %T does not match expected type %T at position %d", second.Typ(), ts.Second, p.curToken.Position)
+		}
+
+		if err := p.expect(lex.TokenRParen); err != nil {
+			return nil, err
+		}
+
+		if err := p.expect(lex.TokenRParen); err != nil {
+			return nil, err
+		}
+
+		return &Constant{Con: &ProtoPair{FstType: ts.First, SndType: ts.Second, First: first, Second: second}}, nil
+	case *TBls12_381G1Element:
+		if p.curToken.Type != lex.TokenPoint {
+			return nil, fmt.Errorf("expected bytestring value, got %v at position %d", p.curToken.Type, p.curToken.Position)
+		}
+
+		b, ok := p.curToken.Value.([]byte)
+		if !ok {
+			return nil, fmt.Errorf("invalid bytestring value %s at position %d", p.curToken.Literal, p.curToken.Position)
+		}
+
+		p.nextToken()
+
+		if err := p.expect(lex.TokenRParen); err != nil {
+			return nil, err
+		}
+
+		if len(b) != 48 {
+			return nil, fmt.Errorf("bls12_381_g1_element must be 48 bytes, got %d", len(b))
+		}
+
+		uncompressed := new(bls.G1Affine)
+
+		_, err := uncompressed.SetBytes(b)
+		if err != nil {
+			return nil, err
+		}
+
+		jac := new(bls.G1Jac).FromAffine(uncompressed)
+
+		return &Constant{Con: &Bls12_381G1Element{Inner: jac}}, nil
+	case *TBls12_381G2Element:
+		if p.curToken.Type != lex.TokenPoint {
+			return nil, fmt.Errorf("expected bytestring value, got %v at position %d", p.curToken.Type, p.curToken.Position)
+		}
+
+		b, ok := p.curToken.Value.([]byte)
+		if !ok {
+			return nil, fmt.Errorf("invalid bytestring value %s at position %d", p.curToken.Literal, p.curToken.Position)
+		}
+
+		p.nextToken()
+
+		if err := p.expect(lex.TokenRParen); err != nil {
+			return nil, err
+		}
+
+		if len(b) != 96 {
+			return nil, fmt.Errorf("bls12_381_g2_element must be 96 bytes, got %d", len(b))
+		}
+
+		uncompressed := new(bls.G2Affine)
+
+		_, err := uncompressed.SetBytes(b)
+		if err != nil {
+			return nil, err
+		}
+
+		jac := new(bls.G2Jac).FromAffine(uncompressed)
+
+		return &Constant{Con: &Bls12_381G2Element{Inner: jac}}, nil
+	case *TValue:
+		if err := p.expect(lex.TokenLBracket); err != nil {
+			return nil, err
+		}
+
+		items := make([]IConstant, 0, 8)
+
+		for p.curToken.Type != lex.TokenRBracket {
+			if len(items) >= maxCollectionWidth {
+				return nil, errTooMany("value policy items", maxCollectionWidth)
+			}
+			if err := p.node(); err != nil {
+				return nil, err
+			}
+			if err := p.expect(lex.TokenLParen); err != nil {
+				return nil, err
+			}
+
+			// Key bytestring
+			if p.curToken.Type != lex.TokenByteString {
+				return nil, fmt.Errorf("expected bytestring key for value, got %v at position %d", p.curToken.Type, p.curToken.Position)
+			}
+
+			kb, ok := p.curToken.Value.([]byte)
+			if !ok {
+				return nil, fmt.Errorf("invalid bytestring key %s at position %d", p.curToken.Literal, p.curToken.Position)
+			}
+
+			if err := checkValueKeyLength("policy", len(items), kb); err != nil {
+				return nil, err
+			}
+			p.nextToken()
+
+			if err := p.expect(lex.TokenComma); err != nil {
+				return nil, err
+			}
+
+			// Inner list of pairs
+			if err := p.expect(lex.TokenLBracket); err != nil {
+				return nil, err
+			}
+
+			innerItems := make([]IConstant, 0, 8)
+
+			for p.curToken.Type != lex.TokenRBracket {
+				if len(innerItems) >= maxCollectionWidth {
+					return nil, errTooMany("value token items", maxCollectionWidth)
+				}
+				if err := p.node(); err != nil {
+					return nil, err
+				}
+				if err := p.expect(lex.TokenLParen); err != nil {
+					return nil, err
+				}
+
+				if p.curToken.Type != lex.TokenByteString {
+					return nil, fmt.Errorf("expected bytestring in inner pair, got %v at position %d", p.curToken.Type, p.curToken.Position)
+				}
+
+				ib, ok := p.curToken.Value.([]byte)
+				if !ok {
+					return nil, fmt.Errorf("invalid bytestring value %s at position %d", p.curToken.Literal, p.curToken.Position)
+				}
+
+				if err := checkValueKeyLength("token", len(innerItems), ib); err != nil {
+					return nil, err
+				}
+				p.nextToken()
+
+				if err := p.expect(lex.TokenComma); err != nil {
+					return nil, err
+				}
+
+				if p.curToken.Type != lex.TokenNumber {
+					return nil, fmt.Errorf("expected integer in inner pair, got %v at position %d", p.curToken.Type, p.curToken.Position)
+				}
+
+				n, ok := p.curToken.Value.(*big.Int)
+				if !ok {
+					return nil, fmt.Errorf("invalid integer value %s at position %d", p.curToken.Literal, p.curToken.Position)
+				}
+				if err := checkValueQuantityRange(len(items), len(innerItems), n); err != nil {
+					return nil, err
+				}
+				p.nextToken()
+
+				if err := p.expect(lex.TokenRParen); err != nil {
+					return nil, err
+				}
+
+				innerItems = append(innerItems, &ProtoPair{FstType: &TByteString{}, SndType: &TInteger{}, First: &ByteString{Inner: ib}, Second: newInteger(n)})
+
+				if p.curToken.Type != lex.TokenRBracket {
+					if err := p.expect(lex.TokenComma); err != nil {
+						return nil, err
+					}
+				}
+			}
+
+			if err := p.expect(lex.TokenRBracket); err != nil {
+				return nil, err
+			}
+
+			if err := p.expect(lex.TokenRParen); err != nil {
+				return nil, err
+			}
+
+			outerPair := &ProtoPair{
+				FstType: &TByteString{},
+				SndType: &TList{Typ: &TPair{First: &TByteString{}, Second: &TInteger{}}},
+				First:   &ByteString{Inner: kb},
+				Second:  &ProtoList{LTyp: &TPair{First: &TByteString{}, Second: &TInteger{}}, List: innerItems},
+			}
+
+			items = append(items, outerPair)
+
+			if p.curToken.Type != lex.TokenRBracket {
+				if err := p.expect(lex.TokenComma); err != nil {
+					return nil, err
+				}
+			}
+		}
+
+		if err := p.expect(lex.TokenRBracket); err != nil {
+			return nil, err
+		}
+
+		if err := p.expect(lex.TokenRParen); err != nil {
+			return nil, err
+		}
+
+		normalized, err := normalizeValueEntries(items)
+		if err != nil {
+			return nil, err
+		}
+
+		return &Constant{Con: newOwnedValue(normalized)}, nil
+	default:
+		return nil, fmt.Errorf("unexpected type spec %v at position %d", typeSpec, p.curToken.Position)
+	}
+}
+
+func (p *Parser) parseConstantCollection(
+	elementType Typ,
+	collectionName string,
+) ([]IConstant, error) {
+	if err := p.expect(lex.TokenLBracket); err != nil {
+		return nil, err
+	}
+
+	var items []IConstant
+	for p.curToken.Type != lex.TokenRBracket {
+		if len(items) >= maxCollectionWidth {
+			return nil, errTooMany("constant list items", maxCollectionWidth)
+		}
+		if err := p.node(); err != nil {
+			return nil, err
+		}
+		item, err := p.parseConstantValue(elementType)
+		if err != nil {
+			return nil, err
+		}
+		if !EqualType(item.Typ(), elementType) {
+			return nil, fmt.Errorf(
+				"%s element of type %T does not match expected type %T at position %d",
+				collectionName,
+				item.Typ(),
+				elementType,
+				p.curToken.Position,
+			)
+		}
+		items = append(items, item)
+		if p.curToken.Type != lex.TokenRBracket {
+			if err := p.expect(lex.TokenComma); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := p.expect(lex.TokenRBracket); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func (p *Parser) parseConstantValue(typ Typ) (IConstant, error) {
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
+
+	switch t := typ.(type) {
+	case *TInteger:
+		if p.curToken.Type != lex.TokenNumber {
+			return nil, fmt.Errorf("expected integer value, got %v at position %d", p.curToken.Type, p.curToken.Position)
+		}
+
+		n, ok := p.curToken.Value.(*big.Int)
+		if !ok {
+			return nil, fmt.Errorf("invalid integer value %s at position %d", p.curToken.Literal, p.curToken.Position)
+		}
+
+		p.nextToken()
+
+		return newInteger(n), nil
+	case *TByteString:
+		if p.curToken.Type != lex.TokenByteString {
+			return nil, fmt.Errorf("expected bytestring value, got %v at position %d", p.curToken.Type, p.curToken.Position)
+		}
+
+		b, ok := p.curToken.Value.([]byte)
+		if !ok {
+			return nil, fmt.Errorf("invalid bytestring value %s at position %d", p.curToken.Literal, p.curToken.Position)
+		}
+
+		p.nextToken()
+
+		return &ByteString{Inner: b}, nil
+	case *TString:
+		if p.curToken.Type != lex.TokenString {
+			return nil, fmt.Errorf("expected string value, got %v at position %d", p.curToken.Type, p.curToken.Position)
+		}
+
+		s, ok := p.curToken.Value.(string)
+		if !ok {
+			return nil, fmt.Errorf("invalid string value %s at position %d", p.curToken.Literal, p.curToken.Position)
+		}
+
+		p.nextToken()
+
+		return &String{Inner: s}, nil
+	case *TBool:
+		var b bool
+
+		switch p.curToken.Type {
+		case lex.TokenTrue:
+			b = true
+		case lex.TokenFalse:
+			b = false
+		default:
+			return nil, fmt.Errorf("expected bool value, got %v at position %d", p.curToken.Type, p.curToken.Position)
+		}
+
+		p.nextToken()
+
+		return &Bool{Inner: b}, nil
+	case *TUnit:
+		if p.curToken.Type != lex.TokenUnit {
+			return nil, fmt.Errorf("expected unit value, got %v at position %d", p.curToken.Type, p.curToken.Position)
+		}
+
+		p.nextToken()
+
+		return &Unit{}, nil
+	case *TBls12_381G1Element:
+		if p.curToken.Type != lex.TokenPoint {
+			return nil, fmt.Errorf("expected point value, got %v at position %d", p.curToken.Type, p.curToken.Position)
+		}
+
+		b, ok := p.curToken.Value.([]byte)
+		if !ok {
+			return nil, fmt.Errorf("invalid bytestring value %s at position %d", p.curToken.Literal, p.curToken.Position)
+		}
+
+		p.nextToken()
+
+		if len(b) != 48 {
+			return nil, fmt.Errorf("bls12_381_g1_element must be 48 bytes, got %d", len(b))
+		}
+
+		uncompressed := new(bls.G1Affine)
+
+		_, err := uncompressed.SetBytes(b)
+		if err != nil {
+			return nil, err
+		}
+
+		jac := new(bls.G1Jac).FromAffine(uncompressed)
+
+		return &Bls12_381G1Element{Inner: jac}, nil
+	case *TBls12_381G2Element:
+		if p.curToken.Type != lex.TokenPoint {
+			return nil, fmt.Errorf("expected point value, got %v at position %d", p.curToken.Type, p.curToken.Position)
+		}
+
+		b, ok := p.curToken.Value.([]byte)
+		if !ok {
+			return nil, fmt.Errorf("invalid bytestring value %s at position %d", p.curToken.Literal, p.curToken.Position)
+		}
+
+		p.nextToken()
+
+		if len(b) != 96 {
+			return nil, fmt.Errorf("bls12_381_g2_element must be 96 bytes, got %d", len(b))
+		}
+
+		uncompressed := new(bls.G2Affine)
+
+		_, err := uncompressed.SetBytes(b)
+		if err != nil {
+			return nil, err
+		}
+
+		jac := new(bls.G2Jac).FromAffine(uncompressed)
+
+		return &Bls12_381G2Element{Inner: jac}, nil
+	case *TData:
+		dataVal, err := p.parsePlutusData()
+		if err != nil {
+			return nil, err
+		}
+
+		return &Data{Inner: dataVal}, nil
+	case *TList:
+		items, err := p.parseConstantCollection(t.Typ, "list")
+		if err != nil {
+			return nil, err
+		}
+		return &ProtoList{LTyp: t.Typ, List: items}, nil
+	case *TArray:
+		items, err := p.parseConstantCollection(t.Typ, "array")
+		if err != nil {
+			return nil, err
+		}
+		return &ProtoArray{ATyp: t.Typ, Array: items}, nil
+	case *TValue:
+		items, err := p.parseConstantCollection(valueEntryType, "value")
+		if err != nil {
+			return nil, err
+		}
+		normalized, err := normalizeValueEntries(items)
+		if err != nil {
+			return nil, err
+		}
+		return newOwnedValue(normalized), nil
+	case *TPair:
+		if err := p.expect(lex.TokenLParen); err != nil {
+			return nil, err
+		}
+
+		first, err := p.parseConstantValue(t.First)
+		if err != nil {
+			return nil, err
+		}
+
+		if !EqualType(first.Typ(), t.First) {
+			return nil, fmt.Errorf("pair first element of type %T does not match expected type %T at position %d", first.Typ(), t.First, p.curToken.Position)
+		}
+
+		if err := p.expect(lex.TokenComma); err != nil {
+			return nil, err
+		}
+
+		second, err := p.parseConstantValue(t.Second)
+		if err != nil {
+			return nil, err
+		}
+
+		if !EqualType(second.Typ(), t.Second) {
+			return nil, fmt.Errorf("pair second element of type %T does not match expected type %T at position %d", second.Typ(), t.Second, p.curToken.Position)
+		}
+
+		if err := p.expect(lex.TokenRParen); err != nil {
+			return nil, err
+		}
+
+		return &ProtoPair{FstType: t.First, SndType: t.Second, First: first, Second: second}, nil
+	default:
+		return nil, fmt.Errorf("unexpected type %v at position %d", typ, p.curToken.Position)
+	}
+}
+
+func (p *Parser) parsePlutusData() (data.PlutusData, error) {
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
+
+	switch p.curToken.Type {
+	case lex.TokenI:
+		p.nextToken()
+
+		if p.curToken.Type != lex.TokenNumber {
+			return nil, fmt.Errorf(
+				"expected integer value for I, got %v at position %d",
+				p.curToken.Type,
+				p.curToken.Position,
+			)
+		}
+
+		n, ok := p.curToken.Value.(*big.Int)
+		if !ok {
+			return nil, fmt.Errorf(
+				"invalid integer value %s at position %d",
+				p.curToken.Literal,
+				p.curToken.Position,
+			)
+		}
+
+		p.nextToken()
+
+		return data.NewInteger(n), nil
+	case lex.TokenB:
+		p.nextToken()
+
+		if p.curToken.Type != lex.TokenByteString {
+			return nil, fmt.Errorf(
+				"expected bytestring value for B, got %v at position %d",
+				p.curToken.Type,
+				p.curToken.Position,
+			)
+		}
+
+		b, ok := p.curToken.Value.([]byte)
+		if !ok {
+			return nil, fmt.Errorf(
+				"invalid bytestring value %s at position %d",
+				p.curToken.Literal,
+				p.curToken.Position,
+			)
+		}
+
+		p.nextToken()
+
+		return data.NewByteString(b), nil
+	case lex.TokenPlutusList:
+		p.nextToken()
+
+		if err := p.expect(lex.TokenLBracket); err != nil {
+			return nil, err
+		}
+
+		var items []data.PlutusData
+
+		for p.curToken.Type != lex.TokenRBracket {
+			if len(items) >= maxCollectionWidth {
+				return nil, errTooMany("PlutusData list items", maxCollectionWidth)
+			}
+			if err := p.node(); err != nil {
+				return nil, err
+			}
+			item, err := p.parsePlutusData()
+			if err != nil {
+				return nil, err
+			}
+
+			items = append(items, item)
+
+			if p.curToken.Type != lex.TokenRBracket {
+				if err := p.expect(lex.TokenComma); err != nil {
+					return nil, err
+				}
+			}
+		}
+
+		if err := p.expect(lex.TokenRBracket); err != nil {
+			return nil, err
+		}
+
+		return data.NewList(items...), nil
+	case lex.TokenMap:
+		p.nextToken()
+
+		if err := p.expect(lex.TokenLBracket); err != nil {
+			return nil, err
+		}
+
+		var pairs [][2]data.PlutusData
+
+		for p.curToken.Type != lex.TokenRBracket {
+			if len(pairs) >= maxCollectionWidth {
+				return nil, errTooMany("PlutusData map items", maxCollectionWidth)
+			}
+			if err := p.node(); err != nil {
+				return nil, err
+			}
+			if err := p.expect(lex.TokenLParen); err != nil {
+				return nil, err
+			}
+
+			key, err := p.parsePlutusData()
+			if err != nil {
+				return nil, err
+			}
+
+			if err := p.expect(lex.TokenComma); err != nil {
+				return nil, err
+			}
+
+			value, err := p.parsePlutusData()
+			if err != nil {
+				return nil, err
+			}
+
+			if err := p.expect(lex.TokenRParen); err != nil {
+				return nil, err
+			}
+
+			pairs = append(pairs, [2]data.PlutusData{key, value})
+
+			if p.curToken.Type != lex.TokenRBracket {
+				if err := p.expect(lex.TokenComma); err != nil {
+					return nil, err
+				}
+			}
+		}
+
+		if err := p.expect(lex.TokenRBracket); err != nil {
+			return nil, err
+		}
+
+		return data.NewMap(pairs), nil
+	case lex.TokenPlutusValue:
+		return p.parsePlutusValue()
+	case lex.TokenPlutusConstr:
+		p.nextToken()
+
+		if p.curToken.Type != lex.TokenNumber {
+			return nil, fmt.Errorf(
+				"expected tag number for Constr, got %v at position %d",
+				p.curToken.Type,
+				p.curToken.Position,
+			)
+		}
+
+		tag, ok := new(big.Int).SetString(p.curToken.Literal, 10)
+		if !ok {
+			return nil, fmt.Errorf(
+				"invalid constr tag %s at position %d",
+				p.curToken.Literal,
+				p.curToken.Position,
+			)
+		}
+
+		p.nextToken()
+
+		if err := p.expect(lex.TokenLBracket); err != nil {
+			return nil, err
+		}
+
+		var fields []data.PlutusData
+
+		for p.curToken.Type != lex.TokenRBracket {
+			if len(fields) >= maxCollectionWidth {
+				return nil, errTooMany("PlutusData constr fields", maxCollectionWidth)
+			}
+			if err := p.node(); err != nil {
+				return nil, err
+			}
+			field, err := p.parsePlutusData()
+			if err != nil {
+				return nil, err
+			}
+
+			fields = append(fields, field)
+
+			if p.curToken.Type != lex.TokenRBracket {
+				if err := p.expect(lex.TokenComma); err != nil {
+					return nil, err
+				}
+			}
+		}
+
+		if err := p.expect(lex.TokenRBracket); err != nil {
+			return nil, err
+		}
+
+		return data.NewConstrFromBigInt(tag, fields...), nil
+	default:
+		return nil, fmt.Errorf(
+			"expected PlutusData constructor (I, B, List, Map, V, Constr), got %v at position %d",
+			p.curToken.Type,
+			p.curToken.Position,
+		)
+	}
+}
+
+func (p *Parser) parsePlutusValue() (data.PlutusData, error) {
+	p.nextToken()
+	if err := p.expect(lex.TokenLBracket); err != nil {
+		return nil, err
+	}
+	var prevPolicy []byte
+	pairs := make([][2]data.PlutusData, 0)
+	for p.curToken.Type != lex.TokenRBracket {
+		if len(pairs) >= maxCollectionWidth {
+			return nil, errTooMany("value policy items", maxCollectionWidth)
+		}
+		if err := p.node(); err != nil {
+			return nil, err
+		}
+		if err := p.expect(lex.TokenLParen); err != nil {
+			return nil, err
+		}
+		policy, err := p.parseValueBytes("policy", len(pairs), prevPolicy)
+		if err != nil {
+			return nil, err
+		}
+		prevPolicy = policy.Inner
+		if err := p.expect(lex.TokenComma); err != nil {
+			return nil, err
+		}
+		if err := p.expect(lex.TokenLBracket); err != nil {
+			return nil, err
+		}
+		var prevToken []byte
+		tokens := make([][2]data.PlutusData, 0)
+		for p.curToken.Type != lex.TokenRBracket {
+			if len(tokens) >= maxCollectionWidth {
+				return nil, errTooMany("value token items", maxCollectionWidth)
+			}
+			if err := p.node(); err != nil {
+				return nil, err
+			}
+			if err := p.expect(lex.TokenLParen); err != nil {
+				return nil, err
+			}
+			token, err := p.parseValueBytes("token", len(tokens), prevToken)
+			if err != nil {
+				return nil, err
+			}
+			prevToken = token.Inner
+			if err := p.expect(lex.TokenComma); err != nil {
+				return nil, err
+			}
+			if p.curToken.Type != lex.TokenNumber {
+				return nil, fmt.Errorf(
+					"expected Value quantity, got %v at position %d",
+					p.curToken.Type,
+					p.curToken.Position,
+				)
+			}
+			quantity, ok := p.curToken.Value.(*big.Int)
+			if !ok {
+				return nil, fmt.Errorf("invalid Value quantity at position %d", p.curToken.Position)
+			}
+			if err := data.CheckValueQuantity(len(pairs), len(tokens), quantity); err != nil {
+				return nil, err
+			}
+			p.nextToken()
+			if err := p.expect(lex.TokenRParen); err != nil {
+				return nil, err
+			}
+			tokens = append(tokens, [2]data.PlutusData{token, data.NewInteger(quantity)})
+			if p.curToken.Type != lex.TokenRBracket {
+				if err := p.expect(lex.TokenComma); err != nil {
+					return nil, err
+				}
+			}
+		}
+		if err := data.CheckValueTokenCount(len(pairs), len(tokens)); err != nil {
+			return nil, err
+		}
+		if err := p.expect(lex.TokenRBracket); err != nil {
+			return nil, err
+		}
+		if err := p.expect(lex.TokenRParen); err != nil {
+			return nil, err
+		}
+		pairs = append(pairs, [2]data.PlutusData{policy, data.NewMap(tokens)})
+		if p.curToken.Type != lex.TokenRBracket {
+			if err := p.expect(lex.TokenComma); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := p.expect(lex.TokenRBracket); err != nil {
+		return nil, err
+	}
+	value, err := data.NewValue(&data.Map{Pairs: pairs})
+	if err != nil {
+		return nil, err
+	}
+	return value, nil
+}
+
+func (p *Parser) parseValueBytes(kind string, index int, prev []byte) (*data.ByteString, error) {
+	if p.curToken.Type != lex.TokenByteString {
+		return nil, fmt.Errorf(
+			"expected Value bytestring, got %v at position %d",
+			p.curToken.Type,
+			p.curToken.Position,
+		)
+	}
+	value, ok := p.curToken.Value.([]byte)
+	if !ok {
+		return nil, fmt.Errorf("invalid Value bytestring at position %d", p.curToken.Position)
+	}
+	if err := data.CheckValueKey(kind, index, value, prev); err != nil {
+		return nil, err
+	}
+	p.nextToken()
+	return &data.ByteString{Inner: value}, nil
+}
+
+func (p *Parser) parseTypeSpec() (Typ, error) {
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
+
+	// Check for invalid bare composite types.
+	if p.curToken.Type == lex.TokenList ||
+		p.curToken.Type == lex.TokenArray ||
+		p.curToken.Type == lex.TokenPair {
+		return nil, fmt.Errorf(
+			"expected left parenthesis for %d type, got %v (literal: %s) at position %d",
+			p.curToken.Type,
+			p.curToken.Type,
+			p.curToken.Literal,
+			p.curToken.Position,
+		)
+	}
+
+	// Handle parenthesized type specs (e.g., (list data), (pair integer bool))
+	if p.curToken.Type == lex.TokenLParen {
+		p.nextToken()
+
+		typ, err := p.parseInnerTypeSpec()
+		if err != nil {
+			return nil, err
+		}
+
+		if p.curToken.Type != lex.TokenRParen {
+			return nil, fmt.Errorf(
+				"expected right parenthesis after type spec, got %v (literal: %s) at position %d",
+				p.curToken.Type,
+				p.curToken.Literal,
+				p.curToken.Position,
+			)
+		}
+
+		p.nextToken()
+
+		return typ, nil
+	}
+
+	// Handle simple types (e.g., integer, data)
+	return p.parseInnerTypeSpec()
+}
+
+func (p *Parser) parseInnerTypeSpec() (Typ, error) {
+	switch p.curToken.Type {
+	case lex.TokenIdentifier:
+		typName := p.curToken.Literal
+
+		p.nextToken()
+
+		switch typName {
+		case "integer":
+			return &TInteger{}, nil
+		case "bytestring":
+			return &TByteString{}, nil
+		case "string":
+			return &TString{}, nil
+		case "unit":
+			return &TUnit{}, nil
+		case "bool":
+			return &TBool{}, nil
+		case "data":
+			return &TData{}, nil
+		case "bls12_381_G1_element":
+			return &TBls12_381G1Element{}, nil
+		case "bls12_381_G2_element":
+			return &TBls12_381G2Element{}, nil
+		case "bls12_381_mlresult":
+			return &TBls12_381MlResult{}, nil
+		case "value":
+			return &TValue{}, nil
+		default:
+			return nil, fmt.Errorf(
+				"unknown type %s at position %d",
+				typName,
+				p.curToken.Position,
+			)
+		}
+	case lex.TokenList:
+		p.nextToken()
+
+		// Parse element type, which may be parenthesized (e.g., (list data)) or simple (e.g., data)
+		elemType, err := p.parseTypeSpec()
+		if err != nil {
+			return nil, err
+		}
+
+		return &TList{Typ: elemType}, nil
+	case lex.TokenArray:
+		p.nextToken()
+
+		elemType, err := p.parseTypeSpec()
+		if err != nil {
+			return nil, err
+		}
+
+		return &TArray{Typ: elemType}, nil
+	case lex.TokenPair:
+		p.nextToken()
+
+		// Parse two types, each may be parenthesized or simple
+		firstType, err := p.parseTypeSpec()
+		if err != nil {
+			return nil, err
+		}
+
+		secondType, err := p.parseTypeSpec()
+		if err != nil {
+			return nil, err
+		}
+
+		return &TPair{First: firstType, Second: secondType}, nil
+	default:
+		return nil, fmt.Errorf(
+			"expected type identifier, list, or pair, got %v (literal: %s) at position %d",
+			p.curToken.Type,
+			p.curToken.Literal,
+			p.curToken.Position,
+		)
+	}
+}
+
+func (p *Parser) parseApply() (Term[Name], error) {
+	if err := p.expect(lex.TokenLBracket); err != nil {
+		return nil, err
+	}
+
+	var terms []Term[Name]
+	applicationDepth := 0
+	defer func() {
+		for range applicationDepth {
+			p.leave()
+		}
+	}()
+
+	for p.curToken.Type != lex.TokenRBracket {
+		// Each argument produces one Apply node in the left-nested chain,
+		// contributing depth 1 to the resulting AST. We therefore charge one
+		// depth unit per argument (held until the application is fully parsed)
+		// so the accumulated application width counts against the same budget
+		// as recursive term nesting — preventing downstream passes from
+		// overflowing the stack on very wide applications.
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
+		applicationDepth++
+
+		term, err := p.ParseTerm()
+		if err != nil {
+			return nil, err
+		}
+		terms = append(terms, term)
+	}
+
+	if len(terms) < 2 {
+		return nil, fmt.Errorf(
+			"application requires at least two terms, got %d at position %d",
+			len(terms),
+			p.curToken.Position,
+		)
+	}
+
+	if err := p.expect(lex.TokenRBracket); err != nil {
+		return nil, err
+	}
+
+	// Build left-nested Apply structure
+	result := terms[0]
+
+	for i := 1; i < len(terms); i++ {
+		result = &Apply[Name]{Function: result, Argument: terms[i]}
+	}
+
+	return result, nil
+}
+
+func (p *Parser) isBefore_v1_1_0() bool {
+	// Lexicographic comparison against 1.1.0 (the first version supporting
+	// constr/case). Comparing major and minor independently is not a valid
+	// version ordering (e.g. it would accept 0.9.0).
+	switch {
+	case p.version[0] != 1:
+		return p.version[0] < 1
+	default:
+		return p.version[1] < 1
+	}
+}

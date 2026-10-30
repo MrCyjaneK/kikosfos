@@ -1,0 +1,714 @@
+// Copyright 2026 Blink Labs Software
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package builtin
+
+import "fmt"
+
+type DefaultFunction uint8
+
+const (
+	// Integer functions
+	AddInteger            DefaultFunction = 0
+	SubtractInteger       DefaultFunction = 1
+	MultiplyInteger       DefaultFunction = 2
+	DivideInteger         DefaultFunction = 3
+	QuotientInteger       DefaultFunction = 4
+	RemainderInteger      DefaultFunction = 5
+	ModInteger            DefaultFunction = 6
+	EqualsInteger         DefaultFunction = 7
+	LessThanInteger       DefaultFunction = 8
+	LessThanEqualsInteger DefaultFunction = 9
+	// ByteString functions
+	AppendByteString         DefaultFunction = 10
+	ConsByteString           DefaultFunction = 11
+	SliceByteString          DefaultFunction = 12
+	LengthOfByteString       DefaultFunction = 13
+	IndexByteString          DefaultFunction = 14
+	EqualsByteString         DefaultFunction = 15
+	LessThanByteString       DefaultFunction = 16
+	LessThanEqualsByteString DefaultFunction = 17
+	// Cryptography and hash functions
+	Sha2_256                        DefaultFunction = 18
+	Sha3_256                        DefaultFunction = 19
+	Blake2b_256                     DefaultFunction = 20
+	Keccak_256                      DefaultFunction = 71
+	Blake2b_224                     DefaultFunction = 72
+	VerifyEd25519Signature          DefaultFunction = 21
+	VerifyEcdsaSecp256k1Signature   DefaultFunction = 52
+	VerifySchnorrSecp256k1Signature DefaultFunction = 53
+	// String functions
+	AppendString DefaultFunction = 22
+	EqualsString DefaultFunction = 23
+	EncodeUtf8   DefaultFunction = 24
+	DecodeUtf8   DefaultFunction = 25
+	// Bool function
+	IfThenElse DefaultFunction = 26
+	// Unit function
+	ChooseUnit DefaultFunction = 27
+	// Tracing function
+	Trace DefaultFunction = 28
+	// Pairs functions
+	FstPair DefaultFunction = 29
+	SndPair DefaultFunction = 30
+	// List functions
+	ChooseList DefaultFunction = 31
+	MkCons     DefaultFunction = 32
+	HeadList   DefaultFunction = 33
+	TailList   DefaultFunction = 34
+	NullList   DefaultFunction = 35
+	// Data functions
+	// It is convenient to have a "choosing" function for a data type that has more than two
+	// constructors to get pattern matching over it and we may end up having multiple such data
+	// types hence we include the name of the data type as a suffix.
+	ChooseData    DefaultFunction = 36
+	ConstrData    DefaultFunction = 37
+	MapData       DefaultFunction = 38
+	ListData      DefaultFunction = 39
+	IData         DefaultFunction = 40
+	BData         DefaultFunction = 41
+	UnConstrData  DefaultFunction = 42
+	UnMapData     DefaultFunction = 43
+	UnListData    DefaultFunction = 44
+	UnIData       DefaultFunction = 45
+	UnBData       DefaultFunction = 46
+	EqualsData    DefaultFunction = 47
+	SerialiseData DefaultFunction = 51
+	// Misc constructors
+	// Constructors that we need for constructing e.g. Data. Polymorphic builtin
+	// constructors are often problematic (See note [Representable built-in
+	// functions over polymorphic built-in types])
+	MkPairData    DefaultFunction = 48
+	MkNilData     DefaultFunction = 49
+	MkNilPairData DefaultFunction = 50
+
+	// BLS Builtins
+	Bls12_381_G1_Add         DefaultFunction = 54
+	Bls12_381_G1_Neg         DefaultFunction = 55
+	Bls12_381_G1_ScalarMul   DefaultFunction = 56
+	Bls12_381_G1_Equal       DefaultFunction = 57
+	Bls12_381_G1_Compress    DefaultFunction = 58
+	Bls12_381_G1_Uncompress  DefaultFunction = 59
+	Bls12_381_G1_HashToGroup DefaultFunction = 60
+	Bls12_381_G2_Add         DefaultFunction = 61
+	Bls12_381_G2_Neg         DefaultFunction = 62
+	Bls12_381_G2_ScalarMul   DefaultFunction = 63
+	Bls12_381_G2_Equal       DefaultFunction = 64
+	Bls12_381_G2_Compress    DefaultFunction = 65
+	Bls12_381_G2_Uncompress  DefaultFunction = 66
+	Bls12_381_G2_HashToGroup DefaultFunction = 67
+	Bls12_381_MillerLoop     DefaultFunction = 68
+	Bls12_381_MulMlResult    DefaultFunction = 69
+	Bls12_381_FinalVerify    DefaultFunction = 70
+
+	// Conversions
+	IntegerToByteString DefaultFunction = 73
+	ByteStringToInteger DefaultFunction = 74
+
+	// Logical
+	AndByteString        DefaultFunction = 75
+	OrByteString         DefaultFunction = 76
+	XorByteString        DefaultFunction = 77
+	ComplementByteString DefaultFunction = 78
+	ReadBit              DefaultFunction = 79
+	WriteBits            DefaultFunction = 80
+	ReplicateByte        DefaultFunction = 81
+
+	// Bitwise
+	ShiftByteString  DefaultFunction = 82
+	RotateByteString DefaultFunction = 83
+	CountSetBits     DefaultFunction = 84
+	FindFirstSetBit  DefaultFunction = 85
+
+	// Ripemd_160
+	Ripemd_160 DefaultFunction = 86
+
+	// Batch 6
+	ExpModInteger DefaultFunction = 87
+	DropList      DefaultFunction = 88
+
+	// Arrays
+	LengthOfArray DefaultFunction = 89
+	ListToArray   DefaultFunction = 90
+	IndexArray    DefaultFunction = 91
+
+	// Multi-scalar multiplication (G1/G2)
+	Bls12_381_G1_MultiScalarMul DefaultFunction = 92
+	Bls12_381_G2_MultiScalarMul DefaultFunction = 93
+
+	// Value/coin builtins
+	InsertCoin    DefaultFunction = 94
+	LookupCoin    DefaultFunction = 95
+	UnionValue    DefaultFunction = 96
+	ValueContains DefaultFunction = 97
+
+	// Value/Data conversion builtins
+	ValueData   DefaultFunction = 98
+	UnValueData DefaultFunction = 99
+	ScaleValue  DefaultFunction = 100
+
+	// Multi-index array
+	MultiIndexArray DefaultFunction = 101
+	Policies        DefaultFunction = 102
+	AssetCount      DefaultFunction = 103
+)
+
+var Builtins map[string]DefaultFunction = map[string]DefaultFunction{
+	// Integer functions
+	"addInteger":            AddInteger,
+	"subtractInteger":       SubtractInteger,
+	"multiplyInteger":       MultiplyInteger,
+	"divideInteger":         DivideInteger,
+	"quotientInteger":       QuotientInteger,
+	"remainderInteger":      RemainderInteger,
+	"modInteger":            ModInteger,
+	"equalsInteger":         EqualsInteger,
+	"lessThanInteger":       LessThanInteger,
+	"lessThanEqualsInteger": LessThanEqualsInteger,
+	// ByteString functions
+	"appendByteString":         AppendByteString,
+	"consByteString":           ConsByteString,
+	"sliceByteString":          SliceByteString,
+	"lengthOfByteString":       LengthOfByteString,
+	"indexByteString":          IndexByteString,
+	"equalsByteString":         EqualsByteString,
+	"lessThanByteString":       LessThanByteString,
+	"lessThanEqualsByteString": LessThanEqualsByteString,
+	// Cryptography and hash functions
+	"sha2_256":                        Sha2_256,
+	"sha3_256":                        Sha3_256,
+	"blake2b_256":                     Blake2b_256,
+	"keccak_256":                      Keccak_256,
+	"blake2b_224":                     Blake2b_224,
+	"verifyEd25519Signature":          VerifyEd25519Signature,
+	"verifySignature":                 VerifyEd25519Signature,
+	"verifyEcdsaSecp256k1Signature":   VerifyEcdsaSecp256k1Signature,
+	"verifySchnorrSecp256k1Signature": VerifySchnorrSecp256k1Signature,
+	// String functions
+	"appendString": AppendString,
+	"equalsString": EqualsString,
+	"encodeUtf8":   EncodeUtf8,
+	"decodeUtf8":   DecodeUtf8,
+	// Bool function
+	"ifThenElse": IfThenElse,
+	// Unit function
+	"chooseUnit": ChooseUnit,
+	// Tracing function
+	"trace": Trace,
+	// Pairs functions
+	"fstPair": FstPair,
+	"sndPair": SndPair,
+	// List functions
+	"chooseList": ChooseList,
+	"mkCons":     MkCons,
+	"headList":   HeadList,
+	"tailList":   TailList,
+	"nullList":   NullList,
+	// Data functions
+	// It is convenient to have a "choosing" function for a data type that has more than two
+	// constructors to get pattern matching over it and we may end up having multiple such data
+	// types hence we include the name of the data type as a suffix.
+	"chooseData":    ChooseData,
+	"constrData":    ConstrData,
+	"mapData":       MapData,
+	"listData":      ListData,
+	"iData":         IData,
+	"bData":         BData,
+	"unConstrData":  UnConstrData,
+	"unMapData":     UnMapData,
+	"unListData":    UnListData,
+	"unIData":       UnIData,
+	"unBData":       UnBData,
+	"equalsData":    EqualsData,
+	"serialiseData": SerialiseData,
+	// Misc constructors
+	// Constructors that we need for constructing e.g. Data. Polymorphic builtin
+	// constructors are often problematic (See note [Representable built-in
+	// functions over polymorphic built-in types])
+	"mkPairData":    MkPairData,
+	"mkNilData":     MkNilData,
+	"mkNilPairData": MkNilPairData,
+	// BLS Builtins
+	"bls12_381_G1_add":         Bls12_381_G1_Add,
+	"bls12_381_G1_neg":         Bls12_381_G1_Neg,
+	"bls12_381_G1_scalarMul":   Bls12_381_G1_ScalarMul,
+	"bls12_381_G1_equal":       Bls12_381_G1_Equal,
+	"bls12_381_G1_compress":    Bls12_381_G1_Compress,
+	"bls12_381_G1_uncompress":  Bls12_381_G1_Uncompress,
+	"bls12_381_G1_hashToGroup": Bls12_381_G1_HashToGroup,
+	"bls12_381_G2_add":         Bls12_381_G2_Add,
+	"bls12_381_G2_neg":         Bls12_381_G2_Neg,
+	"bls12_381_G2_scalarMul":   Bls12_381_G2_ScalarMul,
+	"bls12_381_G2_equal":       Bls12_381_G2_Equal,
+	"bls12_381_G2_compress":    Bls12_381_G2_Compress,
+	"bls12_381_G2_uncompress":  Bls12_381_G2_Uncompress,
+	"bls12_381_G2_hashToGroup": Bls12_381_G2_HashToGroup,
+	"bls12_381_millerLoop":     Bls12_381_MillerLoop,
+	"bls12_381_mulMlResult":    Bls12_381_MulMlResult,
+	"bls12_381_finalVerify":    Bls12_381_FinalVerify,
+	// Conversions
+	"integerToByteString": IntegerToByteString,
+	"byteStringToInteger": ByteStringToInteger,
+	// Logical
+	"andByteString":        AndByteString,
+	"orByteString":         OrByteString,
+	"xorByteString":        XorByteString,
+	"complementByteString": ComplementByteString,
+	"readBit":              ReadBit,
+	"writeBits":            WriteBits,
+	"replicateByte":        ReplicateByte,
+	// Bitwise
+	"shiftByteString":  ShiftByteString,
+	"rotateByteString": RotateByteString,
+	"countSetBits":     CountSetBits,
+	"findFirstSetBit":  FindFirstSetBit,
+	// Ripemd_160
+	"ripemd_160": Ripemd_160,
+	// Batch 6
+	"expModInteger": ExpModInteger,
+	"dropList":      DropList,
+	// Arrays
+	"lengthOfArray": LengthOfArray,
+	"listToArray":   ListToArray,
+	"indexArray":    IndexArray,
+	// Multi-scalar
+	"bls12_381_G1_multiScalarMul": Bls12_381_G1_MultiScalarMul,
+	"bls12_381_G2_multiScalarMul": Bls12_381_G2_MultiScalarMul,
+
+	// Value/coin builtins
+	"insertCoin":    InsertCoin,
+	"lookupCoin":    LookupCoin,
+	"unionValue":    UnionValue,
+	"valueContains": ValueContains,
+
+	// Value/Data conversion builtins
+	"valueData":       ValueData,
+	"unValueData":     UnValueData,
+	"scaleValue":      ScaleValue,
+	"multiIndexArray": MultiIndexArray,
+	"policies":        Policies,
+	"assetCount":      AssetCount,
+}
+
+var defaultFunctionForceCount = [TotalBuiltinCount]uint{
+	// Integer functions
+	AddInteger:            0,
+	SubtractInteger:       0,
+	MultiplyInteger:       0,
+	DivideInteger:         0,
+	QuotientInteger:       0,
+	RemainderInteger:      0,
+	ModInteger:            0,
+	EqualsInteger:         0,
+	LessThanInteger:       0,
+	LessThanEqualsInteger: 0,
+	// ByteString functions
+	AppendByteString:         0,
+	ConsByteString:           0,
+	SliceByteString:          0,
+	LengthOfByteString:       0,
+	IndexByteString:          0,
+	EqualsByteString:         0,
+	LessThanByteString:       0,
+	LessThanEqualsByteString: 0,
+	// Cryptography and hash functions
+	Sha2_256:                        0,
+	Sha3_256:                        0,
+	Blake2b_256:                     0,
+	Keccak_256:                      0,
+	Blake2b_224:                     0,
+	VerifyEd25519Signature:          0,
+	VerifyEcdsaSecp256k1Signature:   0,
+	VerifySchnorrSecp256k1Signature: 0,
+	// String functions
+	AppendString: 0,
+	EqualsString: 0,
+	EncodeUtf8:   0,
+	DecodeUtf8:   0,
+	// Bool function
+	IfThenElse: 1,
+	// Unit function
+	ChooseUnit: 1,
+	// Tracing function
+	Trace: 1,
+	// Pairs functions
+	FstPair: 2,
+	SndPair: 2,
+	// List functions
+	ChooseList: 2,
+	MkCons:     1,
+	HeadList:   1,
+	TailList:   1,
+	NullList:   1,
+	// Data functions
+	// It is convenient to have a "choosing" function for a data type that has more than two
+	// constructors to get pattern matching over it and we may end up having multiple such data
+	// types hence we include the name of the data type as a suffix.
+	ChooseData:    1,
+	ConstrData:    0,
+	MapData:       0,
+	ListData:      0,
+	IData:         0,
+	BData:         0,
+	UnConstrData:  0,
+	UnMapData:     0,
+	UnListData:    0,
+	UnIData:       0,
+	UnBData:       0,
+	EqualsData:    0,
+	SerialiseData: 0,
+	// Misc constructors
+	// Constructors that we need for constructing e.g. Data. Polymorphic builtin
+	// constructors are often problematic (See note [Representable built-in
+	// functions over polymorphic built-in types])
+	MkPairData:               0,
+	MkNilData:                0,
+	MkNilPairData:            0,
+	Bls12_381_G1_Add:         0,
+	Bls12_381_G1_Neg:         0,
+	Bls12_381_G1_ScalarMul:   0,
+	Bls12_381_G1_Equal:       0,
+	Bls12_381_G1_Compress:    0,
+	Bls12_381_G1_Uncompress:  0,
+	Bls12_381_G1_HashToGroup: 0,
+	Bls12_381_G2_Add:         0,
+	Bls12_381_G2_Neg:         0,
+	Bls12_381_G2_ScalarMul:   0,
+	Bls12_381_G2_Equal:       0,
+	Bls12_381_G2_Compress:    0,
+	Bls12_381_G2_Uncompress:  0,
+	Bls12_381_G2_HashToGroup: 0,
+	Bls12_381_MillerLoop:     0,
+	Bls12_381_MulMlResult:    0,
+	Bls12_381_FinalVerify:    0,
+	IntegerToByteString:      0,
+	ByteStringToInteger:      0,
+	AndByteString:            0,
+	OrByteString:             0,
+	XorByteString:            0,
+	ComplementByteString:     0,
+	ReadBit:                  0,
+	WriteBits:                0,
+	ReplicateByte:            0,
+	ShiftByteString:          0,
+	RotateByteString:         0,
+	CountSetBits:             0,
+	FindFirstSetBit:          0,
+	Ripemd_160:               0,
+	// Batch 6
+	ExpModInteger: 0,
+	DropList:      1,
+	// Arrays
+	LengthOfArray:               1,
+	ListToArray:                 1,
+	IndexArray:                  1,
+	Bls12_381_G1_MultiScalarMul: 0,
+	Bls12_381_G2_MultiScalarMul: 0,
+	InsertCoin:                  0,
+	LookupCoin:                  0,
+	UnionValue:                  0,
+	ValueContains:               0,
+	// Value/Data conversion
+	ValueData:       0,
+	UnValueData:     0,
+	ScaleValue:      0,
+	MultiIndexArray: 1,
+	Policies:        0,
+	AssetCount:      0,
+}
+
+func (f DefaultFunction) ForceCount() uint {
+	return defaultFunctionForceCount[f]
+}
+
+var defaultFunctionArity = [TotalBuiltinCount]uint{
+	// Integer functions
+	AddInteger:            2,
+	SubtractInteger:       2,
+	MultiplyInteger:       2,
+	DivideInteger:         2,
+	QuotientInteger:       2,
+	RemainderInteger:      2,
+	ModInteger:            2,
+	EqualsInteger:         2,
+	LessThanInteger:       2,
+	LessThanEqualsInteger: 2,
+	// ByteString functions
+	AppendByteString:         2,
+	ConsByteString:           2,
+	SliceByteString:          3,
+	LengthOfByteString:       1,
+	IndexByteString:          2,
+	EqualsByteString:         2,
+	LessThanByteString:       2,
+	LessThanEqualsByteString: 2,
+	// Cryptography and hash functions
+	Sha2_256:                        1,
+	Sha3_256:                        1,
+	Blake2b_256:                     1,
+	Keccak_256:                      1,
+	Blake2b_224:                     1,
+	VerifyEd25519Signature:          3,
+	VerifyEcdsaSecp256k1Signature:   3,
+	VerifySchnorrSecp256k1Signature: 3,
+	// String functions
+	AppendString: 2,
+	EqualsString: 2,
+	EncodeUtf8:   1,
+	DecodeUtf8:   1,
+	// Bool function
+	IfThenElse: 3,
+	// Unit function
+	ChooseUnit: 2,
+	// Tracing function
+	Trace: 2,
+	// Pairs functions
+	FstPair: 1,
+	SndPair: 1,
+	// List functions
+	ChooseList: 3,
+	MkCons:     2,
+	HeadList:   1,
+	TailList:   1,
+	NullList:   1,
+	// Data functions
+	// It is convenient to have a "choosing" function for a data type that has more than two
+	// constructors to get pattern matching over it and we may end up having multiple such data
+	// types hence we include the name of the data type as a suffix.
+	ChooseData:    6,
+	ConstrData:    2,
+	MapData:       1,
+	ListData:      1,
+	IData:         1,
+	BData:         1,
+	UnConstrData:  1,
+	UnMapData:     1,
+	UnListData:    1,
+	UnIData:       1,
+	UnBData:       1,
+	EqualsData:    2,
+	SerialiseData: 1,
+	// Misc constructors
+	// Constructors that we need for constructing e.g. Data. Polymorphic builtin
+	// constructors are often problematic (See note [Representable built-in
+	// functions over polymorphic built-in types])
+	MkPairData:               2,
+	MkNilData:                1,
+	MkNilPairData:            1,
+	Bls12_381_G1_Add:         2,
+	Bls12_381_G1_Neg:         1,
+	Bls12_381_G1_ScalarMul:   2,
+	Bls12_381_G1_Equal:       2,
+	Bls12_381_G1_Compress:    1,
+	Bls12_381_G1_Uncompress:  1,
+	Bls12_381_G1_HashToGroup: 2,
+	Bls12_381_G2_Add:         2,
+	Bls12_381_G2_Neg:         1,
+	Bls12_381_G2_ScalarMul:   2,
+	Bls12_381_G2_Equal:       2,
+	Bls12_381_G2_Compress:    1,
+	Bls12_381_G2_Uncompress:  1,
+	Bls12_381_G2_HashToGroup: 2,
+	Bls12_381_MillerLoop:     2,
+	Bls12_381_MulMlResult:    2,
+	Bls12_381_FinalVerify:    2,
+	IntegerToByteString:      3,
+	ByteStringToInteger:      2,
+	AndByteString:            3,
+	OrByteString:             3,
+	XorByteString:            3,
+	ComplementByteString:     1,
+	ReadBit:                  2,
+	WriteBits:                3,
+	ReplicateByte:            2,
+	ShiftByteString:          2,
+	RotateByteString:         2,
+	CountSetBits:             1,
+	FindFirstSetBit:          1,
+	Ripemd_160:               1,
+	// Batch 6
+	ExpModInteger: 3,
+	DropList:      2,
+	// Arrays
+	LengthOfArray:               1,
+	ListToArray:                 1,
+	IndexArray:                  2,
+	Bls12_381_G1_MultiScalarMul: 2,
+	Bls12_381_G2_MultiScalarMul: 2,
+	InsertCoin:                  4,
+	LookupCoin:                  3,
+	UnionValue:                  2,
+	ValueContains:               2,
+	// Value/Data conversion
+	ValueData:       1,
+	UnValueData:     1,
+	ScaleValue:      2,
+	MultiIndexArray: 2,
+	Policies:        1,
+	AssetCount:      1,
+}
+
+func (f DefaultFunction) Arity() uint {
+	return defaultFunctionArity[f]
+}
+
+var defaultFunctionToString = [TotalBuiltinCount]string{
+	// Integer functions
+	AddInteger:            "addInteger",
+	SubtractInteger:       "subtractInteger",
+	MultiplyInteger:       "multiplyInteger",
+	DivideInteger:         "divideInteger",
+	QuotientInteger:       "quotientInteger",
+	RemainderInteger:      "remainderInteger",
+	ModInteger:            "modInteger",
+	EqualsInteger:         "equalsInteger",
+	LessThanInteger:       "lessThanInteger",
+	LessThanEqualsInteger: "lessThanEqualsInteger",
+	// ByteString functions
+	AppendByteString:         "appendByteString",
+	ConsByteString:           "consByteString",
+	SliceByteString:          "sliceByteString",
+	LengthOfByteString:       "lengthOfByteString",
+	IndexByteString:          "indexByteString",
+	EqualsByteString:         "equalsByteString",
+	LessThanByteString:       "lessThanByteString",
+	LessThanEqualsByteString: "lessThanEqualsByteString",
+	// Cryptography and hash functions
+	Sha2_256:                        "sha2_256",
+	Sha3_256:                        "sha3_256",
+	Blake2b_256:                     "blake2b_256",
+	Keccak_256:                      "keccak_256",
+	Blake2b_224:                     "blake2b_224",
+	VerifyEd25519Signature:          "verifyEd25519Signature",
+	VerifyEcdsaSecp256k1Signature:   "verifyEcdsaSecp256k1Signature",
+	VerifySchnorrSecp256k1Signature: "verifySchnorrSecp256k1Signature",
+	// String functions
+	AppendString: "appendString",
+	EqualsString: "equalsString",
+	EncodeUtf8:   "encodeUtf8",
+	DecodeUtf8:   "decodeUtf8",
+	// Bool function
+	IfThenElse: "ifThenElse",
+	// Unit function
+	ChooseUnit: "chooseUnit",
+	// Tracing function
+	Trace: "trace",
+	// Pairs functions
+	FstPair: "fstPair",
+	SndPair: "sndPair",
+	// List functions
+	ChooseList: "chooseList",
+	MkCons:     "mkCons",
+	HeadList:   "headList",
+	TailList:   "tailList",
+	NullList:   "nullList",
+	// Data functions
+	// It is convenient to have a "choosing" function for a data type that has more than two
+	// constructors to get pattern matching over it and we may end up having multiple such data
+	// types hence we include the name of the data type as a suffix.
+	ChooseData:    "chooseData",
+	ConstrData:    "constrData",
+	MapData:       "mapData",
+	ListData:      "listData",
+	IData:         "iData",
+	BData:         "bData",
+	UnConstrData:  "unConstrData",
+	UnMapData:     "unMapData",
+	UnListData:    "unListData",
+	UnIData:       "unIData",
+	UnBData:       "unBData",
+	EqualsData:    "equalsData",
+	SerialiseData: "serialiseData",
+	// Misc constructors
+	// Constructors that we need for constructing e.g. Data. Polymorphic builtin
+	// constructors are often problematic (See note [Representable built-in
+	// functions over polymorphic built-in types])
+	MkPairData:               "mkPairData",
+	MkNilData:                "mkNilData",
+	MkNilPairData:            "mkNilPairData",
+	Bls12_381_G1_Add:         "bls12_381_G1_add",
+	Bls12_381_G1_Neg:         "bls12_381_G1_neg",
+	Bls12_381_G1_ScalarMul:   "bls12_381_G1_scalarMul",
+	Bls12_381_G1_Equal:       "bls12_381_G1_equal",
+	Bls12_381_G1_Compress:    "bls12_381_G1_compress",
+	Bls12_381_G1_Uncompress:  "bls12_381_G1_uncompress",
+	Bls12_381_G1_HashToGroup: "bls12_381_G1_hashToGroup",
+	Bls12_381_G2_Add:         "bls12_381_G2_add",
+	Bls12_381_G2_Neg:         "bls12_381_G2_neg",
+	Bls12_381_G2_ScalarMul:   "bls12_381_G2_scalarMul",
+	Bls12_381_G2_Equal:       "bls12_381_G2_equal",
+	Bls12_381_G2_Compress:    "bls12_381_G2_compress",
+	Bls12_381_G2_Uncompress:  "bls12_381_G2_uncompress",
+	Bls12_381_G2_HashToGroup: "bls12_381_G2_hashToGroup",
+	Bls12_381_MillerLoop:     "bls12_381_millerLoop",
+	Bls12_381_MulMlResult:    "bls12_381_mulMlResult",
+	Bls12_381_FinalVerify:    "bls12_381_finalVerify",
+	IntegerToByteString:      "integerToByteString",
+	ByteStringToInteger:      "byteStringToInteger",
+	AndByteString:            "andByteString",
+	OrByteString:             "orByteString",
+	XorByteString:            "xorByteString",
+	ComplementByteString:     "complementByteString",
+	ReadBit:                  "readBit",
+	WriteBits:                "writeBits",
+	ReplicateByte:            "replicateByte",
+	ShiftByteString:          "shiftByteString",
+	RotateByteString:         "rotateByteString",
+	CountSetBits:             "countSetBits",
+	FindFirstSetBit:          "findFirstSetBit",
+	Ripemd_160:               "ripemd_160",
+	// Batch 6
+	ExpModInteger: "expModInteger",
+	DropList:      "dropList",
+	// Arrays
+	LengthOfArray:               "lengthOfArray",
+	ListToArray:                 "listToArray",
+	IndexArray:                  "indexArray",
+	Bls12_381_G1_MultiScalarMul: "bls12_381_G1_multiScalarMul",
+	Bls12_381_G2_MultiScalarMul: "bls12_381_G2_multiScalarMul",
+	InsertCoin:                  "insertCoin",
+	LookupCoin:                  "lookupCoin",
+	UnionValue:                  "unionValue",
+	ValueContains:               "valueContains",
+	// Value/Data conversion
+	ValueData:       "valueData",
+	UnValueData:     "unValueData",
+	ScaleValue:      "scaleValue",
+	MultiIndexArray: "multiIndexArray",
+	Policies:        "policies",
+	AssetCount:      "assetCount",
+}
+
+func (f DefaultFunction) String() string {
+	return defaultFunctionToString[f]
+}
+
+// MinDefaultFunction is the smallest DefaultFunction tag value
+const MinDefaultFunction = 0
+
+// MaxDefaultFunction is the largest DefaultFunction tag value
+const MaxDefaultFunction = 103
+
+// TotalBuiltinCount is the total number of builtin functions
+const TotalBuiltinCount = MaxDefaultFunction + 1
+
+func FromByte(tag byte) (DefaultFunction, error) {
+	// only need to check if greater than because
+	// the lowest possible value for byte is zero anyways
+	if tag > MaxDefaultFunction {
+		return 0, fmt.Errorf("DefaultFunctionNotFound(%d)", tag)
+	}
+
+	return DefaultFunction(tag), nil
+}

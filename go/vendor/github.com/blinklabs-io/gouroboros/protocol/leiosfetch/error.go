@@ -1,0 +1,74 @@
+// Copyright 2026 Blink Labs Software
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package leiosfetch
+
+import "errors"
+
+// ErrBlockNotFound signals that a requested endorser block is not available.
+// A BlockRequestFunc callback may return it directly or wrapped. LeiosFetch
+// defines no not-found response, so the server propagates this error and ends
+// the connection. Callers can test for it with errors.Is.
+var ErrBlockNotFound = errors.New(
+	"endorser block not available",
+)
+
+// ErrBlockTxsNotFound signals that the requested endorser block transactions
+// are not available. A BlockTxsRequestFunc callback may return it directly or
+// wrapped. LeiosFetch defines no not-found response, so the server propagates
+// this error and ends the connection. Callers can test for it with errors.Is.
+var ErrBlockTxsNotFound = errors.New(
+	"endorser block transactions not available",
+)
+
+// ErrRequestSlotAbandoned signals that an earlier request on the same
+// leios-fetch connection timed out before its response arrived, and the peer
+// still had not answered after the bounded grace period. The connection cannot
+// safely issue another request until the protocol receives and discards the
+// late response, and the mini-protocol cannot even write one while the peer
+// holds agency, so the client fails the connection when it returns this error.
+// Callers should fail over to another connection.
+var ErrRequestSlotAbandoned = errors.New(
+	"leios-fetch request slot awaiting abandoned response",
+)
+
+// ErrBlockRangeResponseLimitExceeded signals that a BlockRangeRequest reply
+// stream exceeded the configured message-count or encoded-byte limit.
+var ErrBlockRangeResponseLimitExceeded = errors.New(
+	"leios-fetch block range response limit exceeded",
+)
+
+// ErrVoteRequestTooLarge signals that VotesRequest was asked for more than
+// MaxVotesPerMessage votes. The reply would carry one vote per ID, and a reply
+// above that count fails the whole connection, so the request is refused
+// before anything is sent. Callers should split the IDs across requests.
+var ErrVoteRequestTooLarge = errors.New(
+	"leios-fetch vote request exceeds the per-message vote limit",
+)
+
+// ErrInvalidBlockTxsBitmaps signals that BlockTxsRequest was given a bitmap
+// the reference node refuses while decoding the request: a key at or above
+// the number of bitmaps an endorser block can need, or a bitmap selecting no
+// transaction. Such a request fails the whole connection at the peer, so it is
+// refused before anything is sent.
+var ErrInvalidBlockTxsBitmaps = errors.New(
+	"leios-fetch block transactions request has an invalid bitmap",
+)
+
+// ErrUnexpectedResponse signals that a reply had the message type its state
+// allows but does not describe the request that is waiting for it. The client
+// fails the connection rather than delivering the reply.
+var ErrUnexpectedResponse = errors.New(
+	"leios-fetch response does not match the active request",
+)

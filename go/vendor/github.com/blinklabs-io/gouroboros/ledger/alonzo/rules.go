@@ -1,0 +1,1376 @@
+// Copyright 2026 Blink Labs Software
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package alonzo
+
+import (
+	"errors"
+	"math"
+	"math/big"
+
+	"github.com/blinklabs-io/gouroboros/cbor"
+	"github.com/blinklabs-io/gouroboros/ledger/allegra"
+	"github.com/blinklabs-io/gouroboros/ledger/common"
+	"github.com/blinklabs-io/gouroboros/ledger/common/script"
+	"github.com/blinklabs-io/gouroboros/ledger/mary"
+	"github.com/blinklabs-io/gouroboros/ledger/shelley"
+)
+
+var utxoValidationRuleDescriptors = []common.UtxoValidationRuleDescriptor{
+	{Id: common.UtxoValidationRuleMetadata, Validator: UtxoValidateMetadata},
+	{
+		Id:        common.UtxoValidationRuleIsValidFlag,
+		Validator: UtxoValidateIsValidFlag,
+	},
+	{
+		Id:        common.UtxoValidationRuleRequiredVKeyWitnesses,
+		Validator: UtxoValidateRequiredVKeyWitnesses,
+	},
+	{
+		Id:        common.UtxoValidationRuleSignatures,
+		Validator: UtxoValidateSignatures,
+	},
+	{
+		Id:        common.UtxoValidationRuleProtocolParameterUpdates,
+		Validator: UtxoValidateProtocolParameterUpdates,
+	},
+	{
+		Id:        common.UtxoValidationRuleCollateralVKeyWitnesses,
+		Validator: UtxoValidateCollateralVKeyWitnesses,
+	},
+	{
+		Id:        common.UtxoValidationRuleCollateralKeyLocked,
+		Validator: common.UtxoValidateCollateralKeyLocked,
+	},
+	{
+		Id:        common.UtxoValidationRuleRedeemerAndScriptWitnesses,
+		Validator: UtxoValidateRedeemerAndScriptWitnesses,
+	},
+	{
+		Id:        common.UtxoValidationRuleCostModelsPresent,
+		Validator: UtxoValidateCostModelsPresent,
+	},
+	{
+		Id:        common.UtxoValidationRuleScriptDataHash,
+		Validator: UtxoValidateScriptDataHash,
+	},
+	{
+		Id:        common.UtxoValidationRuleSupplementalDatums,
+		Validator: UtxoValidateSupplementalDatums,
+	},
+	{
+		Id:        common.UtxoValidationRuleOutsideValidityInterval,
+		Validator: UtxoValidateOutsideValidityIntervalUtxo,
+	},
+	{
+		Id:        common.UtxoValidationRuleOutsideForecast,
+		Validator: common.UtxoValidateOutsideForecast,
+	},
+	{
+		Id:        common.UtxoValidationRuleInputSetEmpty,
+		Validator: UtxoValidateInputSetEmptyUtxo,
+	},
+	{
+		Id:        common.UtxoValidationRuleNoDuplicateInputs,
+		Validator: UtxoValidateNoDuplicateInputs,
+	},
+	{
+		Id:        common.UtxoValidationRuleFeeTooSmall,
+		Validator: UtxoValidateFeeTooSmallUtxo,
+	},
+	{
+		Id:        common.UtxoValidationRuleInsufficientCollateral,
+		Validator: UtxoValidateInsufficientCollateral,
+	},
+	{
+		Id:        common.UtxoValidationRuleCollateralContainsNonAda,
+		Validator: UtxoValidateCollateralContainsNonAda,
+	},
+	{
+		Id:        common.UtxoValidationRuleNoCollateralInputs,
+		Validator: UtxoValidateNoCollateralInputs,
+	},
+	{
+		Id:        common.UtxoValidationRuleBadInputs,
+		Validator: UtxoValidateBadInputsUtxo,
+	},
+	{
+		Id:        common.UtxoValidationRuleScriptWitnesses,
+		Validator: UtxoValidateScriptWitnesses,
+	},
+	{
+		Id:        common.UtxoValidationRuleValueNotConserved,
+		Validator: UtxoValidateValueNotConservedUtxo,
+	},
+	{
+		Id:        common.UtxoValidationRuleOutputTooSmall,
+		Validator: UtxoValidateOutputTooSmallUtxo,
+	},
+	{
+		Id:        common.UtxoValidationRuleOutputTooBig,
+		Validator: UtxoValidateOutputTooBigUtxo,
+	},
+	{
+		Id:        common.UtxoValidationRuleOutputBootAddrAttrsTooBig,
+		Validator: UtxoValidateOutputBootAddrAttrsTooBig,
+	},
+	{
+		Id:        common.UtxoValidationRuleWrongNetwork,
+		Validator: UtxoValidateWrongNetwork,
+	},
+	{
+		Id:        common.UtxoValidationRuleWrongNetworkWithdrawal,
+		Validator: UtxoValidateWrongNetworkWithdrawal,
+	},
+	{
+		Id:        common.UtxoValidationRuleTransactionNetworkId,
+		Validator: UtxoValidateTransactionNetworkId,
+	},
+	{
+		Id:        common.UtxoValidationRuleMaxTxSize,
+		Validator: UtxoValidateMaxTxSizeUtxo,
+	},
+	{
+		Id:        common.UtxoValidationRuleExUnitsTooBig,
+		Validator: UtxoValidateExUnitsTooBigUtxo,
+	},
+	{
+		Id:        common.UtxoValidationRuleNativeScripts,
+		Validator: UtxoValidateNativeScripts,
+	},
+	{
+		Id:        common.UtxoValidationRuleExtraneousRedeemers,
+		Validator: UtxoValidateExtraneousRedeemers,
+	},
+	{
+		Id:        common.UtxoValidationRuleMalformedReferenceScripts,
+		Validator: UtxoValidateMalformedReferenceScripts,
+	},
+	{
+		Id:        common.UtxoValidationRulePlutusScripts,
+		Validator: UtxoValidatePlutusScripts,
+	},
+	{
+		Id:        common.UtxoValidationRuleDelegation,
+		Validator: UtxoValidateDelegation,
+	},
+	{
+		Id:        common.UtxoValidationRuleMIRGenesisQuorum,
+		Validator: UtxoValidateMIRGenesisQuorum,
+	},
+	{
+		Id:        common.UtxoValidationRuleWithdrawals,
+		Validator: UtxoValidateWithdrawals,
+	},
+	{
+		Id:        common.UtxoValidationRulePoolCertificates,
+		Validator: UtxoValidatePoolCertificates,
+	},
+}
+
+// UtxoValidationRuleDescriptors returns the authoritative ordered rule
+// descriptors. The returned slice is a defensive copy and may be modified by
+// callers without changing package state.
+func UtxoValidationRuleDescriptors() []common.UtxoValidationRuleDescriptor {
+	return append(
+		[]common.UtxoValidationRuleDescriptor(nil),
+		utxoValidationRuleDescriptors...,
+	)
+}
+
+// UtxoValidationRules is initialized from the authoritative descriptors. It
+// remains mutable for compatibility; mutations are not reflected by
+// UtxoValidationRuleDescriptors.
+var UtxoValidationRules = common.ComposeUtxoValidationRules(
+	common.AlwaysUtxoValidationRules(
+		UtxoValidateMetadata, UtxoValidateIsValidFlag, UtxoValidateRequiredVKeyWitnesses,
+		UtxoValidateSignatures, UtxoValidateProtocolParameterUpdates,
+		UtxoValidateCollateralVKeyWitnesses,
+		common.UtxoValidateCollateralKeyLocked,
+	),
+	common.AlwaysUtxoValidationRules(
+		UtxoValidateRedeemerAndScriptWitnesses, UtxoValidateCostModelsPresent,
+		UtxoValidateScriptDataHash, UtxoValidateSupplementalDatums,
+		UtxoValidateOutsideValidityIntervalUtxo, common.UtxoValidateOutsideForecast,
+		UtxoValidateInputSetEmptyUtxo, UtxoValidateNoDuplicateInputs,
+		UtxoValidateFeeTooSmallUtxo, UtxoValidateInsufficientCollateral,
+		UtxoValidateCollateralContainsNonAda, UtxoValidateNoCollateralInputs,
+		UtxoValidateBadInputsUtxo, UtxoValidateScriptWitnesses, UtxoValidateValueNotConservedUtxo,
+		UtxoValidateOutputTooSmallUtxo, UtxoValidateOutputTooBigUtxo,
+		UtxoValidateOutputBootAddrAttrsTooBig, UtxoValidateWrongNetwork,
+		UtxoValidateWrongNetworkWithdrawal, UtxoValidateTransactionNetworkId,
+		UtxoValidateMaxTxSizeUtxo,
+		UtxoValidateExUnitsTooBigUtxo, UtxoValidateNativeScripts,
+		UtxoValidateExtraneousRedeemers, UtxoValidateMalformedReferenceScripts,
+		UtxoValidatePlutusScripts,
+	),
+	common.Phase2ValidUtxoValidationRules(
+		UtxoValidateDelegation, UtxoValidateMIRGenesisQuorum,
+		UtxoValidateWithdrawals, UtxoValidatePoolCertificates,
+	),
+)
+
+// UtxoValidateOutputTooBigUtxo ensures that transaction output values are not too large
+func UtxoValidateOutputTooBigUtxo(
+	tx common.Transaction,
+	slot uint64,
+	_ common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	tmpPparams, ok := pp.(*AlonzoProtocolParameters)
+	if !ok {
+		return errors.New("pparams are not expected type")
+	}
+	badOutputs := []common.TransactionOutput{}
+	for _, txOutput := range tx.Outputs() {
+		tmpOutput, ok := txOutput.(*AlonzoTransactionOutput)
+		if !ok {
+			return errors.New("transaction output is not expected type")
+		}
+		outputValSize, err := tmpOutput.OutputAmount.LedgerSerializedSize()
+		if err != nil {
+			return err
+		}
+		if uint(outputValSize) <= tmpPparams.MaxValueSize {
+			continue
+		}
+		badOutputs = append(badOutputs, tmpOutput)
+	}
+	if len(badOutputs) == 0 {
+		return nil
+	}
+	return mary.OutputTooBigUtxoError{
+		Outputs: badOutputs,
+	}
+}
+
+// UtxoValidateExUnitsTooBigUtxo ensures that ExUnits for a transaction do not exceed the maximum specified via protocol parameters
+func UtxoValidateExUnitsTooBigUtxo(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	tmpPparams, ok := pp.(*AlonzoProtocolParameters)
+	if !ok {
+		return errors.New("pparams are not expected type")
+	}
+	tmpTx, ok := tx.(*AlonzoTransaction)
+	if !ok {
+		return errors.New("transaction is not expected type")
+	}
+	// Iterate the collapsed view rather than the raw list. The wire format is
+	// a list but the ledger holds a map, so a key appearing more than once
+	// contributes its budget once. Summing the raw list multiplies it by the
+	// number of copies: on Preview, transaction 3ace3bc7f4c5… at slot 12925989
+	// carries the same (mint, 0) redeemer six times at 3322788/843448898, and
+	// summing all six gives 19936728 memory against a 14000000 cap, rejecting
+	// a transaction the network accepted (blinklabs-io/dingo#3875).
+	//
+	// The raw list is still the right thing for the script data hash, which has
+	// to reproduce the bytes as they were signed.
+	var totalSteps, totalMemory int64
+	for _, redeemer := range tmpTx.WitnessSet.WsRedeemers.Iter() {
+		newSteps, ok := common.AddInt64Checked(
+			totalSteps,
+			redeemer.ExUnits.Steps,
+		)
+		if !ok {
+			return ExUnitsTooBigUtxoError{
+				TotalExUnits: common.ExUnits{
+					Memory: totalMemory,
+					Steps:  totalSteps,
+				},
+				MaxTxExUnits: tmpPparams.MaxTxExUnits,
+			}
+		}
+		totalSteps = newSteps
+		newMemory, ok := common.AddInt64Checked(
+			totalMemory,
+			redeemer.ExUnits.Memory,
+		)
+		if !ok {
+			return ExUnitsTooBigUtxoError{
+				TotalExUnits: common.ExUnits{
+					Memory: totalMemory,
+					Steps:  totalSteps,
+				},
+				MaxTxExUnits: tmpPparams.MaxTxExUnits,
+			}
+		}
+		totalMemory = newMemory
+	}
+	if totalSteps <= tmpPparams.MaxTxExUnits.Steps &&
+		totalMemory <= tmpPparams.MaxTxExUnits.Memory {
+		return nil
+	}
+	return ExUnitsTooBigUtxoError{
+		TotalExUnits: common.ExUnits{
+			Memory: totalMemory,
+			Steps:  totalSteps,
+		},
+		MaxTxExUnits: tmpPparams.MaxTxExUnits,
+	}
+}
+
+func UtxoValidatePlutusScripts(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	params, ok := pp.(*AlonzoProtocolParameters)
+	if !ok {
+		return errors.New("pparams are not expected type")
+	}
+	_, err := script.EvaluatePlutusScripts(
+		tx,
+		ls,
+		params.ProtocolMajor,
+		params.CostModels,
+		1,
+		EraNameAlonzo,
+		nil,
+	)
+	return common.ValidatePlutusScriptResult(tx, err)
+}
+
+// UtxoValidateMalformedReferenceScripts checks that Plutus witnesses are
+// well-formed for the active protocol version before phase-2 execution.
+func UtxoValidateMalformedReferenceScripts(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	params, ok := pp.(*AlonzoProtocolParameters)
+	if !ok {
+		return errors.New("pparams are not expected type")
+	}
+	return common.ValidatePlutusScriptsWellFormed(tx, params.ProtocolMajor)
+}
+
+// UtxoValidateSupplementalDatums enforces required and supplemental datum
+// rules for Alonzo transactions.
+func UtxoValidateSupplementalDatums(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	if err := common.ValidateRequiredSpendingDatums(tx, ls); err != nil {
+		return err
+	}
+	return common.ValidateSupplementalDatums(tx, ls)
+}
+
+// UtxoValidateExtraneousRedeemers checks that all redeemers have valid
+// purposes: a spending redeemer's index must reference an existing input,
+// a minting redeemer an existing mint policy, a certifying redeemer an
+// existing certificate, and a reward redeemer an existing withdrawal.
+// Alonzo predates governance, so voting/proposing/guarding redeemer tags
+// are always extraneous here.
+func UtxoValidateExtraneousRedeemers(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	return common.ValidateExactExtraneousRedeemers(tx, ls)
+}
+
+func UtxoValidateOutsideValidityIntervalUtxo(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	return allegra.UtxoValidateOutsideValidityIntervalUtxo(tx, slot, ls, pp)
+}
+
+// UtxoValidateIsValidFlag ensures transactions marked invalid have Plutus scripts
+func UtxoValidateIsValidFlag(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	// If IsValid is true, no check needed
+	if tx.IsValid() {
+		return nil
+	}
+
+	// If IsValid is false, transaction must have redeemers (indicating phase-2 validation)
+	w := tx.Witnesses()
+	if w != nil && w.Redeemers() != nil {
+		for range w.Redeemers().Iter() {
+			// Has at least one redeemer
+			return nil
+		}
+	}
+
+	// IsValid=false but no redeemers present
+	return common.InvalidIsValidFlagError{}
+}
+
+// UtxoValidateRequiredVKeyWitnesses ensures required signers are accompanied by vkey witnesses
+func UtxoValidateRequiredVKeyWitnesses(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	return common.ValidateRequiredVKeyWitnesses(tx)
+}
+
+func UtxoValidateProtocolParameterUpdates(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	return shelley.UtxoValidateProtocolParameterUpdates(tx, slot, ls, pp)
+}
+
+// UtxoValidateCollateralVKeyWitnesses ensures collateral inputs are backed by vkey witnesses
+func UtxoValidateCollateralVKeyWitnesses(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	return common.ValidateCollateralVKeyWitnesses(tx, ls)
+}
+
+// UtxoValidateRedeemerAndScriptWitnesses performs lightweight UTXOW checks for presence/absence of scripts vs redeemers
+func UtxoValidateRedeemerAndScriptWitnesses(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	return common.ValidateRedeemerAndScriptWitnesses(tx, ls)
+}
+
+// UtxoValidateCostModelsPresent ensures Plutus scripts have cost models in protocol parameters
+func UtxoValidateCostModelsPresent(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	tmpPparams, ok := pp.(*AlonzoProtocolParameters)
+	if !ok {
+		return errors.New("pparams are not expected type")
+	}
+	required, err := common.UsedPlutusVersions(tx, ls)
+	if err != nil {
+		return err
+	}
+
+	if len(required) == 0 {
+		return nil
+	}
+
+	for version := range required {
+		model, ok := tmpPparams.CostModels[version]
+		if !ok || len(model) == 0 {
+			return common.MissingCostModelError{Version: version}
+		}
+	}
+
+	return nil
+}
+
+func UtxoValidateInputSetEmptyUtxo(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	return shelley.UtxoValidateInputSetEmptyUtxo(tx, slot, ls, pp)
+}
+
+func UtxoValidateNoDuplicateInputs(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	return shelley.UtxoValidateNoDuplicateInputs(tx, slot, ls, pp)
+}
+
+// UtxoValidateSignatures verifies vkey and bootstrap signatures present in the transaction.
+func UtxoValidateSignatures(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	return common.UtxoValidateSignatures(tx, slot, ls, pp)
+}
+
+func UtxoValidateFeeTooSmallUtxo(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	minFee, err := MinFeeTx(tx, pp)
+	if err != nil {
+		return err
+	}
+	minFeeBigInt := new(big.Int).SetUint64(minFee)
+	fee := tx.Fee()
+	if fee == nil {
+		fee = new(big.Int)
+	}
+	if fee.Cmp(minFeeBigInt) >= 0 {
+		return nil
+	}
+	return shelley.FeeTooSmallUtxoError{
+		Provided: fee,
+		Min:      minFeeBigInt,
+	}
+}
+
+// ValidateInsufficientCollateral applies the Alonzo collateral balance rule,
+// which every later era inherits unchanged.
+//
+// The comparison is cross-multiplied, balance * 100 >= fee * collateralPercent,
+// rather than dividing the requirement by 100: dividing truncates, which
+// accepts a balance one lovelace below the true requirement whenever
+// fee * collateralPercent is not a multiple of 100. The amount reported on
+// failure is the corresponding ceiling. Both totalCollateral and fee are
+// non-negative, so the ceiling can be taken by adding 99 before dividing.
+//
+// Reference: validateInsufficientCollateral in
+// eras/alonzo/impl/src/Cardano/Ledger/Alonzo/Rules/Utxo.hs, which tests
+// `Val.scale 100 bal >= Val.scale collPerc (toDeltaCoin txfee)` and reports
+// `rationalToCoinViaCeiling ((collPerc * txfee) %. 100)`.
+func ValidateInsufficientCollateral(
+	totalCollateral *big.Int,
+	fee *big.Int,
+	collateralPercentage uint,
+) error {
+	scaledCollateral := new(big.Int).Mul(totalCollateral, big.NewInt(100))
+	scaledFee := new(big.Int).Mul(
+		fee,
+		new(big.Int).SetUint64(uint64(collateralPercentage)),
+	)
+	if scaledCollateral.Cmp(scaledFee) >= 0 {
+		return nil
+	}
+	required := new(big.Int).Add(scaledFee, big.NewInt(99))
+	required.Div(required, big.NewInt(100))
+	// Convert to uint64 for error struct (best effort)
+	var providedU, requiredU uint64
+	if totalCollateral.IsUint64() {
+		providedU = totalCollateral.Uint64()
+	}
+	if required.IsUint64() {
+		requiredU = required.Uint64()
+	}
+	return InsufficientCollateralError{
+		Provided: providedU,
+		Required: requiredU,
+	}
+}
+
+// UtxoValidateInsufficientCollateral ensures that there is sufficient collateral provided
+func UtxoValidateInsufficientCollateral(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	tmpPparams, ok := pp.(*AlonzoProtocolParameters)
+	if !ok {
+		return errors.New("pparams are not expected type")
+	}
+	tmpTx, ok := tx.(*AlonzoTransaction)
+	if !ok {
+		return errors.New("transaction is not expected type")
+	}
+	// There's nothing to check if there are no redeemers
+	if len(tmpTx.WitnessSet.WsRedeemers.Redeemers) == 0 {
+		return nil
+	}
+	totalCollateral := new(big.Int)
+	for _, collateralInput := range tx.Collateral() {
+		utxo, err := common.ResolveInputUtxo(ls, collateralInput)
+		if err != nil {
+			return err
+		}
+		if amount := utxo.Output.Amount(); amount != nil {
+			totalCollateral.Add(totalCollateral, amount)
+		}
+	}
+	fee := tmpTx.Fee()
+	if fee == nil {
+		fee = new(big.Int)
+	}
+	return ValidateInsufficientCollateral(
+		totalCollateral,
+		fee,
+		tmpPparams.CollateralPercentage,
+	)
+}
+
+// UtxoValidateCollateralContainsNonAda ensures that collateral inputs don't contain non-ADA
+func UtxoValidateCollateralContainsNonAda(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	tmpTx, ok := tx.(*AlonzoTransaction)
+	if !ok {
+		return errors.New("transaction is not expected type")
+	}
+	// There's nothing to check if there are no redeemers
+	if len(tmpTx.WitnessSet.WsRedeemers.Redeemers) == 0 {
+		return nil
+	}
+	badOutputs := []common.TransactionOutput{}
+	totalCollateral := new(big.Int)
+	for _, collateralInput := range tx.Collateral() {
+		utxo, err := common.ResolveInputUtxo(ls, collateralInput)
+		if err != nil {
+			return err
+		}
+		if amount := utxo.Output.Amount(); amount != nil {
+			totalCollateral.Add(totalCollateral, amount)
+		}
+		if utxo.Output.Assets() == nil {
+			continue
+		}
+		badOutputs = append(badOutputs, utxo.Output)
+	}
+	if len(badOutputs) == 0 {
+		return nil
+	}
+	var providedU uint64
+	if totalCollateral.IsUint64() {
+		providedU = totalCollateral.Uint64()
+	}
+	return CollateralContainsNonAdaError{
+		Provided: providedU,
+	}
+}
+
+// UtxoValidateNoCollateralInputs ensures that collateral inputs are provided when redeemers are present
+func UtxoValidateNoCollateralInputs(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	tmpTx, ok := tx.(*AlonzoTransaction)
+	if !ok {
+		return errors.New("transaction is not expected type")
+	}
+	// There's nothing to check if there are no redeemers
+	if len(tmpTx.WitnessSet.WsRedeemers.Redeemers) == 0 {
+		return nil
+	}
+	if len(tx.Collateral()) > 0 {
+		return nil
+	}
+	return NoCollateralInputsError{}
+}
+
+func UtxoValidateBadInputsUtxo(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	return shelley.UtxoValidateBadInputsUtxo(tx, slot, ls, pp)
+}
+
+func UtxoValidateValueNotConservedUtxo(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	tmpPparams, ok := pp.(*AlonzoProtocolParameters)
+	if !ok {
+		return errors.New("pparams are not expected type")
+	}
+	// Calculate consumed value
+	// consumed = value from input(s) + withdrawals + refunds
+	consumedValue := new(big.Int)
+	for _, tmpInput := range tx.Inputs() {
+		tmpUtxo, err := ls.UtxoById(tmpInput)
+		// Ignore errors fetching the UTxO and exclude it from calculations
+		if err != nil {
+			continue
+		}
+		if amount := tmpUtxo.Output.Amount(); amount != nil {
+			consumedValue.Add(consumedValue, amount)
+		}
+	}
+	for _, tmpWithdrawalAmount := range tx.Withdrawals() {
+		if tmpWithdrawalAmount != nil {
+			consumedValue.Add(consumedValue, tmpWithdrawalAmount)
+		}
+	}
+	seenPoolRegistrations := make(map[common.PoolKeyHash]struct{})
+	stakeCertificateEffectsValid := tx.IsValid() ||
+		!common.TransactionRunsPhase2Scripts(tx)
+	type stakeCredentialKey struct {
+		credType uint
+		hash     string
+	}
+	keyForCredential := func(cred common.Credential) stakeCredentialKey {
+		return stakeCredentialKey{credType: cred.CredType, hash: string(cred.Credential[:])}
+	}
+	stakeRegistered := make(map[stakeCredentialKey]bool)
+	stakeDeposits := make(map[stakeCredentialKey]uint64)
+	if stakeCertificateEffectsValid {
+		for _, cert := range tx.Certificates() {
+			switch tmpCert := cert.(type) {
+			case *common.StakeDeregistrationCertificate:
+				cred := tmpCert.StakeCredential
+				key := keyForCredential(cred)
+				registered, ok := stakeRegistered[key]
+				if !ok {
+					registered = ls.IsStakeCredentialRegistered(cred)
+					if registered {
+						deposit, err := common.StakeCredentialDepositOrDefault(ls, cred, uint64(tmpPparams.KeyDeposit))
+						if err != nil {
+							return err
+						}
+						stakeDeposits[key] = deposit
+					}
+				}
+				if registered {
+					consumedValue.Add(consumedValue, new(big.Int).SetUint64(stakeDeposits[key]))
+					stakeRegistered[key] = false
+				}
+			case *common.StakeRegistrationCertificate:
+				key := keyForCredential(tmpCert.StakeCredential)
+				stakeRegistered[key] = true
+				stakeDeposits[key] = uint64(tmpPparams.KeyDeposit)
+				// Note: PoolRetirementCertificate does NOT refund the deposit as part of the transaction.
+				// Pool deposits are refunded to the reward account at the end of the retiring epoch.
+			}
+		}
+	}
+	// Calculate produced value
+	// produced = value from output(s) + fee + deposits
+	producedValue := new(big.Int)
+	for _, tmpOutput := range tx.Outputs() {
+		if amount := tmpOutput.Amount(); amount != nil {
+			producedValue.Add(producedValue, amount)
+		}
+	}
+	if fee := tx.Fee(); fee != nil {
+		producedValue.Add(producedValue, fee)
+	}
+	for _, cert := range tx.Certificates() {
+		switch tmpCert := cert.(type) {
+		case *common.PoolRegistrationCertificate:
+			operator := common.Blake2b224(tmpCert.Operator)
+			if _, seen := seenPoolRegistrations[operator]; seen {
+				continue
+			}
+			seenPoolRegistrations[operator] = struct{}{}
+			depositDue, err := common.PoolRegistrationDepositDue(
+				ls, slot, operator,
+			)
+			if err != nil {
+				return err
+			}
+			if depositDue {
+				producedValue.Add(producedValue, new(big.Int).SetUint64(uint64(tmpPparams.PoolDeposit)))
+			}
+		case *common.StakeRegistrationCertificate:
+			if stakeCertificateEffectsValid {
+				producedValue.Add(producedValue, new(big.Int).SetUint64(uint64(tmpPparams.KeyDeposit)))
+			}
+		}
+	}
+	if consumedValue.Cmp(producedValue) != 0 {
+		return shelley.ValueNotConservedUtxoError{
+			Consumed: consumedValue,
+			Produced: producedValue,
+		}
+	}
+
+	// Multi-asset value conservation check
+	// For each policy and asset: consumed + minted == produced
+	type assetKey struct {
+		policy common.Blake2b224
+		asset  string
+	}
+
+	consumedAssets := make(map[assetKey]*big.Int)
+	producedAssets := make(map[assetKey]*big.Int)
+
+	// Collect consumed multi-assets from inputs
+	for _, tmpInput := range tx.Inputs() {
+		tmpUtxo, err := ls.UtxoById(tmpInput)
+		if err != nil {
+			continue
+		}
+		if assets := tmpUtxo.Output.Assets(); assets != nil {
+			for _, policy := range assets.Policies() {
+				for _, assetName := range assets.Assets(policy) {
+					amount := assets.Asset(policy, assetName)
+					if amount == nil {
+						continue
+					}
+					key := assetKey{policy: policy, asset: string(assetName)}
+					if consumedAssets[key] == nil {
+						consumedAssets[key] = new(big.Int)
+					}
+					consumedAssets[key].Add(consumedAssets[key], amount)
+				}
+			}
+		}
+	}
+
+	// Add minted/burned assets to consumed (positive for mint, negative for burn)
+	if mint := tx.AssetMint(); mint != nil {
+		for _, policy := range mint.Policies() {
+			for _, assetName := range mint.Assets(policy) {
+				if policy == (common.Blake2b224{}) && len(assetName) == 0 {
+					continue
+				}
+				amount := mint.Asset(policy, assetName)
+				if amount == nil {
+					continue
+				}
+				key := assetKey{policy: policy, asset: string(assetName)}
+				if consumedAssets[key] == nil {
+					consumedAssets[key] = new(big.Int)
+				}
+				consumedAssets[key].Add(consumedAssets[key], amount)
+			}
+		}
+	}
+
+	// Collect produced multi-assets from outputs
+	for _, tmpOutput := range tx.Outputs() {
+		if assets := tmpOutput.Assets(); assets != nil {
+			for _, policy := range assets.Policies() {
+				for _, assetName := range assets.Assets(policy) {
+					amount := assets.Asset(policy, assetName)
+					if amount == nil {
+						continue
+					}
+					key := assetKey{policy: policy, asset: string(assetName)}
+					if producedAssets[key] == nil {
+						producedAssets[key] = new(big.Int)
+					}
+					producedAssets[key].Add(producedAssets[key], amount)
+				}
+			}
+		}
+	}
+
+	// Check that all consumed assets match produced assets without building
+	// an intermediate union set of keys.
+	zero := new(big.Int)
+	for key, consumed := range consumedAssets {
+		produced := producedAssets[key]
+		if produced == nil {
+			produced = zero
+		}
+		if consumed.Cmp(produced) != 0 {
+			return shelley.ValueNotConservedUtxoError{
+				Consumed: consumed,
+				Produced: produced,
+			}
+		}
+		delete(producedAssets, key)
+	}
+	for _, produced := range producedAssets {
+		if produced.Cmp(zero) != 0 {
+			return shelley.ValueNotConservedUtxoError{
+				Consumed: zero,
+				Produced: produced,
+			}
+		}
+	}
+
+	return nil
+}
+
+func UtxoValidateOutputTooSmallUtxo(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	var badOutputs []common.TransactionOutput
+	for _, tmpOutput := range tx.Outputs() {
+		minCoin, err := MinCoinTxOut(tmpOutput, pp)
+		if err != nil {
+			return err
+		}
+		minCoinBig := new(big.Int).SetUint64(minCoin)
+		amount := tmpOutput.Amount()
+		if amount == nil {
+			amount = new(big.Int)
+		}
+		if amount.Cmp(minCoinBig) < 0 {
+			badOutputs = append(badOutputs, tmpOutput)
+		}
+	}
+	if len(badOutputs) == 0 {
+		return nil
+	}
+	return shelley.OutputTooSmallUtxoError{
+		Outputs: badOutputs,
+	}
+}
+
+func UtxoValidateOutputBootAddrAttrsTooBig(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	return shelley.UtxoValidateOutputBootAddrAttrsTooBig(tx, slot, ls, pp)
+}
+
+func UtxoValidateWrongNetwork(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	return shelley.UtxoValidateWrongNetwork(tx, slot, ls, pp)
+}
+
+func UtxoValidateWrongNetworkWithdrawal(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	return shelley.UtxoValidateWrongNetworkWithdrawal(tx, slot, ls, pp)
+}
+
+// UtxoValidateTransactionNetworkId validates a present transaction network
+// identifier against the active ledger network. An absent identifier retains
+// the Alonzo-era behavior and is accepted.
+func UtxoValidateTransactionNetworkId(
+	tx common.Transaction,
+	_ uint64,
+	ls common.LedgerState,
+	_ common.ProtocolParameters,
+) error {
+	txWithNetworkId, ok := tx.(interface{ TransactionNetworkId() *uint8 })
+	if !ok {
+		return errors.New("transaction does not expose a network identifier")
+	}
+	txNetworkId := txWithNetworkId.TransactionNetworkId()
+	if txNetworkId == nil || uint(*txNetworkId) == ls.NetworkId() {
+		return nil
+	}
+	return common.WrongTransactionNetworkIdError{
+		TxNetworkId:     *txNetworkId,
+		LedgerNetworkId: ls.NetworkId(),
+	}
+}
+
+func UtxoValidateMaxTxSizeUtxo(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	tmpPparams, ok := pp.(*AlonzoProtocolParameters)
+	if !ok {
+		return errors.New("pparams are not expected type")
+	}
+	txSize, sizeErr := common.TxSize(tx)
+	if sizeErr != nil {
+		return sizeErr
+	}
+	if uint(txSize) <= tmpPparams.MaxTxSize {
+		return nil
+	}
+	return shelley.MaxTxSizeUtxoError{
+		TxSize:    uint(txSize),
+		MaxTxSize: tmpPparams.MaxTxSize,
+	}
+}
+
+// MinFeeTx calculates the minimum required fee for a transaction based on
+// protocol parameters. The fee-relevant transaction size is determined by
+// common.TxSizeForFee, which uses the original on-wire CBOR length and
+// subtracts 1 byte for Alonzo+ eras (the IsValid boolean is excluded from
+// the fee computation per the Cardano ledger spec toCBORForSizeComputation).
+func MinFeeTx(
+	tx common.Transaction,
+	pparams common.ProtocolParameters,
+) (uint64, error) {
+	tmpPparams, ok := pparams.(*AlonzoProtocolParameters)
+	if !ok {
+		return 0, errors.New("pparams are not expected type")
+	}
+	txSize, err := common.TxSizeForFee(tx)
+	if err != nil {
+		return 0, err
+	}
+	minFee, err := common.CalculateMinFee(
+		txSize,
+		tmpPparams.MinFeeA,
+		tmpPparams.MinFeeB,
+	)
+	if err != nil {
+		return 0, err
+	}
+	executionFee, err := common.CalculateExecutionUnitsFee(
+		tx,
+		tmpPparams.ExecutionCosts,
+	)
+	if err != nil {
+		return 0, err
+	}
+	if minFee > math.MaxUint64-executionFee {
+		return 0, errors.New("minimum transaction fee overflow")
+	}
+	return minFee + executionFee, nil
+}
+
+// Alonzo prices a UTxO entry by an estimate of its in-memory size in 8-byte
+// words rather than by its serialized length, so these constants are heap-word
+// estimates and are not derived from the CBOR encoding.
+//
+// Reference: utxoEntrySize and getMinCoinTxOut in
+// eras/alonzo/impl/src/Cardano/Ledger/Alonzo/TxOut.hs, and Val.size for
+// MaryValue in eras/mary/impl/src/Cardano/Ledger/Mary/Value.hs.
+const (
+	// alonzoUtxoEntrySizeWithoutVal is 6 + txoutLenNoVal(14) + txinLen(7).
+	alonzoUtxoEntrySizeWithoutVal = 27
+	// alonzoAdaOnlyValueSize is Val.size for a value holding only ada.
+	alonzoAdaOnlyValueSize = 2
+	// alonzoDataHashSize is dataHashSize for an output with a datum hash.
+	alonzoDataHashSize = 10
+	// alonzoValueRepOverhead is repOverhead: 4 + adaWords(1) +
+	// numberMulAssets(1).
+	alonzoValueRepOverhead = 6
+	// alonzoWordLength is the word size the estimate is expressed in.
+	alonzoWordLength = 8
+	// alonzoPolicyIdSize is the ADDRHASH length used by representationSize.
+	alonzoPolicyIdSize = 28
+	// alonzoAssetTripleSize is the abcRegion cost of one (policy, name,
+	// quantity) triple.
+	alonzoAssetTripleSize = 12
+)
+
+// alonzoValueSize implements Val.size for a Mary value in the Alonzo era.
+//
+// The ada-only branch returns 2, which the reference flags as wrong for Mary
+// itself and correct only from Alonzo onwards; do not reuse it for Mary.
+func alonzoValueSize(
+	assets *common.MultiAsset[common.MultiAssetTypeOutput],
+) uint64 {
+	if assets == nil {
+		return alonzoAdaOnlyValueSize
+	}
+	numAssets := 0
+	numPolicies := 0
+	assetNames := make(map[string]struct{})
+	for _, policyId := range assets.Policies() {
+		names := assets.Assets(policyId)
+		if len(names) == 0 {
+			// representationSize counts policy IDs appearing in the
+			// flattened triples, so a policy with no assets contributes
+			// nothing.
+			continue
+		}
+		numPolicies++
+		for _, name := range names {
+			numAssets++
+			assetNames[string(name)] = struct{}{}
+		}
+	}
+	if numAssets == 0 && len(assets.Policies()) == 0 {
+		return alonzoAdaOnlyValueSize
+	}
+	nameBytes := 0
+	for name := range assetNames {
+		nameBytes += len(name)
+	}
+	repSize := numAssets*alonzoAssetTripleSize +
+		numPolicies*alonzoPolicyIdSize +
+		nameBytes
+	words := (repSize + alonzoWordLength - 1) / alonzoWordLength
+	return uint64(words + alonzoValueRepOverhead) // #nosec G115
+}
+
+// alonzoUtxoEntrySize implements utxoEntrySize, the Alonzo estimate of the
+// size of one UTxO entry in 8-byte words.
+func alonzoUtxoEntrySize(txOut common.TransactionOutput) uint64 {
+	ret := uint64(alonzoUtxoEntrySizeWithoutVal)
+	ret += alonzoValueSize(txOut.Assets())
+	if txOut.DatumHash() != nil {
+		ret += alonzoDataHashSize
+	}
+	return ret
+}
+
+// MinCoinTxOut calculates the minimum coin for a transaction output.
+//
+// Alonzo replaced the flat Shelley minUTxOValue with a size-based price:
+// utxoEntrySize(txOut) * coinsPerUTxOWord.
+func MinCoinTxOut(
+	txOut common.TransactionOutput,
+	pparams common.ProtocolParameters,
+) (uint64, error) {
+	tmpPparams, ok := pparams.(*AlonzoProtocolParameters)
+	if !ok {
+		return 0, errors.New("pparams are not expected type")
+	}
+	entrySize := alonzoUtxoEntrySize(txOut)
+	if tmpPparams.AdaPerUtxoByte != 0 &&
+		entrySize > math.MaxUint64/tmpPparams.AdaPerUtxoByte {
+		return 0, errors.New("minimum UTxO value overflow")
+	}
+	return entrySize * tmpPparams.AdaPerUtxoByte, nil
+}
+
+func UtxoValidateMetadata(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	if err := shelley.UtxoValidateMetadata(tx, slot, ls, pp); err != nil {
+		return err
+	}
+	params, ok := pp.(*AlonzoProtocolParameters)
+	if !ok {
+		return errors.New("pparams are not expected type")
+	}
+	return common.ValidateAuxiliaryDataScriptsWellFormed(
+		tx,
+		params.ProtocolMajor,
+	)
+}
+
+func UtxoValidateDelegation(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	return shelley.UtxoValidateDelegation(tx, slot, ls, pp)
+}
+
+// UtxoValidateScriptWitnesses checks that script witnesses are provided for all script address inputs.
+func UtxoValidateScriptWitnesses(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	return common.ValidateScriptWitnesses(tx, ls)
+}
+
+// UtxoValidateNativeScripts evaluates native scripts in the transaction.
+func UtxoValidateNativeScripts(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	return mary.UtxoValidateNativeScripts(tx, slot, ls, pp)
+}
+
+// UtxoValidateWithdrawals validates withdrawals against ledger state.
+// For phase-2 invalid transactions (IsValid=false), withdrawal validation is
+// skipped since their effects are reverted and only collateral rules apply.
+func UtxoValidateWithdrawals(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	if !tx.IsValid() {
+		return nil
+	}
+	return shelley.UtxoValidateWithdrawals(tx, slot, ls, pp)
+}
+
+// UtxoValidateScriptDataHash validates the transaction's ScriptDataHash against the expected hash
+// computed from redeemers, datums, and cost models (language views).
+// Alonzo only supports PlutusV1 scripts.
+func UtxoValidateScriptDataHash(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	tmpPparams, ok := pp.(*AlonzoProtocolParameters)
+	if !ok {
+		return errors.New("pparams are not expected type")
+	}
+	tmpTx, ok := tx.(*AlonzoTransaction)
+	if !ok {
+		return errors.New("transaction is not expected type")
+	}
+
+	wits := tmpTx.WitnessSet
+	hasRedeemers := len(wits.WsRedeemers.Redeemers) > 0
+	hasDatums := len(wits.WsPlutusData.Items) > 0
+
+	declaredHash := tx.ScriptDataHash()
+
+	// ScriptDataHash is required only when the transaction has redeemers or
+	// witness datums, indicating actual script execution.
+	if !hasRedeemers && !hasDatums {
+		if declaredHash != nil {
+			return common.ExtraneousScriptDataHashError{Provided: *declaredHash}
+		}
+		return nil
+	}
+
+	if declaredHash == nil {
+		return common.MissingScriptDataHashError{}
+	}
+
+	// The language views cover the Plutus scripts some script purpose of this
+	// transaction requires, not every script the witness set carries. A
+	// witnessed script no purpose needs adds a view the producer did not, so
+	// the hash comes out different and a canonical transaction is rejected
+	// (gouroboros #2188). Alonzo has no reference scripts, so the witness set
+	// is the only source, but the needed-versus-provided distinction is the
+	// same one cardano-ledger draws.
+	view, err := script.NewTxScriptView(tx, ls)
+	if err != nil {
+		if errors.Is(err, common.ErrInputResolution) {
+			// A spent input that does not resolve is reported by
+			// UtxoValidateBadInputsUtxo, which runs on every transaction in
+			// this same rule list. Reporting it from here would change which
+			// error an invalid transaction produces, and this rule is
+			// registered ahead of that one. A reference input that does not
+			// resolve has no such dedicated rule, so it still surfaces here.
+			return nil
+		}
+		return err
+	}
+	usedVersions := view.UsedPlutusVersions()
+
+	// Verify cost models are present for all used Plutus versions
+	for version := range usedVersions {
+		if _, ok := tmpPparams.CostModels[version]; !ok {
+			return common.MissingCostModelError{Version: version}
+		}
+	}
+
+	// Compute the expected ScriptDataHash
+	// ScriptDataHash = blake2b256(redeemers_cbor || datums_cbor || langviews_cbor)
+	//
+	// Use preserved CBOR bytes from the original transaction for exact byte-for-byte match.
+	// The hash was computed by the original submitter using their CBOR encoding.
+
+	redeemersCbor := wits.WsRedeemers.Cbor()
+	if len(redeemersCbor) == 0 {
+		// Fall back to re-encoding if no preserved CBOR
+		// Note: Must encode empty slice explicitly, as nil encodes as 0xf6 (CBOR null)
+		// but the spec expects 0x80 (empty array) for empty redeemers
+		var err error
+		if wits.WsRedeemers.Redeemers == nil {
+			redeemersCbor, err = cbor.Encode([]AlonzoRedeemer{})
+		} else {
+			redeemersCbor, err = cbor.Encode(wits.WsRedeemers.Redeemers)
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	// Get datums CBOR using preserved bytes (only if non-empty)
+	var datumsCbor []byte
+	if hasDatums {
+		datumsCbor = wits.WsPlutusData.Cbor()
+		if len(datumsCbor) == 0 {
+			// Fall back to re-encoding if no preserved CBOR
+			var err error
+			datumsCbor, err = cbor.Encode(wits.WsPlutusData.Items)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	// Encode language views per the Cardano spec
+	langViewsCbor, err := common.EncodeLangViews(
+		usedVersions,
+		tmpPparams.CostModels,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Concatenate and hash
+	hashInput := make(
+		[]byte,
+		0,
+		len(redeemersCbor)+len(datumsCbor)+len(langViewsCbor),
+	)
+	hashInput = append(hashInput, redeemersCbor...)
+	hashInput = append(hashInput, datumsCbor...)
+	hashInput = append(hashInput, langViewsCbor...)
+
+	computedHash := common.Blake2b256Hash(hashInput)
+
+	// Compare with declared hash (nil check for static analysis - logically unreachable)
+	if declaredHash == nil {
+		return common.MissingScriptDataHashError{}
+	}
+	if *declaredHash != computedHash {
+		return common.ScriptDataHashMismatchError{
+			Declared: *declaredHash,
+			Computed: computedHash,
+		}
+	}
+
+	return nil
+}
+
+// UtxoValidatePoolCertificates applies the Shelley POOL rule, which this era
+// inherits unchanged.
+//
+// Reference: eras/alonzo/impl/src/Cardano/Ledger/Alonzo/Rules/Pool.hs declares
+// only the EraRuleFailure and EraRuleEvent instances and reuses
+// Shelley.poolTransition.
+func UtxoValidatePoolCertificates(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	return shelley.UtxoValidatePoolCertificates(tx, slot, ls, pp)
+}
+
+// UtxoValidateMIRGenesisQuorum ensures a move instantaneous rewards
+// certificate is authorized by a quorum of the current genesis delegates
+func UtxoValidateMIRGenesisQuorum(
+	tx common.Transaction,
+	slot uint64,
+	ls common.LedgerState,
+	pp common.ProtocolParameters,
+) error {
+	return shelley.UtxoValidateMIRGenesisQuorum(tx, slot, ls, pp)
+}

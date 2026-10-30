@@ -1,0 +1,1069 @@
+// Copyright 2026 Blink Labs Software
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package dijkstra
+
+import (
+	"bytes"
+	"cmp"
+	"errors"
+	"fmt"
+	"math/big"
+	"slices"
+
+	"github.com/blinklabs-io/gouroboros/cbor"
+	"github.com/blinklabs-io/gouroboros/ledger/common"
+	"github.com/blinklabs-io/gouroboros/ledger/common/script"
+	"github.com/blinklabs-io/plutigo/data"
+)
+
+// dijkstraPlutusV4Context builds the Plutus V4 ScriptContext defined by the
+// Dijkstra ledger. V4 deliberately has a different TxInfo, ScriptPurpose and
+// ScriptInfo shape from Conway's V3 context, and from plutus-ledger-api 1.69
+// it encodes every single-constructor type (ScriptContext, TxInfo, TxInInfo,
+// TxOutRef, TxOut, Address, POSIXTimeRange and the governance products) as a
+// Data list of its fields instead of as constructor 0.
+func dijkstraPlutusV4Context(
+	level dijkstraScriptLevel,
+	purpose script.ScriptPurpose,
+	key common.RedeemerKey,
+	value common.RedeemerValue,
+) (data.PlutusData, error) {
+	txInfo, err := level.cachedTxInfoV4()
+	if err != nil {
+		return nil, err
+	}
+	purposeData, scriptInfo, err := dijkstraPurposeV4(purpose, key)
+	if err != nil {
+		return nil, err
+	}
+	_ = purposeData // The purpose is represented in txInfoRedeemers.
+	if guarding, ok := purpose.(script.ScriptPurposeGuarding); ok &&
+		level.subTxIndex == nil {
+		// A top-level guard script sees the whole batch; a sub-transaction
+		// guard script sees Nothing.
+		topTxInfo, err := dijkstraTopTxInfoV4(
+			level,
+			guarding.ScriptHash(),
+		)
+		if err != nil {
+			return nil, err
+		}
+		scriptInfo = data.NewConstr(
+			6,
+			data.NewInteger(new(big.Int).SetUint64(uint64(key.Index))),
+			data.NewConstr(0, topTxInfo),
+		)
+	}
+	return data.NewList(
+		txInfo,
+		data.Normalize(value.Data.Data),
+		scriptInfo,
+		data.NewByteString(purpose.ScriptHash().Bytes()),
+	), nil
+}
+
+type dijkstraTxInfoV4Cache struct {
+	built  bool
+	txInfo data.PlutusData
+	err    error
+}
+
+// cachedTxInfoV4 converts the level's V4 TxInfo on first use and returns the
+// same value for every later redeemer, so the result must be treated as
+// read-only. A level built without a cache converts on every call.
+func (level dijkstraScriptLevel) cachedTxInfoV4() (data.PlutusData, error) {
+	cache := level.txInfoV4
+	if cache == nil {
+		return dijkstraTxInfoV4(level)
+	}
+	if !cache.built {
+		cache.txInfo, cache.err = dijkstraTxInfoV4(level)
+		cache.built = true
+	}
+	return cache.txInfo, cache.err
+}
+
+func dijkstraTxInfoV4(level dijkstraScriptLevel) (data.PlutusData, error) {
+	base, err := script.NewTxInfoV3FromTransaction(
+		level.slotState,
+		transactionWithoutGuardingRedeemers{Transaction: level.tx},
+		level.resolved,
+		common.ProtocolVersionDijkstra,
+	)
+	if err != nil {
+		return nil, err
+	}
+	inputs, err := dijkstraInputsV4(
+		script.SortInputs(level.tx.Inputs()),
+		level.view.ResolvedInputs,
+	)
+	if err != nil {
+		return nil, err
+	}
+	referenceInputs, err := dijkstraInputsV4(
+		script.SortInputs(level.tx.ReferenceInputs()),
+		level.view.ResolvedReferenceInputs,
+	)
+	if err != nil {
+		return nil, err
+	}
+	outputs := make([]data.PlutusData, 0, len(level.tx.Outputs()))
+	for _, output := range level.tx.Outputs() {
+		translated, err := dijkstraOutputV4(output)
+		if err != nil {
+			return nil, err
+		}
+		outputs = append(outputs, translated)
+	}
+	certificates := make([]data.PlutusData, 0, len(level.tx.Certificates()))
+	for _, certificate := range level.tx.Certificates() {
+		translated, err := dijkstraCertificateV4(certificate)
+		if err != nil {
+			return nil, err
+		}
+		certificates = append(certificates, translated)
+	}
+	redeemers, err := dijkstraRedeemersV4(level)
+	if err != nil {
+		return nil, err
+	}
+	withdrawals, err := dijkstraWithdrawalsV4(level.tx.Withdrawals())
+	if err != nil {
+		return nil, err
+	}
+	directDeposits, balanceIntervals, guards, requiredGuards, err := dijkstraBodyFieldsV4(
+		level.tx.body,
+	)
+	if err != nil {
+		return nil, err
+	}
+	validRange, err := dijkstraPOSIXTimeRangeV4(level)
+	if err != nil {
+		return nil, err
+	}
+
+	mint := level.tx.AssetMint()
+	if mint == nil {
+		mint = &common.MultiAsset[common.MultiAssetTypeMint]{}
+	}
+	donation := level.tx.Donation()
+	if donation == nil {
+		donation = new(big.Int)
+	}
+
+	proposals, err := dijkstraProposalProceduresV4(
+		level.tx.ProposalProcedures(),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	votes, err := dijkstraVotesV4(base.Votes.ToPlutusData())
+	if err != nil {
+		return nil, err
+	}
+
+	return data.NewList(
+		data.NewByteString(level.tx.Id().Bytes()),
+		dijkstraOptionalIndex(level.subTxIndex),
+		data.NewList(inputs...),
+		data.NewList(referenceInputs...),
+		data.NewList(outputs...),
+		mint.ToPlutusData(),
+		data.NewList(certificates...),
+		withdrawals,
+		directDeposits,
+		balanceIntervals,
+		validRange,
+		guards,
+		requiredGuards,
+		redeemers,
+		base.Data.ToPlutusData(),
+		votes,
+		proposals,
+		base.CurrentTreasuryAmount.ToPlutusData(),
+		data.NewInteger(donation),
+	), nil
+}
+
+func dijkstraPOSIXTimeRangeV4(
+	level dijkstraScriptLevel,
+) (data.PlutusData, error) {
+	var lower *big.Int
+	if dijkstraValidityLowerBoundPresentV4(level.tx.body) {
+		value, err := level.slotState.SlotToTime(
+			level.tx.ValidityIntervalStart(),
+		)
+		if err != nil {
+			return nil, err
+		}
+		lower = big.NewInt(value.UnixMilli())
+	}
+	var upper *big.Int
+	if slot, present := level.tx.ValidityIntervalUpperBound(); present {
+		value, err := level.slotState.SlotToTime(slot)
+		if err != nil {
+			return nil, err
+		}
+		upper = big.NewInt(value.UnixMilli())
+	}
+	return dijkstraPOSIXTimeRangeDataV4(lower, upper), nil
+}
+
+func dijkstraValidityLowerBoundPresentV4(body common.TransactionBody) bool {
+	present := body.ValidityIntervalStart() > 0
+	if len(body.Cbor()) == 0 {
+		return present
+	}
+	var fields map[uint]cbor.RawMessage
+	if _, err := cbor.Decode(body.Cbor(), &fields); err != nil {
+		return present
+	}
+	_, present = fields[8]
+	return present
+}
+
+func dijkstraPOSIXTimeRangeDataV4(
+	lower *big.Int,
+	upper *big.Int,
+) data.PlutusData {
+	optional := func(value *big.Int) data.PlutusData {
+		if value == nil {
+			return data.NewConstr(1)
+		}
+		return data.NewConstr(0, data.NewInteger(value))
+	}
+	return data.NewList(optional(lower), optional(upper))
+}
+
+func dijkstraOptionalIndex(index *uint32) data.PlutusData {
+	if index == nil {
+		return data.NewConstr(1)
+	}
+	return data.NewConstr(
+		0,
+		data.NewInteger(new(big.Int).SetUint64(uint64(*index))),
+	)
+}
+
+func dijkstraInputsV4(
+	inputs []common.TransactionInput,
+	resolved []common.Utxo,
+) ([]data.PlutusData, error) {
+	byID := make(map[string]common.Utxo, len(resolved))
+	for _, utxo := range resolved {
+		if utxo.Id != nil {
+			byID[utxo.Id.String()] = utxo
+		}
+	}
+	ret := make([]data.PlutusData, 0, len(inputs))
+	for _, input := range inputs {
+		utxo, ok := byID[input.String()]
+		if !ok || utxo.Output == nil {
+			return nil, common.InputResolutionError{
+				Input: input,
+				Err:   errors.New("resolved input is missing"),
+			}
+		}
+		output, err := dijkstraOutputV4(utxo.Output)
+		if err != nil {
+			return nil, err
+		}
+		ret = append(ret, data.NewList(dijkstraTxOutRefV4(input), output))
+	}
+	return ret, nil
+}
+
+func dijkstraTxOutRefV4(input common.TransactionInput) data.PlutusData {
+	return data.NewList(
+		data.NewByteString(input.Id().Bytes()),
+		data.NewInteger(new(big.Int).SetUint64(uint64(input.Index()))),
+	)
+}
+
+func dijkstraOutputV4(
+	output common.TransactionOutput,
+) (data.PlutusData, error) {
+	if output == nil {
+		return nil, errors.New("nil transaction output in Plutus V4 context")
+	}
+	address, err := dijkstraAddressV4(output.Address())
+	if err != nil {
+		return nil, err
+	}
+	valuePairs := make([][2]data.PlutusData, 0, 2)
+	amount := output.Amount()
+	if amount == nil {
+		amount = new(big.Int)
+	}
+	valuePairs = append(valuePairs, [2]data.PlutusData{
+		data.NewByteString(nil),
+		data.NewMap([][2]data.PlutusData{{
+			data.NewByteString(nil), data.NewInteger(amount),
+		}}),
+	})
+	if assets := output.Assets(); assets != nil {
+		assetData, ok := assets.ToPlutusData().(*data.Map)
+		if !ok {
+			return nil, errors.New("multi-asset value did not encode as a map")
+		}
+		valuePairs = append(valuePairs, assetData.Pairs...)
+	}
+
+	var datumData data.PlutusData
+	switch {
+	case output.Datum() != nil:
+		datumData = data.NewConstr(2, data.Normalize(output.Datum().Data))
+	case output.DatumHash() != nil:
+		datumData = data.NewConstr(
+			1,
+			data.NewByteString(output.DatumHash().Bytes()),
+		)
+	default:
+		datumData = data.NewConstr(0)
+	}
+	var referenceScript data.PlutusData
+	if output.ScriptRef() == nil {
+		referenceScript = data.NewConstr(1)
+	} else {
+		referenceScript = data.NewConstr(
+			0,
+			data.NewByteString(output.ScriptRef().Hash().Bytes()),
+		)
+	}
+	return data.NewList(
+		address,
+		data.NewMap(valuePairs),
+		datumData,
+		referenceScript,
+	), nil
+}
+
+func dijkstraAddressV4(address common.Address) (data.PlutusData, error) {
+	if address.Type() == common.AddressTypeByron {
+		return nil, errors.New(
+			"byron output is not supported in Plutus V4 context",
+		)
+	}
+	if address.Type() == common.AddressTypeKeyPointer ||
+		address.Type() == common.AddressTypeScriptPointer {
+		return nil, errors.New(
+			"pointer output is not supported in Plutus V4 context",
+		)
+	}
+	var payment common.Credential
+	switch payload := address.PayloadPayload().(type) {
+	case common.AddressPayloadKeyHash:
+		payment.CredType = common.CredentialTypeAddrKeyHash
+		payment.Credential = payload.Hash
+	case common.AddressPayloadScriptHash:
+		payment.CredType = common.CredentialTypeScriptHash
+		payment.Credential = common.Blake2b224(payload.Hash)
+	default:
+		return nil, errors.New("transaction output has no payment credential")
+	}
+	stake := data.NewConstr(1)
+	if credential, ok := address.StakeCredential(); ok {
+		stake = data.NewConstr(0, credential.ToPlutusData())
+	}
+	return data.NewList(payment.ToPlutusData(), stake), nil
+}
+
+func dijkstraRedeemersV4(level dijkstraScriptLevel) (data.PlutusData, error) {
+	wits := level.tx.Witnesses()
+	if wits == nil || wits.Redeemers() == nil {
+		return data.NewMap(nil), nil
+	}
+	pairs := make([][2]data.PlutusData, 0)
+	for key, value := range wits.Redeemers().Iter() {
+		purpose, err := dijkstraPurposeForKey(level, key)
+		if err != nil {
+			return nil, err
+		}
+		purposeData, _, err := dijkstraPurposeV4(purpose, key)
+		if err != nil {
+			return nil, err
+		}
+		pairs = append(pairs, [2]data.PlutusData{purposeData, data.Normalize(value.Data.Data)})
+	}
+	return data.NewMap(pairs), nil
+}
+
+func dijkstraPurposeForKey(
+	level dijkstraScriptLevel,
+	key common.RedeemerKey,
+) (script.ScriptPurpose, error) {
+	if key.Tag == common.RedeemerTagGuarding {
+		purpose, ok := dijkstraGuardingPurpose(level.tx, key)
+		if !ok {
+			return nil, script.UnmatchedRedeemerError{RedeemerKey: key}
+		}
+		return purpose, nil
+	}
+	resolved := make(
+		map[string]common.Utxo,
+		len(level.view.ResolvedInputs),
+	)
+	for _, utxo := range level.view.ResolvedInputs {
+		if utxo.Id != nil {
+			resolved[utxo.Id.String()] = utxo
+		}
+	}
+	mint := level.tx.AssetMint()
+	if mint == nil {
+		mint = &common.MultiAsset[common.MultiAssetTypeMint]{}
+	}
+	witnessDatums := make(map[common.Blake2b256]*common.Datum)
+	if witnesses := level.tx.Witnesses(); witnesses != nil {
+		for _, item := range witnesses.PlutusData() {
+			datum := item
+			witnessDatums[datum.Hash()] = &datum
+		}
+	}
+	return script.BuildScriptPurpose(
+		key,
+		resolved,
+		script.SortInputs(level.tx.Inputs()),
+		*mint,
+		level.tx.Certificates(),
+		level.tx.Withdrawals(),
+		level.tx.VotingProcedures(),
+		level.tx.ProposalProcedures(),
+		witnessDatums,
+		common.ProtocolVersionDijkstra,
+	)
+}
+
+func dijkstraPurposeV4(
+	purpose script.ScriptPurpose,
+	key common.RedeemerKey,
+) (data.PlutusData, data.PlutusData, error) {
+	hash := data.NewByteString(purpose.ScriptHash().Bytes())
+	index := data.NewInteger(new(big.Int).SetUint64(uint64(key.Index)))
+	switch p := purpose.(type) {
+	case script.ScriptPurposeMinting:
+		policy := data.NewByteString(p.PolicyId.Bytes())
+		return data.NewConstr(0, hash, policy), data.NewConstr(0, policy), nil
+	case script.ScriptPurposeSpending:
+		input := dijkstraTxOutRefV4(p.Input.Id)
+		datumOption := data.NewConstr(1)
+		if p.Datum != nil {
+			datumOption = data.NewConstr(0, p.Datum)
+		}
+		return data.NewConstr(1, hash, input),
+			data.NewConstr(1, input, datumOption), nil
+	case script.ScriptPurposeRewarding:
+		credential := p.StakeCredential.ToPlutusData()
+		return data.NewConstr(2, hash, credential),
+			data.NewConstr(2, credential), nil
+	case script.ScriptPurposeCertifying:
+		certificate, err := dijkstraCertificateV4(p.Certificate)
+		if err != nil {
+			return nil, nil, err
+		}
+		return data.NewConstr(3, hash, index, certificate),
+			data.NewConstr(3, index, certificate), nil
+	case script.ScriptPurposeVoting:
+		voter := p.Voter.ToPlutusData()
+		return data.NewConstr(4, hash, voter), data.NewConstr(4, voter), nil
+	case script.ScriptPurposeProposing:
+		proposalData, err := dijkstraProposalProcedureV4(p.ProposalProcedure)
+		if err != nil {
+			return nil, nil, err
+		}
+		return data.NewConstr(5, hash, index, proposalData),
+			data.NewConstr(5, index, proposalData), nil
+	case script.ScriptPurposeGuarding:
+		return data.NewConstr(6, hash, index),
+			data.NewConstr(6, index, data.NewConstr(1)), nil
+	default:
+		return nil, nil, fmt.Errorf("unsupported Plutus V4 purpose %T", purpose)
+	}
+}
+
+func dijkstraWithdrawalsV4(
+	withdrawals map[*common.Address]*big.Int,
+) (data.PlutusData, error) {
+	sortedAddresses := script.SortWithdrawalAddresses(withdrawals)
+	pairs := make([][2]data.PlutusData, len(sortedAddresses))
+	for idx, address := range sortedAddresses {
+		credential, err := address.RewardAccountCredential()
+		if err != nil {
+			return nil, err
+		}
+		pairs[idx] = [2]data.PlutusData{
+			credential.ToPlutusData(), data.NewInteger(withdrawals[address]),
+		}
+	}
+	return data.NewMap(pairs), nil
+}
+
+func dijkstraBodyFieldsV4(body common.TransactionBody) (
+	directDeposits data.PlutusData,
+	balanceIntervals data.PlutusData,
+	guards data.PlutusData,
+	requiredGuards data.PlutusData,
+	err error,
+) {
+	balanceIntervals = data.NewMap(nil)
+	guards = data.NewList()
+	requiredGuards = data.NewMap(nil)
+	var deposits DijkstraDirectDeposits
+	var intervals DijkstraAccountBalanceIntervals
+	var guardSet *DijkstraGuards
+	var required DijkstraRequiredTopLevelGuards
+	switch b := body.(type) {
+	case *DijkstraTransactionBody:
+		deposits = b.TxDirectDeposits
+		intervals = b.TxBalanceIntervals
+		guardSet = b.TxGuards
+		required = b.TxRequiredTopLevelGuards
+	case *DijkstraSubTransactionBody:
+		deposits = b.TxDirectDeposits
+		intervals = b.TxAccountBalanceIntervals
+		guardSet = b.TxGuards
+		required = b.TxRequiredTopLevelGuards
+	default:
+		return nil, nil, nil, nil, fmt.Errorf(
+			"unexpected Dijkstra body type %T",
+			body,
+		)
+	}
+	directDeposits, err = dijkstraDirectDepositsV4(deposits)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	if len(intervals) > 0 {
+		balanceIntervals, err = dijkstraAccountBalanceIntervalsV4(intervals)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+	}
+	if guardSet != nil {
+		items := make([]data.PlutusData, len(guardSet.Credentials))
+		for idx := range guardSet.Credentials {
+			items[idx] = guardSet.Credentials[idx].ToPlutusData()
+		}
+		guards = data.NewList(items...)
+	}
+	if len(required) > 0 {
+		requiredGuards, err = dijkstraRequiredTopLevelGuardsV4(required)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+	}
+	return directDeposits, balanceIntervals, guards, requiredGuards, nil
+}
+
+// sortedDijkstraCredentials follows the reference Credential order: script
+// credentials precede key credentials, with hashes ordered bytewise.
+func sortedDijkstraCredentials[V any](
+	values map[*common.Credential]V,
+) []*common.Credential {
+	credentials := make([]*common.Credential, 0, len(values))
+	for credential := range values {
+		credentials = append(credentials, credential)
+	}
+	slices.SortFunc(credentials, func(a, b *common.Credential) int {
+		if a.CredType != b.CredType {
+			if a.CredType == common.CredentialTypeScriptHash {
+				return -1
+			}
+			return 1
+		}
+		return bytes.Compare(a.Credential.Bytes(), b.Credential.Bytes())
+	})
+	return credentials
+}
+
+func dijkstraAccountBalanceIntervalsV4(
+	intervals DijkstraAccountBalanceIntervals,
+) (data.PlutusData, error) {
+	if err := validateDijkstraAccountAddressMapKeys(
+		map[cbor.ByteString]*DijkstraAccountBalanceInterval(intervals),
+		"account balance intervals",
+	); err != nil {
+		return nil, err
+	}
+	addresses := sortedDijkstraAccountAddresses(intervals)
+	pairs := make([][2]data.PlutusData, 0, len(addresses))
+	for _, addressBytes := range addresses {
+		interval := intervals[addressBytes]
+		if interval == nil {
+			return nil, errors.New(
+				"account balance intervals contains a nil interval",
+			)
+		}
+		if err := validateDijkstraAccountBalanceInterval(interval); err != nil {
+			return nil, err
+		}
+		address, err := dijkstraAddressFromKey(addressBytes)
+		if err != nil {
+			return nil, err
+		}
+		credential, err := address.RewardAccountCredential()
+		if err != nil {
+			return nil, err
+		}
+		pairs = append(pairs, [2]data.PlutusData{
+			credential.ToPlutusData(),
+			dijkstraAccountBalanceIntervalV4(interval),
+		})
+	}
+	return data.NewMap(pairs), nil
+}
+
+// sortedDijkstraAccountAddresses orders reward-account keys by the reference
+// AccountAddress order: network, then script credentials before key
+// credentials, then hash bytes. The encoded header byte cannot be compared
+// directly because it carries the credential type above the network.
+func sortedDijkstraAccountAddresses[V any](
+	values map[cbor.ByteString]V,
+) []cbor.ByteString {
+	addresses := make([]cbor.ByteString, 0, len(values))
+	for address := range values {
+		addresses = append(addresses, address)
+	}
+	slices.SortFunc(addresses, func(a, b cbor.ByteString) int {
+		return compareDijkstraAccountAddresses(a.Bytes(), b.Bytes())
+	})
+	return addresses
+}
+
+func compareDijkstraAccountAddresses(a, b []byte) int {
+	if len(a) == 0 || len(b) == 0 {
+		return bytes.Compare(a, b)
+	}
+	const (
+		networkMask = 0x0f
+		scriptBit   = 0x10
+	)
+	if c := cmp.Compare(a[0]&networkMask, b[0]&networkMask); c != 0 {
+		return c
+	}
+	aScript, bScript := a[0]&scriptBit != 0, b[0]&scriptBit != 0
+	if aScript != bScript {
+		if aScript {
+			return -1
+		}
+		return 1
+	}
+	return bytes.Compare(a[1:], b[1:])
+}
+
+func dijkstraAccountBalanceIntervalV4(
+	interval *DijkstraAccountBalanceInterval,
+) data.PlutusData {
+	switch {
+	case interval.Exact != nil:
+		return data.NewConstr(
+			3,
+			data.NewInteger(new(big.Int).SetUint64(*interval.Exact)),
+		)
+	case interval.LowerBound != nil && interval.UpperBound != nil:
+		return data.NewConstr(
+			2,
+			data.NewInteger(new(big.Int).SetUint64(*interval.LowerBound)),
+			data.NewInteger(new(big.Int).SetUint64(*interval.UpperBound)),
+		)
+	case interval.LowerBound != nil:
+		return data.NewConstr(
+			0,
+			data.NewInteger(new(big.Int).SetUint64(*interval.LowerBound)),
+		)
+	case interval.UpperBound != nil:
+		return data.NewConstr(
+			1,
+			data.NewInteger(new(big.Int).SetUint64(*interval.UpperBound)),
+		)
+	default:
+		// Unreachable for a decoded value: DijkstraAccountBalanceInterval's
+		// own UnmarshalCBOR rejects an interval with every bound nil. Only a
+		// manually-constructed zero-value interval can reach this case.
+		return data.NewConstr(1, data.NewInteger(new(big.Int)))
+	}
+}
+
+func dijkstraRequiredTopLevelGuardsV4(
+	required DijkstraRequiredTopLevelGuards,
+) (data.PlutusData, error) {
+	rawRequired := map[*common.Credential]*common.Datum(required)
+	if err := validateDijkstraCredentialMapKeys(
+		rawRequired,
+		"required top-level guards",
+	); err != nil {
+		return nil, err
+	}
+	credentials := sortedDijkstraCredentials(rawRequired)
+	pairs := make([][2]data.PlutusData, 0, len(credentials))
+	for _, credential := range credentials {
+		value := data.NewConstr(1)
+		datum := required[credential]
+		if err := validateDijkstraRequiredTopLevelGuardDatum(datum); err != nil {
+			return nil, err
+		}
+		if datum != nil {
+			// Normalize: datum.Data comes straight off cbor.Decode, so it
+			// still carries the wire's definite/indefinite encoding. Every
+			// other script-visible boundary in this file normalizes; this
+			// one must too, or a required top-level guard datum reaches a
+			// PlutusV4 script with non-canonical bytes.
+			value = data.NewConstr(0, data.Normalize(datum.Data))
+		}
+		pairs = append(pairs, [2]data.PlutusData{
+			credential.ToPlutusData(), value,
+		})
+	}
+	return data.NewMap(pairs), nil
+}
+
+func dijkstraDirectDepositsV4(
+	deposits DijkstraDirectDeposits,
+) (data.PlutusData, error) {
+	addresses := sortedDijkstraAccountAddresses(deposits)
+	pairs := make([][2]data.PlutusData, len(addresses))
+	for idx, addressBytes := range addresses {
+		address, err := dijkstraAddressFromKey(addressBytes)
+		if err != nil {
+			return nil, err
+		}
+		credential, err := address.RewardAccountCredential()
+		if err != nil {
+			return nil, err
+		}
+		pairs[idx] = [2]data.PlutusData{
+			credential.ToPlutusData(),
+			data.NewInteger(new(big.Int).SetUint64(deposits[addressBytes])),
+		}
+	}
+	return data.NewMap(pairs), nil
+}
+
+type dijkstraCredentialKey struct {
+	Type uint
+	Hash common.Blake2b224
+}
+
+func (k *dijkstraCredentialKey) UnmarshalCBOR(raw []byte) error {
+	var credential common.Credential
+	if _, err := cbor.Decode(raw, &credential); err != nil {
+		return err
+	}
+	k.Type = credential.CredType
+	k.Hash = credential.Credential
+	return nil
+}
+
+func (k dijkstraCredentialKey) credential() *common.Credential {
+	return &common.Credential{CredType: k.Type, Credential: k.Hash}
+}
+
+func dijkstraSortCredentialKeys(credentials []dijkstraCredentialKey) {
+	slices.SortFunc(credentials, func(a, b dijkstraCredentialKey) int {
+		if a.Type != b.Type {
+			return int(a.Type) - int(b.Type)
+		}
+		return bytes.Compare(a.Hash.Bytes(), b.Hash.Bytes())
+	})
+}
+
+func dijkstraProposalProceduresV4(
+	values []common.ProposalProcedure,
+) (data.PlutusData, error) {
+	items := make([]data.PlutusData, 0, len(values))
+	for _, value := range values {
+		item, err := dijkstraProposalProcedureV4(value)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return data.NewList(items...), nil
+}
+
+// dijkstraProposalProcedureV4 derives the V4 ProposalProcedure from the V3
+// encoding the procedure produces. plutus-ledger-api defines each V4
+// governance product as ListEncoded over its V3 type, which is exactly the V3
+// constructor-0 fields as a list, so the conversion is the same one plutus
+// applies.
+func dijkstraProposalProcedureV4(
+	value common.ProposalProcedure,
+) (data.PlutusData, error) {
+	encodable, ok := value.(interface {
+		ToPlutusData() data.PlutusData
+	})
+	if !ok {
+		return nil, fmt.Errorf(
+			"proposal procedure %T cannot be encoded for Plutus V4",
+			value,
+		)
+	}
+	fields, err := dijkstraListEncodedFieldsV4(
+		encodable.ToPlutusData(),
+		3,
+		"proposal procedure",
+	)
+	if err != nil {
+		return nil, err
+	}
+	action, err := dijkstraGovActionV4(fields[2])
+	if err != nil {
+		return nil, err
+	}
+	return data.NewList(fields[0], fields[1], action), nil
+}
+
+// dijkstraGovActionV4 rewrites the fields of a V3 GovernanceAction whose V4
+// types are list-encoded: every Maybe GovernanceActionId, HardForkInitiation's
+// ProtocolVersion, UpdateCommittee's quorum Rational and NewConstitution's
+// Constitution. The constructor indices are unchanged.
+func dijkstraGovActionV4(value data.PlutusData) (data.PlutusData, error) {
+	action, ok := value.(*data.Constr)
+	if !ok || action.Tag == nil || !action.Tag.IsUint64() {
+		return nil, fmt.Errorf(
+			"governance action is not a constructor: %T",
+			value,
+		)
+	}
+	fields := slices.Clone(action.Fields)
+	// Field positions per constructor index: 0 ParameterChange,
+	// 1 HardForkInitiation, 3 NoConfidence, 4 UpdateCommittee and
+	// 5 NewConstitution lead with the previous action id; 2
+	// TreasuryWithdrawals and 6 InfoAction carry no V4 product.
+	listFields := map[uint64]struct {
+		count    int
+		products []int
+	}{
+		0: {count: 3},
+		1: {count: 2, products: []int{1}},
+		3: {count: 1},
+		4: {count: 4, products: []int{3}},
+		5: {count: 2, products: []int{1}},
+	}
+	layout, hasActionId := listFields[action.Tag.Uint64()]
+	if !hasActionId {
+		return action, nil
+	}
+	if len(fields) != layout.count {
+		return nil, fmt.Errorf(
+			"governance action %d has %d fields, expected %d",
+			action.Tag.Uint64(),
+			len(fields),
+			layout.count,
+		)
+	}
+	actionId, err := dijkstraMaybeGovActionIdV4(fields[0])
+	if err != nil {
+		return nil, err
+	}
+	fields[0] = actionId
+	for _, idx := range layout.products {
+		product, err := dijkstraListEncodedFieldsV4(
+			fields[idx],
+			-1,
+			"governance action field",
+		)
+		if err != nil {
+			return nil, err
+		}
+		fields[idx] = data.NewList(product...)
+	}
+	return data.NewConstr(action.Tag.Uint64(), fields...), nil
+}
+
+func dijkstraMaybeGovActionIdV4(
+	value data.PlutusData,
+) (data.PlutusData, error) {
+	maybe, ok := value.(*data.Constr)
+	if !ok || maybe.Tag == nil {
+		return nil, fmt.Errorf(
+			"governance action id option is not a constructor: %T",
+			value,
+		)
+	}
+	if maybe.Tag.Sign() != 0 || len(maybe.Fields) != 1 {
+		return maybe, nil
+	}
+	id, err := dijkstraListEncodedFieldsV4(
+		maybe.Fields[0],
+		2,
+		"governance action id",
+	)
+	if err != nil {
+		return nil, err
+	}
+	return data.NewConstr(0, data.NewList(id...)), nil
+}
+
+// dijkstraVotesV4 list-encodes the GovernanceActionId keys of the V3 votes
+// map. The V4 id orders exactly as the V3 one, so the key order is kept.
+func dijkstraVotesV4(value data.PlutusData) (data.PlutusData, error) {
+	votes, ok := value.(*data.Map)
+	if !ok {
+		return value, nil
+	}
+	pairs := make([][2]data.PlutusData, len(votes.Pairs))
+	for idx, pair := range votes.Pairs {
+		pairs[idx] = pair
+		byAction, ok := pair[1].(*data.Map)
+		if !ok {
+			continue
+		}
+		actionPairs := make([][2]data.PlutusData, len(byAction.Pairs))
+		for actionIdx, actionPair := range byAction.Pairs {
+			actionPairs[actionIdx] = actionPair
+			id, err := dijkstraListEncodedFieldsV4(
+				actionPair[0],
+				2,
+				"governance action id",
+			)
+			if err != nil {
+				return nil, err
+			}
+			actionPairs[actionIdx][0] = data.NewList(id...)
+		}
+		pairs[idx][1] = data.NewMap(actionPairs)
+	}
+	return data.NewMap(pairs), nil
+}
+
+// dijkstraListEncodedFieldsV4 returns the fields of a V3 constructor-0 value,
+// which plutus-ledger-api's ListEncoded turns into the V4 list. count < 0
+// accepts any field count.
+func dijkstraListEncodedFieldsV4(
+	value data.PlutusData,
+	count int,
+	name string,
+) ([]data.PlutusData, error) {
+	constr, ok := value.(*data.Constr)
+	if !ok || constr.Tag == nil || constr.Tag.Sign() != 0 {
+		return nil, fmt.Errorf(
+			"%s is not a constructor-0 product: %T",
+			name,
+			value,
+		)
+	}
+	if count >= 0 && len(constr.Fields) != count {
+		return nil, fmt.Errorf(
+			"%s has %d fields, expected %d",
+			name,
+			len(constr.Fields),
+			count,
+		)
+	}
+	return slices.Clone(constr.Fields), nil
+}
+
+func dijkstraCertificateV4(
+	certificate common.Certificate,
+) (data.PlutusData, error) {
+	integer := func(value uint64) data.PlutusData {
+		return data.NewInteger(new(big.Int).SetUint64(value))
+	}
+	delegateePool := func(pool common.PoolKeyHash) data.PlutusData {
+		return data.NewConstr(0, data.NewByteString(pool.Bytes()))
+	}
+	delegateeDRep := func(drep *common.Drep) data.PlutusData {
+		return data.NewConstr(1, drep.ToPlutusData())
+	}
+	switch cert := certificate.(type) {
+	case *common.RegistrationCertificate:
+		return data.NewConstr(
+			0, cert.StakeCredential.ToPlutusData(), integer(cert.Amount),
+		), nil
+	case *common.DeregistrationCertificate:
+		return data.NewConstr(
+			1, cert.StakeCredential.ToPlutusData(), integer(cert.Amount),
+		), nil
+	case *common.StakeDelegationCertificate:
+		return data.NewConstr(
+			2, cert.StakeCredential.ToPlutusData(), delegateePool(cert.PoolKeyHash),
+		), nil
+	case *common.VoteDelegationCertificate:
+		return data.NewConstr(
+			2, cert.StakeCredential.ToPlutusData(), delegateeDRep(&cert.Drep),
+		), nil
+	case *common.StakeVoteDelegationCertificate:
+		return data.NewConstr(
+			2,
+			cert.StakeCredential.ToPlutusData(),
+			data.NewConstr(
+				2,
+				data.NewByteString(cert.PoolKeyHash.Bytes()),
+				cert.Drep.ToPlutusData(),
+			),
+		), nil
+	case *common.StakeRegistrationDelegationCertificate:
+		return data.NewConstr(
+			3,
+			cert.StakeCredential.ToPlutusData(),
+			delegateePool(cert.PoolKeyHash),
+			integer(cert.Amount),
+		), nil
+	case *common.VoteRegistrationDelegationCertificate:
+		return data.NewConstr(
+			3,
+			cert.StakeCredential.ToPlutusData(),
+			delegateeDRep(&cert.Drep),
+			integer(cert.Amount),
+		), nil
+	case *common.StakeVoteRegistrationDelegationCertificate:
+		return data.NewConstr(
+			3,
+			cert.StakeCredential.ToPlutusData(),
+			data.NewConstr(
+				2,
+				data.NewByteString(cert.PoolKeyHash.Bytes()),
+				cert.Drep.ToPlutusData(),
+			),
+			integer(cert.Amount),
+		), nil
+	case *common.RegistrationDrepCertificate:
+		return data.NewConstr(
+			4, cert.DrepCredential.ToPlutusData(), integer(cert.Amount),
+		), nil
+	case *common.UpdateDrepCertificate:
+		return data.NewConstr(5, cert.DrepCredential.ToPlutusData()), nil
+	case *common.DeregistrationDrepCertificate:
+		return data.NewConstr(
+			6, cert.DrepCredential.ToPlutusData(), integer(cert.Amount),
+		), nil
+	case *common.PoolRegistrationCertificate:
+		return data.NewConstr(
+			7,
+			data.NewByteString(cert.Operator.Bytes()),
+			data.NewByteString(cert.VrfKeyHash.Bytes()),
+		), nil
+	case *common.PoolRetirementCertificate:
+		return data.NewConstr(
+			8,
+			data.NewByteString(cert.PoolKeyHash.Bytes()),
+			data.NewInteger(new(big.Int).SetUint64(cert.Epoch)),
+		), nil
+	case *common.AuthCommitteeHotCertificate:
+		return data.NewConstr(
+			9,
+			cert.ColdCredential.ToPlutusData(),
+			cert.HotCredential.ToPlutusData(),
+		), nil
+	case *common.ResignCommitteeColdCertificate:
+		return data.NewConstr(10, cert.ColdCredential.ToPlutusData()), nil
+	default:
+		return nil, fmt.Errorf(
+			"unsupported certificate type %T in Plutus V4 context",
+			certificate,
+		)
+	}
+}

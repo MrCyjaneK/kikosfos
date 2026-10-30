@@ -1,0 +1,843 @@
+// Copyright 2026 Blink Labs Software
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package bursa
+
+import (
+	"crypto/ed25519"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math/big"
+	"math/bits"
+	"strings"
+
+	"github.com/blinklabs-io/bursa/bip32"
+	"github.com/blinklabs-io/gouroboros/cbor"
+	"github.com/blinklabs-io/gouroboros/ledger"
+	lcommon "github.com/blinklabs-io/gouroboros/ledger/common"
+)
+
+// decodeVkeyWitnessField decodes the value of witness-set key 0 (vkey
+// witnesses), handling both the plain-array form (pre-Conway) and the CBOR
+// tag-258 set form (Conway+). Returns the witnesses, whether the value was
+// tag-258 wrapped, and any error. A nil/empty input yields an empty slice.
+func decodeVkeyWitnessField(raw []byte) ([]lcommon.VkeyWitness, bool, error) {
+	if len(raw) == 0 {
+		return nil, false, nil
+	}
+	var tag cbor.RawTag
+	if _, err := cbor.Decode(raw, &tag); err == nil {
+		if tag.Number != cbor.CborTagSet {
+			return nil, false, fmt.Errorf("unexpected CBOR tag %d on vkey witnesses", tag.Number)
+		}
+		var items []lcommon.VkeyWitness
+		if _, err := cbor.Decode([]byte(tag.Content), &items); err != nil {
+			return nil, false, fmt.Errorf("failed to decode tagged vkey witnesses: %w", err)
+		}
+		return items, true, nil
+	}
+	var items []lcommon.VkeyWitness
+	if _, err := cbor.Decode(raw, &items); err != nil {
+		return nil, false, fmt.Errorf("failed to decode vkey witnesses: %w", err)
+	}
+	return items, false, nil
+}
+
+// encodeVkeyWitnessField encodes vkey witnesses as witness-set key 0, using the
+// tag-258 set form when useTag is true (required for Conway+).
+func encodeVkeyWitnessField(items []lcommon.VkeyWitness, useTag bool) ([]byte, error) {
+	st := cbor.NewSetType[lcommon.VkeyWitness](items, useTag)
+	out, err := st.MarshalCBOR()
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode vkey witnesses: %w", err)
+	}
+	return out, nil
+}
+
+func dedupeVkeyWitnesses(items []lcommon.VkeyWitness) []lcommon.VkeyWitness {
+	if len(items) < 2 {
+		return items
+	}
+	seen := make(map[string]struct{}, len(items))
+	out := make([]lcommon.VkeyWitness, 0, len(items))
+	for _, item := range items {
+		key := hex.EncodeToString(item.Vkey) + ":" + hex.EncodeToString(item.Signature)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, item)
+	}
+	return out
+}
+
+// injectVkeyWitnesses adds vkey witnesses to a transaction's witness set
+// without re-encoding the transaction body. Only the witness_set element of the
+// [body, witness_set, is_valid, aux_data] array is rewritten.
+func injectVkeyWitnesses(txCbor []byte, newWits []lcommon.VkeyWitness, useTag bool) ([]byte, error) {
+	var arr []cbor.RawMessage
+	if _, err := cbor.Decode(txCbor, &arr); err != nil {
+		return nil, fmt.Errorf("failed to decode transaction array: %w", err)
+	}
+	if len(arr) < 2 {
+		return nil, fmt.Errorf("unexpected transaction shape: %d elements", len(arr))
+	}
+	ws := map[uint64]cbor.RawMessage{}
+	if len(arr[1]) > 0 {
+		if _, err := cbor.Decode(arr[1], &ws); err != nil {
+			return nil, fmt.Errorf("failed to decode witness set: %w", err)
+		}
+	}
+	existing, hadTag, err := decodeVkeyWitnessField(ws[0])
+	if err != nil {
+		return nil, err
+	}
+	merged := append(existing, newWits...)
+	merged = dedupeVkeyWitnesses(merged)
+	field0, err := encodeVkeyWitnessField(merged, useTag || hadTag)
+	if err != nil {
+		return nil, err
+	}
+	ws[0] = cbor.RawMessage(field0)
+	wsBytes, err := cbor.Encode(ws)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode witness set: %w", err)
+	}
+	arr[1] = cbor.RawMessage(wsBytes)
+	out, err := cbor.Encode(arr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode signed transaction: %w", err)
+	}
+	return out, nil
+}
+
+// useTagForTxType reports whether the vkey-witness field should be tag-258
+// wrapped for the given transaction type. Conway and later require set tags.
+func useTagForTxType(txType uint) bool {
+	return txType >= ledger.TxTypeConway
+}
+
+// ErrSignatureVerification indicates a freshly produced signature failed to
+// verify against its own public key. With correct key material and an intact
+// signing routine this can never happen, so it signals memory corruption, a
+// fault-injection ("glitch") attack on the deterministic EdDSA signer — the
+// standard defense against which is to verify before releasing the signature,
+// since a faulted second signing of the same message would otherwise leak the
+// private scalar — or a signing-math bug. The signature is discarded, never
+// returned.
+var ErrSignatureVerification = errors.New("produced signature failed self-verification")
+
+// verifyingSigner wraps a raw signing function with a verify-after-sign
+// self-check: it signs, then confirms the result verifies against pub before
+// returning it, yielding ErrSignatureVerification otherwise. crypto/ed25519
+// verification is valid for both standard and Cardano extended
+// (BIP32-Ed25519) signatures because both verify against the 32-byte public
+// key, and Go's verifier additionally rejects non-canonical S (malleable)
+// signatures. This is defense-in-depth applied at the lowest signing layer so
+// every caller — offline tx signing, CIP-8 data signing, and the remote
+// signer's custody backends — inherits the same guarantee.
+func verifyingSigner(pub []byte, raw func(msg []byte) []byte) func(msg []byte) ([]byte, error) {
+	return func(msg []byte) ([]byte, error) {
+		sig := raw(msg)
+		if len(pub) != ed25519.PublicKeySize ||
+			!ed25519.Verify(ed25519.PublicKey(pub), msg, sig) {
+			return nil, ErrSignatureVerification
+		}
+		return sig, nil
+	}
+}
+
+// signerForKey returns the 32-byte public (vkey) bytes and a signing closure
+// for a loaded signing key. Extended BIP32 keys (96-byte SKey) use Cardano
+// BIP32-Ed25519 signing; standard keys (64-byte ed25519 private key) use
+// crypto/ed25519. The returned closure verifies every signature it produces
+// against vkey before returning it (see verifyingSigner / ErrSignatureVerification).
+func signerForKey(lk *LoadedKey) (vkey []byte, sign func(msg []byte) ([]byte, error), err error) {
+	if lk == nil {
+		return nil, nil, errors.New("signing key cannot be nil")
+	}
+	switch len(lk.SKey) {
+	case 96:
+		x := bip32.XPrv(lk.SKey)
+		pub := x.PublicKey()
+		return pub, verifyingSigner(pub, x.Sign), nil
+	case 64:
+		priv := ed25519.PrivateKey(lk.SKey)
+		pub := priv.Public().(ed25519.PublicKey)
+		return pub, verifyingSigner(pub, func(msg []byte) []byte { return ed25519.Sign(priv, msg) }), nil
+	default:
+		return nil, nil, fmt.Errorf("unsupported signing key length %d (want 64 or 96)", len(lk.SKey))
+	}
+}
+
+// CreateWitness signs the given 32-byte transaction id with the loaded key and
+// returns a vkey witness.
+func CreateWitness(txID []byte, lk *LoadedKey) (lcommon.VkeyWitness, error) {
+	if len(txID) != 32 {
+		return lcommon.VkeyWitness{}, fmt.Errorf("transaction id must be 32 bytes, got %d", len(txID))
+	}
+	vkey, sign, err := signerForKey(lk)
+	if err != nil {
+		return lcommon.VkeyWitness{}, err
+	}
+	sig, err := sign(txID)
+	if err != nil {
+		return lcommon.VkeyWitness{}, err
+	}
+	return lcommon.VkeyWitness{Vkey: vkey, Signature: sig}, nil
+}
+
+// SignTransaction adds a vkey witness for each provided signing key and returns
+// the signed transaction CBOR. The body (and thus the txid) is never modified.
+func SignTransaction(txCbor []byte, signers []*LoadedKey) ([]byte, error) {
+	if len(signers) == 0 {
+		return nil, errors.New("no signing keys provided")
+	}
+	txType, err := ledger.DetermineTransactionType(txCbor)
+	if err != nil {
+		return nil, fmt.Errorf("failed to determine transaction era: %w", err)
+	}
+	return SignTransactionForEra(txCbor, txType, signers)
+}
+
+// SignTransactionForEra is SignTransaction for a transaction of a known era
+// (a ledger.TxType value), which selects the witness set encoding.
+func SignTransactionForEra(txCbor []byte, txType uint, signers []*LoadedKey) ([]byte, error) {
+	if len(signers) == 0 {
+		return nil, errors.New("no signing keys provided")
+	}
+	tx, err := ledger.NewTransactionFromCbor(txType, txCbor)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode transaction: %w", err)
+	}
+	txID := tx.Hash().Bytes()
+	wits := make([]lcommon.VkeyWitness, 0, len(signers))
+	for _, lk := range signers {
+		w, err := CreateWitness(txID, lk)
+		if err != nil {
+			return nil, err
+		}
+		wits = append(wits, w)
+	}
+	return injectVkeyWitnesses(txCbor, wits, useTagForTxType(txType))
+}
+
+// WitnessTransaction produces a single detached vkey witness for the
+// transaction using the given key (for multi-party / multisig assembly).
+func WitnessTransaction(txCbor []byte, lk *LoadedKey) (lcommon.VkeyWitness, error) {
+	txType, err := ledger.DetermineTransactionType(txCbor)
+	if err != nil {
+		return lcommon.VkeyWitness{}, fmt.Errorf("failed to determine transaction era: %w", err)
+	}
+	tx, err := ledger.NewTransactionFromCbor(txType, txCbor)
+	if err != nil {
+		return lcommon.VkeyWitness{}, fmt.Errorf("failed to decode transaction: %w", err)
+	}
+	return CreateWitness(tx.Hash().Bytes(), lk)
+}
+
+// AssembleTransaction merges the provided detached witnesses into the
+// transaction and returns the assembled signed transaction CBOR.
+func AssembleTransaction(txCbor []byte, wits []lcommon.VkeyWitness) ([]byte, error) {
+	if len(wits) == 0 {
+		return nil, errors.New("no witnesses provided")
+	}
+	txType, err := ledger.DetermineTransactionType(txCbor)
+	if err != nil {
+		return nil, fmt.Errorf("failed to determine transaction era: %w", err)
+	}
+	return AssembleTransactionForEra(txCbor, txType, wits)
+}
+
+// AssembleTransactionForEra is AssembleTransaction for a transaction of a
+// known era (a ledger.TxType value), which selects the witness set encoding.
+func AssembleTransactionForEra(txCbor []byte, txType uint, wits []lcommon.VkeyWitness) ([]byte, error) {
+	if len(wits) == 0 {
+		return nil, errors.New("no witnesses provided")
+	}
+	return injectVkeyWitnesses(txCbor, wits, useTagForTxType(txType))
+}
+
+// EncodeWitness serializes a single vkey witness to CBOR.
+func EncodeWitness(w lcommon.VkeyWitness) ([]byte, error) {
+	out, err := cbor.Encode(w)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode witness: %w", err)
+	}
+	return out, nil
+}
+
+// DecodeWitness deserializes a single vkey witness from CBOR.
+func DecodeWitness(data []byte) (lcommon.VkeyWitness, error) {
+	var w lcommon.VkeyWitness
+	if _, err := cbor.Decode(data, &w); err != nil {
+		return lcommon.VkeyWitness{}, fmt.Errorf("failed to decode witness: %w", err)
+	}
+	return w, nil
+}
+
+// TransactionID returns the hex-encoded transaction id (blake2b-256 of the body).
+func TransactionID(txCbor []byte) (string, error) {
+	txType, err := ledger.DetermineTransactionType(txCbor)
+	if err != nil {
+		return "", fmt.Errorf("failed to determine transaction era: %w", err)
+	}
+	tx, err := ledger.NewTransactionFromCbor(txType, txCbor)
+	if err != nil {
+		return "", fmt.Errorf("failed to decode transaction: %w", err)
+	}
+	return hex.EncodeToString(tx.Hash().Bytes()), nil
+}
+
+// TxInput is a decoded transaction input.
+type TxInput struct {
+	TxId  string `json:"tx_id"`
+	Index uint32 `json:"index"`
+}
+
+// TxOutput is a decoded transaction output.
+type TxOutput struct {
+	Address  string `json:"address"`
+	Lovelace string `json:"lovelace"`
+	// HasAssets is true when the output carries native (multi-)assets in
+	// addition to lovelace. The policy engine treats native-asset movement as
+	// a distinct, deny-by-default operation because lovelace limits do not
+	// bound token quantities.
+	HasAssets bool `json:"has_assets,omitempty"`
+}
+
+// TxInspection is the decoded, human-readable view of a transaction.
+type TxInspection struct {
+	TxId             string     `json:"tx_id"`
+	Era              string     `json:"era"`
+	SizeBytes        int        `json:"size_bytes"`
+	IsValid          bool       `json:"is_valid"`
+	Fee              string     `json:"fee,omitempty"`
+	TTL              uint64     `json:"ttl,omitempty"`
+	ValidityStart    uint64     `json:"validity_interval_start,omitempty"`
+	Inputs           []TxInput  `json:"inputs"`
+	Outputs          []TxOutput `json:"outputs"`
+	CollateralInputs []TxInput  `json:"collateral_inputs,omitempty"`
+	CollateralReturn *TxOutput  `json:"collateral_return,omitempty"`
+	TotalCollateral  string     `json:"total_collateral,omitempty"`
+	CertificateCount int        `json:"certificate_count"`
+	// CertificateDepositTotal and CertificateRefundTotal contain the sums that
+	// are encoded directly in Conway certificates. Legacy stake and pool
+	// certificate amounts depend on protocol parameters or ledger state; their
+	// counts remain explicit so value-limited signers can fail closed.
+	CertificateDepositTotal         string `json:"certificate_deposit_total,omitempty"`
+	CertificateRefundTotal          string `json:"certificate_refund_total,omitempty"`
+	UnresolvedCertificateDeposits   int    `json:"unresolved_certificate_deposits,omitempty"`
+	UnresolvedCertificateRefunds    int    `json:"unresolved_certificate_refunds,omitempty"`
+	CertificateValueEffectsComplete bool   `json:"certificate_value_effects_complete"`
+	WithdrawalCount                 int    `json:"withdrawal_count"`
+	HasMint                         bool   `json:"has_mint"`
+	HasMetadata                     bool   `json:"has_metadata"`
+	RequiredSigners                 int    `json:"required_signers"`
+	VkeyWitnesses                   int    `json:"vkey_witnesses"`
+	NativeScripts                   int    `json:"native_scripts"`
+	// Conway governance and treasury components. These authorize
+	// high-impact actions (casting DRep/committee votes, submitting
+	// governance proposals, donating to the treasury) that are independent
+	// of outputs/certificates/withdrawals, so the policy engine must inspect
+	// and gate them explicitly.
+	VotingProcedureCount     int    `json:"voting_procedure_count,omitempty"`
+	ProposalProcedureCount   int    `json:"proposal_procedure_count,omitempty"`
+	ProposalDepositTotal     string `json:"proposal_deposit_total,omitempty"`
+	HasTreasuryDonation      bool   `json:"has_treasury_donation,omitempty"`
+	TreasuryDonationLovelace string `json:"treasury_donation_lovelace,omitempty"`
+}
+
+func inspectCertificateValues(certs []lcommon.Certificate) (string, string, int, int, bool) {
+	deposits := new(big.Int)
+	refunds := new(big.Int)
+	unresolvedDeposits := 0
+	unresolvedRefunds := 0
+	hasDeposits := false
+	hasRefunds := false
+	complete := true
+	add := func(total *big.Int, amount *big.Int, unresolved *int, present *bool) {
+		*present = true
+		if amount == nil || amount.Sign() < 0 {
+			*unresolved++
+			return
+		}
+		total.Add(total, amount)
+	}
+	for _, cert := range certs {
+		switch cert := cert.(type) {
+		case *lcommon.StakeRegistrationCertificate,
+			*lcommon.PoolRegistrationCertificate:
+			unresolvedDeposits++
+		case *lcommon.StakeDeregistrationCertificate:
+			unresolvedRefunds++
+		case *lcommon.RegistrationCertificate:
+			if cert == nil {
+				unresolvedDeposits++
+				continue
+			}
+			add(deposits, cert.DepositAmount(), &unresolvedDeposits, &hasDeposits)
+		case *lcommon.StakeRegistrationDelegationCertificate:
+			if cert == nil {
+				unresolvedDeposits++
+				continue
+			}
+			add(deposits, cert.DepositAmount(), &unresolvedDeposits, &hasDeposits)
+		case *lcommon.VoteRegistrationDelegationCertificate:
+			if cert == nil {
+				unresolvedDeposits++
+				continue
+			}
+			add(deposits, cert.DepositAmount(), &unresolvedDeposits, &hasDeposits)
+		case *lcommon.StakeVoteRegistrationDelegationCertificate:
+			if cert == nil {
+				unresolvedDeposits++
+				continue
+			}
+			add(deposits, cert.DepositAmount(), &unresolvedDeposits, &hasDeposits)
+		case *lcommon.RegistrationDrepCertificate:
+			if cert == nil {
+				unresolvedDeposits++
+				continue
+			}
+			add(deposits, cert.DepositAmount(), &unresolvedDeposits, &hasDeposits)
+		case *lcommon.DeregistrationCertificate:
+			if cert == nil {
+				unresolvedRefunds++
+				continue
+			}
+			add(refunds, cert.DepositAmount(), &unresolvedRefunds, &hasRefunds)
+		case *lcommon.DeregistrationDrepCertificate:
+			if cert == nil {
+				unresolvedRefunds++
+				continue
+			}
+			add(refunds, cert.DepositAmount(), &unresolvedRefunds, &hasRefunds)
+		case *lcommon.StakeDelegationCertificate,
+			*lcommon.PoolRetirementCertificate,
+			*lcommon.GenesisKeyDelegationCertificate,
+			*lcommon.MoveInstantaneousRewardsCertificate,
+			*lcommon.VoteDelegationCertificate,
+			*lcommon.StakeVoteDelegationCertificate,
+			*lcommon.AuthCommitteeHotCertificate,
+			*lcommon.ResignCommitteeColdCertificate,
+			*lcommon.UpdateDrepCertificate:
+		default:
+			complete = false
+		}
+	}
+	depositTotal := ""
+	if hasDeposits {
+		depositTotal = deposits.String()
+	}
+	refundTotal := ""
+	if hasRefunds {
+		refundTotal = refunds.String()
+	}
+	return depositTotal, refundTotal, unresolvedDeposits, unresolvedRefunds, complete
+}
+
+func inspectProposalDeposit(proposals []lcommon.ProposalProcedure) (string, bool) {
+	if len(proposals) == 0 {
+		return "", true
+	}
+	total := new(big.Int)
+	for _, proposal := range proposals {
+		if proposal == nil {
+			return "", false
+		}
+		total.Add(total, new(big.Int).SetUint64(proposal.Deposit()))
+	}
+	return total.String(), true
+}
+
+func inspectTxOutput(out lcommon.TransactionOutput) TxOutput {
+	lovelace := "0"
+	if amt := out.Amount(); amt != nil {
+		lovelace = amt.String()
+	}
+	hasAssets := false
+	if assets := out.Assets(); assets != nil && len(assets.Policies()) > 0 {
+		hasAssets = true
+	}
+	return TxOutput{
+		Address:   out.Address().String(),
+		Lovelace:  lovelace,
+		HasAssets: hasAssets,
+	}
+}
+
+func eraName(txType uint) string {
+	switch txType {
+	case ledger.TxTypeByron:
+		return "Byron"
+	case ledger.TxTypeShelley:
+		return "Shelley"
+	case ledger.TxTypeAllegra:
+		return "Allegra"
+	case ledger.TxTypeMary:
+		return "Mary"
+	case ledger.TxTypeAlonzo:
+		return "Alonzo"
+	case ledger.TxTypeBabbage:
+		return "Babbage"
+	case ledger.TxTypeConway:
+		return "Conway"
+	case ledger.TxTypeDijkstra:
+		return "Dijkstra"
+	default:
+		return fmt.Sprintf("Unknown(%d)", txType)
+	}
+}
+
+// eraEnvelopeName returns the era name cardano-cli uses in text envelope
+// types, or "" for eras it has no envelope type for.
+func eraEnvelopeName(txType uint) string {
+	switch txType {
+	case ledger.TxTypeShelley:
+		return "Shelley"
+	case ledger.TxTypeAllegra:
+		return "Allegra"
+	case ledger.TxTypeMary:
+		return "Mary"
+	case ledger.TxTypeAlonzo:
+		return "Alonzo"
+	case ledger.TxTypeBabbage:
+		return "Babbage"
+	case ledger.TxTypeConway:
+		return "Conway"
+	case ledger.TxTypeDijkstra:
+		return "Dijkstra"
+	default:
+		return ""
+	}
+}
+
+// txEnvelopeType returns the cardano-cli text envelope type for a signed
+// transaction of the given era. Unknown eras fall back to the plain "Tx".
+func txEnvelopeType(txType uint) string {
+	switch txType {
+	case ledger.TxTypeShelley:
+		return "TxSignedShelley"
+	}
+	if era := eraEnvelopeName(txType); era != "" {
+		return "Tx " + era + "Era"
+	}
+	return "Tx"
+}
+
+// txWitnessEnvelopeType returns the cardano-cli text envelope type for a
+// detached witness of the given era. Unknown eras fall back to "TxWitness".
+func txWitnessEnvelopeType(txType uint) string {
+	if era := eraEnvelopeName(txType); era != "" {
+		return "TxWitness " + era + "Era"
+	}
+	return "TxWitness"
+}
+
+// TxEnvelopeTypes returns the text envelope types for a signed transaction
+// and a detached witness of the given era (a ledger.TxType value), as
+// cardano-cli expects them.
+func TxEnvelopeTypes(txType uint) (txEnvType, witnessEnvType string) {
+	return txEnvelopeType(txType), txWitnessEnvelopeType(txType)
+}
+
+// ErrAmbiguousTxEra is returned when transaction CBOR decodes in more than one
+// era and the input does not declare which one it is.
+var ErrAmbiguousTxEra = errors.New("transaction era is ambiguous")
+
+// envelopeEras lists the eras with cardano-cli text envelope types.
+var envelopeEras = []uint{
+	ledger.TxTypeShelley,
+	ledger.TxTypeAllegra,
+	ledger.TxTypeMary,
+	ledger.TxTypeAlonzo,
+	ledger.TxTypeBabbage,
+	ledger.TxTypeConway,
+	ledger.TxTypeDijkstra,
+}
+
+// txTypeFromEraName returns the transaction type for an era name such as
+// "babbage", compared case-insensitively.
+func txTypeFromEraName(name string) (uint, error) {
+	for _, txType := range envelopeEras {
+		if strings.EqualFold(eraEnvelopeName(txType), name) {
+			return txType, nil
+		}
+	}
+	return 0, fmt.Errorf("unknown era %q", name)
+}
+
+// envelopeTxType returns the era declared by a cardano-cli transaction text
+// envelope type such as "Tx BabbageEra", "Unwitnessed Tx ConwayEra" or
+// "TxSignedShelley". declared is false for raw hex input (empty type) and for
+// era-less types such as the plain "Tx" written by earlier Bursa releases.
+func envelopeTxType(envType string) (txType uint, declared bool, err error) {
+	switch envType {
+	case "TxSignedShelley", "TxUnsignedShelley":
+		return ledger.TxTypeShelley, true, nil
+	}
+	for _, prefix := range []string{"Unwitnessed Tx ", "Witnessed Tx ", "Tx "} {
+		rest, found := strings.CutPrefix(envType, prefix)
+		if !found {
+			continue
+		}
+		name, hasSuffix := strings.CutSuffix(rest, "Era")
+		if !hasSuffix {
+			return 0, false, fmt.Errorf("unsupported transaction envelope type %q", envType)
+		}
+		txType, err := txTypeFromEraName(name)
+		if err != nil {
+			return 0, false, fmt.Errorf("unsupported transaction envelope type %q: %w", envType, err)
+		}
+		return txType, true, nil
+	}
+	return 0, false, nil
+}
+
+// inferTxType determines the era of transaction CBOR that declares none. It
+// fails with ErrAmbiguousTxEra when the CBOR decodes in more than one era of
+// its transaction shape, because the era selects the envelope type and the
+// witness set encoding and cannot be guessed.
+func inferTxType(txCbor []byte) (uint, error) {
+	txType, err := ledger.DetermineTransactionType(txCbor)
+	if err != nil {
+		return 0, fmt.Errorf("failed to determine transaction era: %w", err)
+	}
+	var candidates []uint
+	switch txType {
+	case ledger.TxTypeShelley, ledger.TxTypeAllegra, ledger.TxTypeMary:
+		candidates = []uint{ledger.TxTypeShelley, ledger.TxTypeAllegra, ledger.TxTypeMary}
+	case ledger.TxTypeAlonzo, ledger.TxTypeBabbage, ledger.TxTypeConway:
+		candidates = []uint{ledger.TxTypeAlonzo, ledger.TxTypeBabbage, ledger.TxTypeConway}
+	default:
+		// Byron has its own shape; Dijkstra is only reported when the CBOR
+		// carries Dijkstra-only fields.
+		return txType, nil
+	}
+	var eras []string
+	for _, candidate := range candidates {
+		if _, err := ledger.NewTransactionFromCbor(candidate, txCbor); err == nil {
+			eras = append(eras, eraEnvelopeName(candidate))
+		}
+	}
+	if len(eras) > 1 {
+		return 0, fmt.Errorf("%w: the CBOR is valid in the %s eras", ErrAmbiguousTxEra, strings.Join(eras, ", "))
+	}
+	return txType, nil
+}
+
+// ReadTxInput decodes a transaction given as raw hex CBOR or a JSON text
+// envelope and returns its CBOR and era (a ledger.TxType value). The era is
+// taken from era (a name such as "babbage") when it is non-empty, otherwise
+// from the envelope type. Input that declares no era is accepted only when
+// its CBOR decodes in a single era; otherwise ReadTxInput fails with
+// ErrAmbiguousTxEra.
+func ReadTxInput(data []byte, era string) ([]byte, uint, error) {
+	raw, envType, err := readCborInput(data)
+	if err != nil {
+		return nil, 0, err
+	}
+	txType, declared, err := envelopeTxType(envType)
+	if err != nil {
+		return nil, 0, err
+	}
+	if era != "" {
+		eraType, err := txTypeFromEraName(era)
+		if err != nil {
+			return nil, 0, err
+		}
+		if declared && eraType != txType {
+			return nil, 0, fmt.Errorf("era %q conflicts with envelope type %q", era, envType)
+		}
+		txType, declared = eraType, true
+	}
+	if !declared {
+		txType, err = inferTxType(raw)
+		if err != nil {
+			return nil, 0, err
+		}
+		return raw, txType, nil
+	}
+	if _, err := ledger.NewTransactionFromCbor(txType, raw); err != nil {
+		return nil, 0, fmt.Errorf("transaction is not valid %s era CBOR: %w", eraEnvelopeName(txType), err)
+	}
+	return raw, txType, nil
+}
+
+// InspectTransaction decodes a transaction into a human-readable summary.
+func InspectTransaction(txCbor []byte) (*TxInspection, error) {
+	txType, err := ledger.DetermineTransactionType(txCbor)
+	if err != nil {
+		return nil, fmt.Errorf("failed to determine transaction era: %w", err)
+	}
+	tx, err := ledger.NewTransactionFromCbor(txType, txCbor)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode transaction: %w", err)
+	}
+	insp := &TxInspection{
+		TxId:          hex.EncodeToString(tx.Hash().Bytes()),
+		Era:           eraName(txType),
+		SizeBytes:     len(txCbor),
+		IsValid:       tx.IsValid(),
+		TTL:           tx.TTL(),
+		ValidityStart: tx.ValidityIntervalStart(),
+	}
+	if fee := tx.Fee(); fee != nil {
+		insp.Fee = fee.String()
+	}
+	for _, in := range tx.Inputs() {
+		insp.Inputs = append(insp.Inputs, TxInput{
+			TxId:  hex.EncodeToString(in.Id().Bytes()),
+			Index: in.Index(),
+		})
+	}
+	for _, out := range tx.Outputs() {
+		insp.Outputs = append(insp.Outputs, inspectTxOutput(out))
+	}
+	for _, in := range tx.Collateral() {
+		insp.CollateralInputs = append(insp.CollateralInputs, TxInput{
+			TxId:  hex.EncodeToString(in.Id().Bytes()),
+			Index: in.Index(),
+		})
+	}
+	if out := tx.CollateralReturn(); out != nil {
+		collateralReturn := inspectTxOutput(out)
+		insp.CollateralReturn = &collateralReturn
+	}
+	if lcommon.TransactionTotalCollateralPresent(tx) {
+		if total := tx.TotalCollateral(); total != nil {
+			insp.TotalCollateral = total.String()
+		}
+	}
+	certificates := tx.Certificates()
+	insp.CertificateCount = len(certificates)
+	depositTotal, refundTotal, unresolvedDeposits, unresolvedRefunds, certificateValuesComplete := inspectCertificateValues(certificates)
+	insp.CertificateDepositTotal = depositTotal
+	insp.CertificateRefundTotal = refundTotal
+	insp.UnresolvedCertificateDeposits = unresolvedDeposits
+	insp.UnresolvedCertificateRefunds = unresolvedRefunds
+	insp.CertificateValueEffectsComplete = certificateValuesComplete
+	insp.WithdrawalCount = len(tx.Withdrawals())
+	insp.HasMint = tx.AssetMint() != nil
+	insp.HasMetadata = tx.Metadata() != nil
+	insp.RequiredSigners = len(tx.RequiredSigners())
+	insp.VotingProcedureCount = len(tx.VotingProcedures())
+	proposals := tx.ProposalProcedures()
+	insp.ProposalProcedureCount = len(proposals)
+	proposalDepositTotal, proposalDepositsComplete := inspectProposalDeposit(proposals)
+	if proposalDepositsComplete {
+		insp.ProposalDepositTotal = proposalDepositTotal
+	}
+	if d := tx.Donation(); d != nil && d.Sign() > 0 {
+		insp.HasTreasuryDonation = true
+		insp.TreasuryDonationLovelace = d.String()
+	}
+	if ws := tx.Witnesses(); ws != nil {
+		insp.VkeyWitnesses = len(ws.Vkey())
+		insp.NativeScripts = len(ws.NativeScripts())
+	}
+	return insp, nil
+}
+
+// ProtocolParams holds the fee-relevant subset of cardano protocol parameters,
+// using the cardano-cli protocol-parameters.json field names.
+type ProtocolParams struct {
+	TxFeePerByte uint64 `json:"txFeePerByte"`
+	TxFeeFixed   uint64 `json:"txFeeFixed"`
+}
+
+// ParseProtocolParams parses a cardano-cli protocol-parameters JSON document,
+// extracting the fee-relevant fields.
+func ParseProtocolParams(data []byte) (ProtocolParams, error) {
+	var raw struct {
+		TxFeePerByte *uint64 `json:"txFeePerByte"`
+		TxFeeFixed   *uint64 `json:"txFeeFixed"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return ProtocolParams{}, fmt.Errorf("failed to parse protocol params: %w", err)
+	}
+	if raw.TxFeePerByte == nil || raw.TxFeeFixed == nil {
+		return ProtocolParams{}, errors.New("protocol params missing txFeePerByte/txFeeFixed")
+	}
+	return ProtocolParams{TxFeePerByte: *raw.TxFeePerByte, TxFeeFixed: *raw.TxFeeFixed}, nil
+}
+
+// MinFee returns the minimum fee in lovelace for a transaction of the given
+// serialized size: fee = txFeePerByte * sizeBytes + txFeeFixed. This base
+// linear formula does not include Plutus execution units or reference-script
+// tiers; for script transactions the result is a lower bound.
+//
+// The fee is a Cardano Coin and must fit in uint64. An invalid size or a fee
+// that cannot be represented as a Coin is returned as an error instead of
+// wrapping around.
+func MinFee(sizeBytes int, params ProtocolParams) (uint64, error) {
+	if sizeBytes < 0 {
+		return 0, fmt.Errorf("min fee: negative transaction size %d", sizeBytes)
+	}
+
+	productHigh, productLow := bits.Mul64(params.TxFeePerByte, uint64(sizeBytes))
+	if productHigh != 0 {
+		return 0, fmt.Errorf(
+			"min fee overflow: %d * %d exceeds uint64",
+			params.TxFeePerByte,
+			sizeBytes,
+		)
+	}
+	fee, carry := bits.Add64(productLow, params.TxFeeFixed, 0)
+	if carry != 0 {
+		return 0, fmt.Errorf(
+			"min fee overflow: %d + %d exceeds uint64",
+			productLow,
+			params.TxFeeFixed,
+		)
+	}
+	return fee, nil
+}
+
+// SignDigest signs an arbitrary message with the loaded key and returns the raw
+// 64-byte signature. Standard ed25519 keys use crypto/ed25519; extended
+// BIP32-Ed25519 keys use the Cardano signing routine. This is the low-level
+// signing primitive used by the remote signer's custody backends. The produced
+// signature is verified against the key's own public key before return; a
+// failure yields ErrSignatureVerification.
+//
+// SECURITY: SignDigest signs whatever bytes it is handed — it performs no
+// transaction decoding and no policy evaluation. Callers MUST only pass a
+// digest derived from a fully decoded, policy-checked request (e.g. the
+// blake2b-256 tx id from TransactionID after InspectTransaction, or a CIP-8
+// Sig_structure). Never wire this primitive to a caller-supplied, un-inspected
+// digest: doing so would let an attacker obtain a valid witness over an
+// arbitrary transaction body (a drain). The remote signer upholds this by
+// computing the digest itself from decoded CBOR and signing only after policy
+// passes; any new signing entry point must do the same.
+func SignDigest(lk *LoadedKey, msg []byte) ([]byte, error) {
+	_, sign, err := signerForKey(lk)
+	if err != nil {
+		return nil, err
+	}
+	return sign(msg)
+}
+
+// PublicKeyOf returns the canonical 32-byte Ed25519 verification key for the
+// loaded key (the value placed in a vkey witness and hashed for the key hash).
+func PublicKeyOf(lk *LoadedKey) ([]byte, error) {
+	vkey, _, err := signerForKey(lk)
+	if err != nil {
+		return nil, err
+	}
+	return vkey, nil
+}

@@ -1,0 +1,2125 @@
+// Copyright 2026 Blink Labs Software
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package localstatequery
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+
+	"github.com/blinklabs-io/gouroboros/cbor"
+	"github.com/blinklabs-io/gouroboros/ledger"
+	lcommon "github.com/blinklabs-io/gouroboros/ledger/common"
+	"github.com/blinklabs-io/gouroboros/protocol"
+	pcommon "github.com/blinklabs-io/gouroboros/protocol/common"
+)
+
+const maxLocalStateQuerySetItems = 10_000
+
+func validateLocalStateQuerySet[T any](items []T, name string) error {
+	if len(items) > maxLocalStateQuerySetItems {
+		return fmt.Errorf("%s contains %d items; maximum is %d", name, len(items), maxLocalStateQuerySetItems)
+	}
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		encoded, err := cbor.Encode(item)
+		if err != nil {
+			return fmt.Errorf("encode %s item: %w", name, err)
+		}
+		key := string(encoded)
+		if _, exists := seen[key]; exists {
+			return fmt.Errorf("%s contains duplicate item", name)
+		}
+		seen[key] = struct{}{}
+	}
+	return nil
+}
+
+// Client implements the LocalStateQuery client
+type Client struct {
+	*protocol.Protocol
+	config                        *Config
+	callbackContext               CallbackContext
+	enableGetChainBlockNo         bool
+	enableGetChainPoint           bool
+	enableGetRewardInfoPoolsBlock bool
+	enableGetLedgerPeerSnapshot   bool
+	enableLedgerPeerKind          bool
+	version                       uint16
+	busyMutex                     sync.Mutex
+	acquired                      bool
+	queryResultChan               chan []byte
+	acquireResultChan             chan error
+	currentEra                    int
+	onceStart                     sync.Once
+}
+
+// NewClient returns a new LocalStateQuery client object
+func NewClient(protoOptions protocol.ProtocolOptions, cfg *Config) *Client {
+	if cfg == nil {
+		tmpCfg := NewConfig()
+		cfg = &tmpCfg
+	}
+	c := &Client{
+		config:            cfg,
+		queryResultChan:   make(chan []byte),
+		acquireResultChan: make(chan error),
+		acquired:          false,
+		currentEra:        -1,
+	}
+	c.callbackContext = CallbackContext{
+		Client:       c,
+		ConnectionId: protoOptions.ConnectionId,
+	}
+	// Update state map with timeouts
+	stateMap := StateMap.Copy()
+	if entry, ok := stateMap[stateAcquiring]; ok {
+		entry.Timeout = c.config.AcquireTimeout
+		stateMap[stateAcquiring] = entry
+	}
+	if entry, ok := stateMap[stateQuerying]; ok {
+		entry.Timeout = c.config.QueryTimeout
+		stateMap[stateQuerying] = entry
+	}
+	// Configure underlying Protocol
+	protoConfig := protocol.ProtocolConfig{
+		Name:                ProtocolName,
+		ProtocolId:          ProtocolId,
+		Muxer:               protoOptions.Muxer,
+		Logger:              protoOptions.Logger,
+		ErrorChan:           protoOptions.ErrorChan,
+		Mode:                protoOptions.Mode,
+		Role:                protocol.ProtocolRoleClient,
+		MessageHandlerFunc:  c.messageHandler,
+		MessageFromCborFunc: NewMsgFromCbor,
+		StateMap:            stateMap,
+		InitialState:        stateIdle,
+		MaxReadBufferSize:   cfg.MaxReadBufferSize,
+	}
+	c.version = protoOptions.Version
+	// Enable version-dependent features
+	if (protoOptions.Version - protocol.ProtocolVersionNtCOffset) >= 10 {
+		c.enableGetChainBlockNo = true
+		c.enableGetChainPoint = true
+	}
+	if (protoOptions.Version - protocol.ProtocolVersionNtCOffset) >= 11 {
+		c.enableGetRewardInfoPoolsBlock = true
+	}
+	if (protoOptions.Version - protocol.ProtocolVersionNtCOffset) >= 19 {
+		c.enableGetLedgerPeerSnapshot = true
+	}
+	if (protoOptions.Version - protocol.ProtocolVersionNtCOffset) >= 23 {
+		c.enableLedgerPeerKind = true
+	}
+	c.Protocol = protocol.New(protoConfig)
+	return c
+}
+
+func (c *Client) Start() {
+	c.onceStart.Do(func() {
+		c.Protocol.Logger().
+			Debug("starting client protocol",
+				"component", "network",
+				"protocol", ProtocolName,
+				"connection_id", c.callbackContext.ConnectionId.String(),
+			)
+		c.Protocol.Start()
+		// Start goroutine to cleanup resources on protocol shutdown
+		go func() {
+			<-c.DoneChan()
+			close(c.queryResultChan)
+			close(c.acquireResultChan)
+		}()
+	})
+}
+
+// Acquire starts the acquire process for the specified chain point
+func (c *Client) Acquire(point *pcommon.Point) error {
+	// Use volatile tip if no point provided
+	if point == nil {
+		return c.AcquireVolatileTip()
+	}
+	c.Protocol.Logger().
+		Debug(
+			fmt.Sprintf(
+				"calling Acquire(point: {Slot: %d, Hash: %x})",
+				point.Slot,
+				point.Hash,
+			),
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	acquireTarget := AcquireSpecificPoint{
+		Point: *point,
+	}
+	return c.acquire(acquireTarget)
+}
+
+func (c *Client) AcquireVolatileTip() error {
+	c.Protocol.Logger().
+		Debug(
+			"calling AcquireVolatileTip",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	acquireTarget := AcquireVolatileTip{}
+	return c.acquire(acquireTarget)
+}
+
+func (c *Client) AcquireImmutableTip() error {
+	c.Protocol.Logger().
+		Debug(
+			"calling AcquireImmutableTip",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	acquireTarget := AcquireImmutableTip{}
+	return c.acquire(acquireTarget)
+}
+
+// Release releases the previously acquired chain point
+func (c *Client) Release() error {
+	c.Protocol.Logger().
+		Debug("calling Release()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	return c.release()
+}
+
+// GetCurrentEra returns the current era ID
+func (c *Client) GetCurrentEra() (int, error) {
+	c.Protocol.Logger().
+		Debug("calling GetCurrentEra()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	return c.getCurrentEra()
+}
+
+// GetSystemStart returns the SystemStart value
+func (c *Client) GetSystemStart() (*SystemStartResult, error) {
+	c.Protocol.Logger().
+		Debug("calling GetSystemStart()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	query := buildQuery(
+		QueryTypeSystemStart,
+	)
+	var result SystemStartResult
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// GetChainBlockNo returns the latest block number
+func (c *Client) GetChainBlockNo() (int64, error) {
+	c.Protocol.Logger().
+		Debug("calling GetChainBlockNo()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	query := buildQuery(
+		QueryTypeChainBlockNo,
+	)
+	result := []any{}
+	if err := c.runQuery(query, &result); err != nil {
+		return 0, err
+	}
+	switch {
+	case len(result) == 1 && result[0] == uint64(0):
+		return 0, nil
+	case len(result) == 2 && result[0] == uint64(1):
+		blockNo, ok := result[1].(uint64)
+		if !ok {
+			return 0, errors.New("malformed chain block number result")
+		}
+		if blockNo > uint64(1<<63-1) {
+			return 0, errors.New("chain block number is outside int64 API range")
+		}
+		return int64(blockNo), nil
+	default:
+		return 0, errors.New("malformed chain block number result")
+	}
+}
+
+// GetChainPoint returns the current chain tip
+func (c *Client) GetChainPoint() (*pcommon.Point, error) {
+	c.Protocol.Logger().
+		Debug("calling GetChainPoint()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	query := buildQuery(
+		QueryTypeChainPoint,
+	)
+	var result pcommon.Point
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// GetEraHistory returns the era history
+func (c *Client) GetEraHistory() ([]EraHistoryResult, error) {
+	c.Protocol.Logger().
+		Debug("calling GetEraHistory()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	query := buildHardForkQuery(QueryTypeHardForkEraHistory)
+	var result []EraHistoryResult
+	if err := c.runQuery(query, &result); err != nil {
+		return []EraHistoryResult{}, err
+	}
+	return result, nil
+}
+
+// GetEpochNo returns the current epoch number
+func (c *Client) GetEpochNo() (int, error) {
+	c.Protocol.Logger().
+		Debug("calling GetEpochNo()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return 0, err
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyEpochNo,
+	)
+	result := []int{}
+	if err := c.runQuery(query, &result); err != nil {
+		return 0, err
+	}
+	if len(result) == 0 {
+		return 0, errors.New("empty epoch number result")
+	}
+	return result[0], nil
+}
+
+// GetNonMyopicMemberRewards returns the non-myopic member rewards for the given stakes
+// stakes should be an array of [tag, stake_amount] pairs where tag is 0 for KeyHash credentials
+// The array must be sorted by stake amount
+func (c *Client) GetNonMyopicMemberRewards(stakes []any) (*NonMyopicMemberRewardsResult, error) {
+	c.Protocol.Logger().
+		Debug(fmt.Sprintf("calling GetNonMyopicMemberRewards(stakes: %+v)", stakes),
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	if err := validateLocalStateQuerySet(stakes, "stakes"); err != nil {
+		return nil, err
+	}
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	// Wrap the stakes in a CBOR set (tag 258)
+	stakesSet := cbor.NewSetType(stakes, true)
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyNonMyopicMemberRewards,
+		stakesSet,
+	)
+	// The result is wrapped in a single-element array
+	var wrappedResult []NonMyopicMemberRewardsResult
+	if err := c.runQuery(query, &wrappedResult); err != nil {
+		return nil, err
+	}
+	if len(wrappedResult) == 0 {
+		return nil, errors.New("empty result from non-myopic member rewards query")
+	}
+	return &wrappedResult[0], nil
+}
+
+// GetCurrentProtocolParams returns the set of protocol params that are currently in effect
+func (c *Client) GetCurrentProtocolParams() (lcommon.ProtocolParameters, error) {
+	c.Protocol.Logger().
+		Debug("calling GetCurrentProtocolParams()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyCurrentProtocolParams,
+	)
+	switch currentEra {
+	case ledger.EraIdDijkstra:
+		result := []ledger.DijkstraProtocolParameters{}
+		if err := c.runQuery(query, &result); err != nil {
+			return nil, err
+		}
+		if len(result) == 0 {
+			return nil, errors.New(
+				"empty result from Dijkstra protocol parameters query",
+			)
+		}
+		return &result[0], nil
+	case ledger.EraIdConway:
+		result := []ledger.ConwayProtocolParameters{}
+		if err := c.runQuery(query, &result); err != nil {
+			return nil, err
+		}
+		if len(result) == 0 {
+			return nil, errors.New("empty result from Conway protocol parameters query")
+		}
+		return &result[0], nil
+	case ledger.EraIdBabbage:
+		result := []ledger.BabbageProtocolParameters{}
+		if err := c.runQuery(query, &result); err != nil {
+			return nil, err
+		}
+		if len(result) == 0 {
+			return nil, errors.New("empty result from Babbage protocol parameters query")
+		}
+		return &result[0], nil
+	case ledger.EraIdAlonzo:
+		result := []ledger.AlonzoProtocolParameters{}
+		if err := c.runQuery(query, &result); err != nil {
+			return nil, err
+		}
+		if len(result) == 0 {
+			return nil, errors.New("empty result from Alonzo protocol parameters query")
+		}
+		return &result[0], nil
+	case ledger.EraIdMary:
+		result := []ledger.MaryProtocolParameters{}
+		if err := c.runQuery(query, &result); err != nil {
+			return nil, err
+		}
+		if len(result) == 0 {
+			return nil, errors.New("empty result from Mary protocol parameters query")
+		}
+		return &result[0], nil
+	case ledger.EraIdAllegra:
+		result := []ledger.AllegraProtocolParameters{}
+		if err := c.runQuery(query, &result); err != nil {
+			return nil, err
+		}
+		if len(result) == 0 {
+			return nil, errors.New("empty result from Allegra protocol parameters query")
+		}
+		return &result[0], nil
+	case ledger.EraIdShelley:
+		result := []ledger.ShelleyProtocolParameters{}
+		if err := c.runQuery(query, &result); err != nil {
+			return nil, err
+		}
+		if len(result) == 0 {
+			return nil, errors.New("empty result from Shelley protocol parameters query")
+		}
+		return &result[0], nil
+	default:
+		return nil, fmt.Errorf("unknown era ID: %d", currentEra)
+	}
+}
+
+// GetProposedProtocolParamsUpdates returns the set of proposed protocol params updates
+func (c *Client) GetProposedProtocolParamsUpdates() (*ProposedProtocolParamsUpdatesResult, error) {
+	c.Protocol.Logger().
+		Debug("calling GetProposedProtocolParamsUpdates()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	if !shelleyQuerySupported(
+		QueryTypeShelleyProposedProtocolParamsUpdates,
+		c.version,
+	) {
+		return nil, unsupportedQueryError(
+			"GetProposedPParamsUpdates",
+			c.version,
+		)
+	}
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyProposedProtocolParamsUpdates,
+	)
+	var result ProposedProtocolParamsUpdatesResult
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// GetStakeDistribution returns the stake distribution
+func (c *Client) GetStakeDistribution() (*StakeDistributionResult, error) {
+	c.Protocol.Logger().
+		Debug("calling GetStakeDistribution()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	if !shelleyQuerySupported(QueryTypeShelleyStakeDistribution, c.version) {
+		return nil, unsupportedQueryError("GetStakeDistribution", c.version)
+	}
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyStakeDistribution,
+	)
+	var result StakeDistributionResult
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// GetUTxOByAddress returns the UTxOs for a given list of ledger.Address structs
+func (c *Client) GetUTxOByAddress(
+	addrs []ledger.Address,
+) (*UTxOsResult, error) {
+	c.Protocol.Logger().
+		Debug(fmt.Sprintf("calling GetUTxOByAddress(addrs: %+v)", addrs),
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyUtxoByAddress,
+		addrs,
+	)
+	var result UTxOsResult
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// GetUTxOWhole returns the current UTxO set
+func (c *Client) GetUTxOWhole() (*UTxOsResult, error) {
+	c.Protocol.Logger().
+		Debug("calling GetUTxOWhole()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyUtxoWhole,
+	)
+	var result UTxOsResult
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// DebugEpochState returns the ledger's EpochState for the acquired point
+// (Shelley sub-query 8). See [DebugEpochStateResult] for which parts are typed.
+func (c *Client) DebugEpochState() (*DebugEpochStateResult, error) {
+	c.Protocol.Logger().
+		Debug("calling DebugEpochState()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyDebugEpochState,
+	)
+	return runWrappedQuery[DebugEpochStateResult](c, query, "epoch state")
+}
+
+func (c *Client) GetFilteredDelegationsAndRewardAccounts(
+	creds []StakeCredential,
+) (*FilteredDelegationsAndRewardAccountsResult, error) {
+	c.Protocol.Logger().
+		Debug(fmt.Sprintf("calling GetFilteredDelegationsAndRewardAccounts(creds: %+v)", creds),
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	if err := validateLocalStateQuerySet(creds, "credentials"); err != nil {
+		return nil, err
+	}
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyFilteredDelegationAndRewardAccounts,
+		cbor.NewSetType(creds, true),
+	)
+	var result FilteredDelegationsAndRewardAccountsResult
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// GetStakeDelegDeposits returns the deposits currently locked by the requested
+// registered stake credentials.
+func (c *Client) GetStakeDelegDeposits(
+	creds []StakeCredential,
+) (*StakeDelegDepositsResult, error) {
+	c.Protocol.Logger().
+		Debug(fmt.Sprintf("calling GetStakeDelegDeposits(creds: %+v)", creds),
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	if err := validateLocalStateQuerySet(creds, "credentials"); err != nil {
+		return nil, err
+	}
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyStakeDelegDeposits,
+		cbor.NewSetType(creds, true),
+	)
+	var result StakeDelegDepositsResult
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *Client) GetGenesisConfig() (*GenesisConfigResult, error) {
+	c.Protocol.Logger().
+		Debug("calling GetGenesisConfig()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyGenesisConfig,
+	)
+	result := []GenesisConfigResult{}
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	if len(result) == 0 {
+		return nil, errors.New("empty result from genesis config query")
+	}
+	return &result[0], nil
+}
+
+// DebugNewEpochState returns the ledger's NewEpochState for the acquired point
+// (Shelley sub-query 12). See [DebugNewEpochStateResult] for which parts are
+// typed.
+func (c *Client) DebugNewEpochState() (*DebugNewEpochStateResult, error) {
+	c.Protocol.Logger().
+		Debug("calling DebugNewEpochState()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyDebugNewEpochState,
+	)
+	return runWrappedQuery[DebugNewEpochStateResult](c, query, "new epoch state")
+}
+
+// DebugChainDepState returns the consensus chain-dependent state for the
+// acquired point (Shelley sub-query 13).
+//
+// Use this to read the authoritative on-chain operational-certificate counters
+// the node enforces during block validation: [DebugChainDepStateResult]
+// exposes OpCertCounters, a map from each block-issuer key hash (a stake pool's
+// cold-key hash) to the highest operational-certificate issue number the chain
+// has accepted for it. For the common case of just the counters, prefer
+// [Client.GetOpCertCounters].
+//
+// The result also carries the last-applied slot and the evolving/candidate
+// nonces (plus the Praos-only epoch nonces), so it can be combined with the
+// slots-per-KES-period value from [Client.GetGenesisConfig] to derive
+// KES-period-info for a pool's operational certificate.
+//
+// The decoder handles both the Praos (Babbage era and later, including Conway)
+// and TPraos (Shelley through Alonzo) serialisations.
+func (c *Client) DebugChainDepState() (*DebugChainDepStateResult, error) {
+	c.Protocol.Logger().
+		Debug("calling DebugChainDepState()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyDebugChainDepState,
+	)
+	return runWrappedQuery[DebugChainDepStateResult](c, query, "chain dep state")
+}
+
+// runWrappedQuery runs a query whose result the node sends inside the
+// one-element array every QueryIfCurrent answer carries, and returns the
+// element.
+//
+// Decoding the reply straight into T skips that layer and hands T's decoder the
+// outer array, which fails with an error about the shape T expects one level
+// down.
+func runWrappedQuery[T any](c *Client, query any, name string) (*T, error) {
+	result := []T{}
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("empty result from %s query", name)
+	}
+	return &result[0], nil
+}
+
+// GetOpCertCounters returns the authoritative on-chain operational-certificate
+// issue-number counter the node enforces for each block issuer (a stake pool's
+// cold-key hash). The value for a pool is the highest opcert issue number the
+// chain has accepted; a block presenting a lower number is rejected.
+//
+// This is a typed convenience wrapper over [Client.DebugChainDepState] for the
+// common case of reading only the counters. Use [DebugChainDepStateResult] via
+// DebugChainDepState directly when the slot or nonce fields are also needed.
+func (c *Client) GetOpCertCounters() (map[ledger.Blake2b224]uint64, error) {
+	result, err := c.DebugChainDepState()
+	if err != nil {
+		return nil, err
+	}
+	return result.OpCertCounters, nil
+}
+
+func (c *Client) GetRewardProvenance() (*RewardProvenanceResult, error) {
+	c.Protocol.Logger().
+		Debug("calling GetRewardProvenance()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyRewardProvenance,
+	)
+	var result RewardProvenanceResult
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *Client) GetUTxOByTxIn(
+	txIns []ledger.TransactionInput,
+) (*UTxOByTxInResult, error) {
+	c.Protocol.Logger().
+		Debug(fmt.Sprintf("calling GetUTxOByTxIn(txIns: %+v)", txIns),
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyUtxoByTxin,
+		txIns,
+	)
+	var result UTxOByTxInResult
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *Client) GetStakePools() (*StakePoolsResult, error) {
+	c.Protocol.Logger().
+		Debug("calling GetStakePools()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyStakePools,
+	)
+	var result StakePoolsResult
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *Client) GetAccountState() (*AccountStateResult, error) {
+	c.Protocol.Logger().
+		Debug("calling GetAccountState()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	if currentEra < ledger.EraIdConway {
+		return nil, fmt.Errorf(
+			"GetAccountState requires Conway era or later (current era: %d)",
+			currentEra,
+		)
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyAccountState,
+	)
+	var result AccountStateResult
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *Client) GetStakePoolParams(
+	poolIds []ledger.PoolId,
+) (*StakePoolParamsResult, error) {
+	c.Protocol.Logger().
+		Debug(fmt.Sprintf("calling GetStakePoolParams(poolIds: %+v)", poolIds),
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyStakePoolParams,
+		cbor.Tag{
+			Number:  cbor.CborTagSet,
+			Content: poolIds,
+		},
+	)
+	var result StakePoolParamsResult
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *Client) GetRewardInfoPools() (*RewardInfoPoolsResult, error) {
+	c.Protocol.Logger().
+		Debug("calling GetRewardInfoPools()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyRewardInfoPools,
+	)
+	var result RewardInfoPoolsResult
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *Client) GetPoolState(poolIds []any) (*PoolStateResult, error) {
+	c.Protocol.Logger().
+		Debug(fmt.Sprintf("calling GetPoolState(poolIds: %+v)", poolIds),
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	if err := validateLocalStateQuerySet(poolIds, "pool IDs"); err != nil {
+		return nil, err
+	}
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	poolFilter := poolFilterQueryParam(poolIds)
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyPoolState,
+		poolFilter,
+	)
+	result := []PoolStateResult{}
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	if len(result) == 0 {
+		return nil, errors.New("empty result from pool state query")
+	}
+	return &result[0], nil
+}
+
+// GetStakePoolState returns the state of the registered stake pools, Shelley
+// sub-query 40. Only Leios prototype nodes answer it today, from
+// node-to-client protocol version 23: released nodes have no such query, so
+// calling it against one fails.
+//
+// Passing no pool IDs asks about every pool. The delegators of each pool are
+// only included when includeDelegators is set, as they make up most of the
+// size of the reply.
+func (c *Client) GetStakePoolState(
+	poolIds []ledger.PoolId,
+	includeDelegators bool,
+) (*StakePoolStateResult, error) {
+	c.Protocol.Logger().
+		Debug(fmt.Sprintf(
+			"calling GetStakePoolState(poolIds: %+v, includeDelegators: %v)",
+			poolIds,
+			includeDelegators,
+		),
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	if !shelleyQuerySupported(QueryTypeShelleyStakePoolState, c.version) {
+		return nil, unsupportedQueryError("GetStakePoolState", c.version)
+	}
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	poolSet, err := encodeStakePoolIdSet(poolIds)
+	if err != nil {
+		return nil, err
+	}
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	// The pool filter is a StrictMaybe (Set PoolId), encoded as a list: an
+	// empty list selects all pools (SNothing), while a single-element list
+	// holding a tag-258 set restricts the reply to those pools (SJust).
+	poolFilter := []any{}
+	if poolSet != nil {
+		poolFilter = append(poolFilter, cbor.RawMessage(poolSet))
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyStakePoolState,
+		poolFilter,
+		includeDelegators,
+	)
+	var result StakePoolStateResult
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *Client) GetStakeSnapshots(
+	poolIds []any,
+) (*StakeSnapshotsResult, error) {
+	c.Protocol.Logger().
+		Debug(fmt.Sprintf("calling GetStakeSnapshots(poolIds: %+v)", poolIds),
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	if err := validateLocalStateQuerySet(poolIds, "pool IDs"); err != nil {
+		return nil, err
+	}
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	// GetStakeSnapshots takes a StrictMaybe (Set PoolId), encoded as a
+	// list: an empty list selects all pools (SNothing), while a
+	// single-element list holding a tag-258 set restricts the result to
+	// those pools (SJust). See dingo issue #2917.
+	poolFilter := []any{}
+	if len(poolIds) > 0 {
+		poolFilter = append(poolFilter, cbor.NewSetType(poolIds, true))
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyStakeSnapshots,
+		poolFilter,
+	)
+	// The result is wrapped in a single-element array
+	var wrappedResult []StakeSnapshotsResult
+	if err := c.runQuery(query, &wrappedResult); err != nil {
+		return nil, err
+	}
+	if len(wrappedResult) == 0 {
+		return nil, errors.New("empty result from stake snapshots query")
+	}
+	return &wrappedResult[0], nil
+}
+
+func (c *Client) GetPoolDistr(poolIds []any) (*PoolDistrResult, error) {
+	c.Protocol.Logger().
+		Debug(fmt.Sprintf("calling GetPoolDistr(poolIds: %+v)", poolIds),
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	if !shelleyQuerySupported(QueryTypeShelleyPoolDistr, c.version) {
+		return nil, unsupportedQueryError("GetPoolDistr", c.version)
+	}
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	if err := validateLocalStateQuerySet(poolIds, "pool IDs"); err != nil {
+		return nil, err
+	}
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	poolFilter := poolFilterQueryParam(poolIds)
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyPoolDistr,
+		poolFilter,
+	)
+	var result PoolDistrResult
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// poolFilterQueryParam encodes the StrictMaybe (Set PoolId) argument used by
+// the filtered Shelley pool queries. An empty StrictMaybe requests all pools.
+func poolFilterQueryParam(poolIds []any) []any {
+	poolFilter := []any{}
+	if len(poolIds) > 0 {
+		poolFilter = append(poolFilter, cbor.NewSetType(poolIds, true))
+	}
+	return poolFilter
+}
+
+// GetPoolDistr2 returns the ledger's pool stake distribution, which replaces
+// GetPoolDistr from node-to-client protocol version 21.
+//
+// Passing no pool IDs asks about every pool. The reply carries each pool's
+// total delegated stake and the total active stake across all pools, neither of
+// which GetPoolDistr returned.
+func (c *Client) GetPoolDistr2(
+	poolIds []ledger.PoolId,
+) (*PoolDistr2Result, error) {
+	c.Protocol.Logger().
+		Debug(fmt.Sprintf("calling GetPoolDistr2(poolIds: %+v)", poolIds),
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	if !shelleyQuerySupported(QueryTypeShelleyPoolDistr2, c.version) {
+		return nil, unsupportedQueryError("GetPoolDistr2", c.version)
+	}
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	if err := validateLocalStateQuerySet(poolIds, "pool IDs"); err != nil {
+		return nil, err
+	}
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	// The pool filter is a StrictMaybe encoded as a list, so an empty list asks
+	// about every pool rather than about none.
+	poolFilter := []any{}
+	if len(poolIds) > 0 {
+		poolFilter = append(poolFilter, cbor.NewSetType(poolIds, true))
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyPoolDistr2,
+		poolFilter,
+	)
+	var result StakeDistribution2Result
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result.Distribution, nil
+}
+
+// GetConstitution returns the current on-chain constitution (CIP-1694).
+//
+// Use this to read the constitution that governance actions are checked
+// against: its metadata anchor (URL and hash of the constitution document)
+// and the optional guardrails script hash that constrains protocol-parameter
+// and treasury-withdrawal actions.
+//
+// Response: a [ConstitutionResult] with the anchor and optional guardrails
+// script hash (nil when no guardrails script is set).
+//
+// Era: requires the Conway era or later. Returns an error if the acquired
+// ledger state is on an earlier era.
+func (c *Client) GetConstitution() (*ConstitutionResult, error) {
+	c.Protocol.Logger().
+		Debug("calling GetConstitution()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	if currentEra < ledger.EraIdConway {
+		return nil, fmt.Errorf(
+			"GetConstitution requires Conway era or later (current era: %d)",
+			currentEra,
+		)
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyConstitution,
+	)
+	var result ConstitutionResult
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// GetGovState returns the full governance state (CIP-1694).
+//
+// Use this as the one-shot snapshot of everything governance-related: the
+// active proposals with their voting state, the constitutional committee, the
+// constitution, the current/previous/scheduled protocol parameters, and the
+// DRep pulsing state. Prefer the narrower queries ([Client.GetProposals],
+// [Client.GetDRepState], [Client.GetCommitteeMembersState]) when you only need
+// one piece, as this query returns and decodes considerably more data.
+//
+// Response: a [GovStateResult]. Several fields are returned as raw CBOR
+// because their shape is era-specific; the Committee field is a StrictMaybe
+// and can be decoded with [GovStateResult.DecodeCommittee].
+//
+// Era: requires the Conway era or later. Returns an error if the acquired
+// ledger state is on an earlier era.
+func (c *Client) GetGovState() (*GovStateResult, error) {
+	c.Protocol.Logger().
+		Debug("calling GetGovState()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	if currentEra < ledger.EraIdConway {
+		return nil, fmt.Errorf(
+			"GetGovState requires Conway era or later (current era: %d)",
+			currentEra,
+		)
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyGovState,
+	)
+	var result GovStateResult
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// GetDRepState returns the registration state of delegate representatives
+// (DReps) (CIP-1694).
+//
+// Use this to inspect registered DReps: when each one's activity period
+// expires, the deposit it locked at registration, and its optional metadata
+// anchor. Pass a list of DRep credentials to filter the response, or nil/empty
+// to return the state of every registered DRep.
+//
+// Response: a [DRepStateResult], a map keyed by each DRep's credential with a
+// [DRepStateEntry] value (expiry epoch, deposit, optional anchor).
+//
+// Era: requires the Conway era or later. Returns an error if the acquired
+// ledger state is on an earlier era.
+func (c *Client) GetDRepState(
+	credentials []lcommon.Credential,
+) (*DRepStateResult, error) {
+	c.Protocol.Logger().
+		Debug(fmt.Sprintf("calling GetDRepState(credentials: %d)", len(credentials)),
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	if err := validateLocalStateQuerySet(credentials, "credentials"); err != nil {
+		return nil, err
+	}
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	if currentEra < ledger.EraIdConway {
+		return nil, fmt.Errorf(
+			"GetDRepState requires Conway era or later (current era: %d)",
+			currentEra,
+		)
+	}
+	// Create a CBOR set from the credentials
+	if credentials == nil {
+		credentials = []lcommon.Credential{}
+	}
+	credSet := cbor.Tag{
+		Number:  cbor.CborTagSet,
+		Content: credentials,
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyDRepState,
+		credSet,
+	)
+	// The result is wrapped in a single-element array.
+	var wrappedResult []DRepStateResult
+	if err := c.runQuery(query, &wrappedResult); err != nil {
+		return nil, err
+	}
+	if len(wrappedResult) == 0 {
+		return nil, errors.New("empty result from DRep state query")
+	}
+	return &wrappedResult[0], nil
+}
+
+// GetDRepStakeDistr returns the stake distribution across DReps (CIP-1694).
+//
+// Use this to read the voting power (total delegated stake, in lovelace) of
+// DReps, for example to weigh how a proposal's DRep votes translate into
+// stake. Pass a list of DReps to filter the response, or nil/empty for the
+// full distribution. Note the [lcommon.Drep] type also covers the predefined
+// Abstain and NoConfidence options, not only credential-backed DReps.
+//
+// Response: a [DRepStakeDistrResult], one [DRepStakeDistrEntry] per DRep in
+// the reply, carrying the DRep and the lovelace delegated to it.
+//
+// Era: requires the Conway era or later. Returns an error if the acquired
+// ledger state is on an earlier era.
+func (c *Client) GetDRepStakeDistr(
+	dreps []lcommon.Drep,
+) (*DRepStakeDistrResult, error) {
+	c.Protocol.Logger().
+		Debug(fmt.Sprintf("calling GetDRepStakeDistr(dreps: %d)", len(dreps)),
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	if err := validateLocalStateQuerySet(dreps, "DReps"); err != nil {
+		return nil, err
+	}
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	if currentEra < ledger.EraIdConway {
+		return nil, fmt.Errorf(
+			"GetDRepStakeDistr requires Conway era or later (current era: %d)",
+			currentEra,
+		)
+	}
+	// Create a CBOR set from the dreps
+	if dreps == nil {
+		dreps = []lcommon.Drep{}
+	}
+	drepSet := cbor.Tag{
+		Number:  cbor.CborTagSet,
+		Content: dreps,
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyDRepStakeDistr,
+		drepSet,
+	)
+	var result DRepStakeDistrResult
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// GetCommitteeMembersState returns the state of the constitutional committee
+// (CIP-1694).
+//
+// Use this to inspect committee members and their standing: each member's
+// hot-credential authorization status (not-authorized, authorized, or
+// resigned), its term status (active, expired, or unrecognized), its term
+// expiry epoch, and any change scheduled for the next epoch boundary, along
+// with the committee voting threshold and the current epoch.
+//
+// The three filters narrow the response: by member cold credentials, by hot
+// credentials, and by member status (see [MemberStatus]). Pass nil/empty for a
+// filter to leave it unconstrained; passing nil for all three returns every
+// member. The committee uses a hot/cold key setup, so a member is identified
+// by its cold credential and votes with its authorized hot credential.
+//
+// Response: a [CommitteeMembersStateResult] mapping each member's cold
+// credential to a [CommitteeMemberState], plus the [cbor.Rat] threshold and
+// epoch.
+//
+// Era: requires the Conway era or later. Returns an error if the acquired
+// ledger state is on an earlier era.
+func (c *Client) GetCommitteeMembersState(
+	coldCreds []lcommon.Credential,
+	hotCreds []lcommon.Credential,
+	statuses []int,
+) (*CommitteeMembersStateResult, error) {
+	c.Protocol.Logger().
+		Debug("calling GetCommitteeMembersState()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	if err := validateLocalStateQuerySet(coldCreds, "cold credentials"); err != nil {
+		return nil, err
+	}
+	if err := validateLocalStateQuerySet(hotCreds, "hot credentials"); err != nil {
+		return nil, err
+	}
+	if err := validateLocalStateQuerySet(statuses, "statuses"); err != nil {
+		return nil, err
+	}
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	if currentEra < ledger.EraIdConway {
+		return nil, fmt.Errorf(
+			"GetCommitteeMembersState requires Conway era or later (current era: %d)",
+			currentEra,
+		)
+	}
+	// Create CBOR sets for each filter
+	if coldCreds == nil {
+		coldCreds = []lcommon.Credential{}
+	}
+	if hotCreds == nil {
+		hotCreds = []lcommon.Credential{}
+	}
+	if statuses == nil {
+		statuses = []int{}
+	}
+	coldSet := cbor.Tag{
+		Number:  cbor.CborTagSet,
+		Content: coldCreds,
+	}
+	hotSet := cbor.Tag{
+		Number:  cbor.CborTagSet,
+		Content: hotCreds,
+	}
+	statusSet := cbor.Tag{
+		Number:  cbor.CborTagSet,
+		Content: statuses,
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyCommitteeMembersState,
+		coldSet,
+		hotSet,
+		statusSet,
+	)
+	var result CommitteeMembersStateResult
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// GetFilteredVoteDelegatees returns the DRep that each stake credential has
+// delegated its vote to (CIP-1694).
+//
+// Use this to look up where stake credentials have delegated their voting
+// rights. Per CIP-1694 a vote-delegation certificate maps a stake credential
+// to a DRep credential, so each result is a single [lcommon.Drep]; that DRep
+// may be a credential-backed DRep or one of the predefined Abstain or
+// NoConfidence options. Pass a list of stake credentials to filter the
+// response, or nil/empty to return delegations for all credentials.
+//
+// Response: a [FilteredVoteDelegateesResult], a map keyed by stake credential
+// with the delegated [lcommon.Drep] as the value.
+//
+// Era: requires the Conway era or later. Returns an error if the acquired
+// ledger state is on an earlier era.
+func (c *Client) GetFilteredVoteDelegatees(
+	credentials []lcommon.Credential,
+) (*FilteredVoteDelegateesResult, error) {
+	c.Protocol.Logger().
+		Debug(fmt.Sprintf("calling GetFilteredVoteDelegatees(credentials: %d)", len(credentials)),
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	if err := validateLocalStateQuerySet(credentials, "credentials"); err != nil {
+		return nil, err
+	}
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	if currentEra < ledger.EraIdConway {
+		return nil, fmt.Errorf(
+			"GetFilteredVoteDelegatees requires Conway era or later (current era: %d)",
+			currentEra,
+		)
+	}
+	// Create a CBOR set from the credentials
+	if credentials == nil {
+		credentials = []lcommon.Credential{}
+	}
+	credSet := cbor.Tag{
+		Number:  cbor.CborTagSet,
+		Content: credentials,
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyFilteredVoteDelegatees,
+		credSet,
+	)
+	var result FilteredVoteDelegateesResult
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// GetSPOStakeDistr returns the stake-pool-operator (SPO) stake distribution
+// used for governance voting (CIP-1694).
+//
+// Use this to read each pool's governance voting power (the Lovelace delegated
+// to it), for example to weigh how SPO votes on a proposal translate into
+// stake. This is the governance-voting view of pool stake, distinct from the
+// block-production stake distribution returned by [Client.GetStakeDistribution].
+// Pass a list of pool IDs to filter the response, or nil/empty for all pools.
+//
+// Response: an [SPOStakeDistrResult] mapping each pool ID to its voting power
+// in Lovelace.
+//
+// Era: requires the Conway era or later. Returns an error if the acquired
+// ledger state is on an earlier era.
+func (c *Client) GetSPOStakeDistr(
+	poolIds []ledger.PoolId,
+) (*SPOStakeDistrResult, error) {
+	c.Protocol.Logger().
+		Debug(fmt.Sprintf("calling GetSPOStakeDistr(poolIds: %d)", len(poolIds)),
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	if err := validateLocalStateQuerySet(poolIds, "pool IDs"); err != nil {
+		return nil, err
+	}
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	if currentEra < ledger.EraIdConway {
+		return nil, fmt.Errorf(
+			"GetSPOStakeDistr requires Conway era or later (current era: %d)",
+			currentEra,
+		)
+	}
+	// Create a CBOR set from the pool IDs
+	if poolIds == nil {
+		poolIds = []ledger.PoolId{}
+	}
+	poolSet := cbor.Tag{
+		Number:  cbor.CborTagSet,
+		Content: poolIds,
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleySPOStakeDistr,
+		poolSet,
+	)
+	var result SPOStakeDistrResult
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// GetProposals returns all active governance proposals (CIP-1694).
+//
+// Use this to enumerate governance actions that are currently open for voting
+// and to inspect their tally. Each entry carries the governance action ID (the
+// creating transaction hash plus the action's index within that transaction),
+// the votes cast so far by the constitutional committee, DReps, and SPOs, the
+// raw proposal procedure, and the epoch window during which the action is live
+// (proposed-in epoch through expires-after epoch).
+//
+// Response: a [ProposalsResult], a slice of [GovActionState], one per active
+// proposal.
+//
+// Era: requires the Conway era or later. Returns an error if the acquired
+// ledger state is on an earlier era.
+func (c *Client) GetProposals() (*ProposalsResult, error) {
+	c.Protocol.Logger().
+		Debug("calling GetProposals()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	if currentEra < ledger.EraIdConway {
+		return nil, fmt.Errorf(
+			"GetProposals requires Conway era or later (current era: %d)",
+			currentEra,
+		)
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyGetProposals,
+		cbor.NewSetType([]lcommon.GovActionId{}, true),
+	)
+	var result ProposalsResult
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// GetRatifyState returns the current governance ratification state (CIP-1694).
+//
+// Governance actions are checked for ratification on the epoch boundary and
+// enacted on the following boundary. Use this to see the outcome of that
+// process for the current epoch: the enact state (the committee, constitution,
+// protocol parameters, treasury, withdrawals, and previous governance action
+// IDs that will take effect), the actions that were ratified/enacted, the IDs
+// of actions that expired, and a delayed flag indicating that enactment of
+// further actions is held back this epoch (for example behind a hard fork).
+//
+// Response: a [RatifyStateResult] with the [EnactState], the enacted
+// [GovActionState] list, the expired [lcommon.GovActionId] list, and the
+// delayed flag.
+//
+// Era: requires the Conway era or later. Returns an error if the acquired
+// ledger state is on an earlier era.
+func (c *Client) GetRatifyState() (*RatifyStateResult, error) {
+	c.Protocol.Logger().
+		Debug("calling GetRatifyState()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	if currentEra < ledger.EraIdConway {
+		return nil, fmt.Errorf(
+			"GetRatifyState requires Conway era or later (current era: %d)",
+			currentEra,
+		)
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyGetRatifyState,
+	)
+	var result RatifyStateResult
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// GetStakePoolDefaultVote returns the vote the ledger counts for a stake pool
+// on a governance action the pool does not vote on, which follows from the
+// DRep delegation of the pool's reward account.
+//
+// Requires node-to-client version 20 or later and the Conway era or later.
+func (c *Client) GetStakePoolDefaultVote(
+	poolId ledger.PoolId,
+) (DefaultVote, error) {
+	c.Protocol.Logger().
+		Debug(
+			fmt.Sprintf("calling GetStakePoolDefaultVote(poolId: %s)", poolId),
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	if !shelleyQuerySupported(QueryTypeShelleyStakePoolDefaultVote, c.version) {
+		return 0, unsupportedQueryError("QueryStakePoolDefaultVote", c.version)
+	}
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return 0, err
+	}
+	if currentEra < ledger.EraIdConway {
+		return 0, fmt.Errorf(
+			"QueryStakePoolDefaultVote requires Conway era or later (current era: %d)",
+			currentEra,
+		)
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyStakePoolDefaultVote,
+		poolId,
+	)
+	var result StakePoolDefaultVoteResult
+	if err := c.runQuery(query, &result); err != nil {
+		return 0, err
+	}
+	return result.Vote, nil
+}
+
+// GetStakeDistribution2 returns the ledger's pool stake distribution, which
+// replaces GetStakeDistribution from node-to-client version 21. Unlike
+// GetPoolDistr2 it takes no pool filter.
+func (c *Client) GetStakeDistribution2() (*StakeDistribution2Result, error) {
+	c.Protocol.Logger().
+		Debug("calling GetStakeDistribution2()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	if !shelleyQuerySupported(QueryTypeShelleyStakeDistribution2, c.version) {
+		return nil, unsupportedQueryError("GetStakeDistribution2", c.version)
+	}
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyStakeDistribution2,
+	)
+	var result StakeDistribution2Result
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// GetMaxMajorProtocolVersion returns the highest major protocol version the
+// node can follow. Requires node-to-client version 21 or later.
+func (c *Client) GetMaxMajorProtocolVersion() (uint64, error) {
+	c.Protocol.Logger().
+		Debug("calling GetMaxMajorProtocolVersion()",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	if !shelleyQuerySupported(
+		QueryTypeShelleyMaxMajorProtocolVersion,
+		c.version,
+	) {
+		return 0, unsupportedQueryError(
+			"GetMaxMajorProtocolVersion",
+			c.version,
+		)
+	}
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return 0, err
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyMaxMajorProtocolVersion,
+	)
+	var result MaxMajorProtocolVersionResult
+	if err := c.runQuery(query, &result); err != nil {
+		return 0, err
+	}
+	return result.Version, nil
+}
+
+// GetDRepDelegations returns the stake credentials delegated to each of the
+// given DReps. Pass nil or an empty slice to cover every DRep.
+//
+// Requires node-to-client version 23 or later and the Conway era or later.
+func (c *Client) GetDRepDelegations(
+	dreps []lcommon.Drep,
+) (*DRepDelegationsResult, error) {
+	c.Protocol.Logger().
+		Debug(fmt.Sprintf("calling GetDRepDelegations(dreps: %d)", len(dreps)),
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	if !shelleyQuerySupported(QueryTypeShelleyDRepDelegations, c.version) {
+		return nil, unsupportedQueryError("GetDRepDelegations", c.version)
+	}
+	if err := validateLocalStateQuerySet(dreps, "DReps"); err != nil {
+		return nil, err
+	}
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	if currentEra < ledger.EraIdConway {
+		return nil, fmt.Errorf(
+			"GetDRepDelegations requires Conway era or later (current era: %d)",
+			currentEra,
+		)
+	}
+	if dreps == nil {
+		dreps = []lcommon.Drep{}
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyDRepDelegations,
+		cbor.Tag{Number: cbor.CborTagSet, Content: dreps},
+	)
+	var result DRepDelegationsResult
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// GetLedgerPeerSnapshot returns the ledger peer snapshot used by
+// node-to-node peer discovery (introduced at node-to-client protocol version
+// 19 / cardano-node 10.7). Versions 19 to 22 expose only LedgerPeerKindBig,
+// the high-stake pools used by Genesis diffusion; LedgerPeerKindAll requires
+// node-to-client version 23 or later.
+//
+// The returned LedgerPeerSnapshotResult preserves the snapshot slot (or
+// origin), each pool's stake, and the typed list of IPv4, IPv6, domain and
+// SRV relay endpoints. From version 23 it also carries the snapshot's block
+// hash and network magic.
+//
+// Returns ErrLedgerPeerSnapshotUnsupportedVersion if the negotiated
+// node-to-client protocol version does not advertise the query.
+func (c *Client) GetLedgerPeerSnapshot(
+	peerKind LedgerPeerKind,
+) (*LedgerPeerSnapshotResult, error) {
+	c.Protocol.Logger().
+		Debug(fmt.Sprintf("calling GetLedgerPeerSnapshot(peerKind: %d)", peerKind),
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	var wantVersion uint64
+	switch peerKind {
+	case LedgerPeerKindAll:
+		wantVersion = ledgerPeerSnapshotWireVersionAll
+	case LedgerPeerKindBig:
+		wantVersion = ledgerPeerSnapshotWireVersionBig
+	default:
+		return nil, fmt.Errorf("invalid LedgerPeerKind: %d", peerKind)
+	}
+	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
+	if !c.enableGetLedgerPeerSnapshot {
+		return nil, ErrLedgerPeerSnapshotUnsupportedVersion
+	}
+	var params []any
+	if c.enableLedgerPeerKind {
+		params = []any{int(peerKind)}
+	} else {
+		if peerKind != LedgerPeerKindBig {
+			return nil, ErrLedgerPeerKindUnsupportedVersion
+		}
+		wantVersion = ledgerPeerSnapshotWireVersion
+	}
+	currentEra, err := c.getCurrentEra()
+	if err != nil {
+		return nil, err
+	}
+	query := buildShelleyQuery(
+		currentEra,
+		QueryTypeShelleyGetLedgerPeerSnapshot,
+		params...,
+	)
+	// The snapshot arrives inside the single-element era result wrapper.
+	var result struct {
+		cbor.StructAsArray
+		Snapshot LedgerPeerSnapshotResult
+	}
+	if err := c.runQuery(query, &result); err != nil {
+		return nil, err
+	}
+	if result.Snapshot.Version != wantVersion {
+		return nil, fmt.Errorf("%w: got %d, expected %d",
+			ErrLedgerPeerSnapshotUnsupportedWireVersion,
+			result.Snapshot.Version,
+			wantVersion,
+		)
+	}
+	return &result.Snapshot, nil
+}
+
+func (c *Client) messageHandler(msg protocol.Message) error {
+	var err error
+	switch msg.Type() {
+	case MessageTypeAcquired:
+		err = c.handleAcquired()
+	case MessageTypeFailure:
+		err = c.handleFailure(msg)
+	case MessageTypeResult:
+		err = c.handleResult(msg)
+	default:
+		err = fmt.Errorf(
+			"%s: received unexpected message type %d",
+			ProtocolName,
+			msg.Type(),
+		)
+	}
+	return err
+}
+
+func (c *Client) handleAcquired() error {
+	c.Protocol.Logger().
+		Debug("acquired",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	// Check for shutdown
+	select {
+	case <-c.DoneChan():
+		return protocol.ErrProtocolShuttingDown
+	default:
+	}
+	c.acquired = true
+	// Invalidate the cached era before signaling completion on
+	// acquireResultChan, not after: a caller blocked in acquire() wakes up
+	// on that channel receive and can immediately call a query that reads
+	// currentEra (getCurrentEra, via GetCurrentProtocolParams/GetEpochNo/
+	// etc.). Writing it after the send has no happens-before relationship
+	// to that caller's subsequent read -- a data race under the Go memory
+	// model, confirmed live under -race with a low-latency (fast, local)
+	// server, where the window between the two statements is otherwise
+	// too narrow to hit against normal network latency.
+	c.currentEra = -1
+	c.acquireResultChan <- nil
+	return nil
+}
+
+func (c *Client) handleFailure(msg protocol.Message) error {
+	c.Protocol.Logger().
+		Debug("failed",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	// Check for shutdown
+	select {
+	case <-c.DoneChan():
+		return protocol.ErrProtocolShuttingDown
+	default:
+	}
+	msgFailure := msg.(*MsgFailure)
+	var acquireErr error
+	switch msgFailure.Failure {
+	case AcquireFailurePointTooOld:
+		acquireErr = ErrAcquireFailurePointTooOld
+	case AcquireFailurePointNotOnChain:
+		acquireErr = ErrAcquireFailurePointNotOnChain
+	default:
+		return fmt.Errorf("unknown failure type: %d", msgFailure.Failure)
+	}
+	// Failure releases the snapshot even after ReAcquire. Publish idle state
+	// before waking a caller that can immediately acquire or query again.
+	c.acquired = false
+	c.currentEra = -1
+	c.acquireResultChan <- acquireErr
+	return nil
+}
+
+func (c *Client) handleResult(msg protocol.Message) error {
+	c.Protocol.Logger().
+		Debug("results",
+			"component", "network",
+			"protocol", ProtocolName,
+			"role", "client",
+			"connection_id", c.callbackContext.ConnectionId.String(),
+		)
+	// Check for shutdown
+	select {
+	case <-c.DoneChan():
+		return protocol.ErrProtocolShuttingDown
+	default:
+	}
+	msgResult := msg.(*MsgResult)
+	c.queryResultChan <- msgResult.Result
+	return nil
+}
+
+func (c *Client) acquire(acquireTarget AcquireTarget) error {
+	var msg protocol.Message
+	if c.acquired {
+		switch t := acquireTarget.(type) {
+		case AcquireSpecificPoint:
+			msg = NewMsgReAcquire(t.Point)
+		case AcquireVolatileTip:
+			msg = NewMsgReAcquireVolatileTip()
+		case AcquireImmutableTip:
+			msg = NewMsgReAcquireImmutableTip()
+		default:
+			return errors.New("invalid acquire point provided")
+		}
+	} else {
+		switch t := acquireTarget.(type) {
+		case AcquireSpecificPoint:
+			msg = NewMsgAcquire(t.Point)
+		case AcquireVolatileTip:
+			msg = NewMsgAcquireVolatileTip()
+		case AcquireImmutableTip:
+			msg = NewMsgAcquireImmutableTip()
+		default:
+			return errors.New("invalid acquire point provided")
+		}
+	}
+	if err := c.SendMessage(msg); err != nil {
+		return err
+	}
+	err, ok := <-c.acquireResultChan
+	if !ok {
+		return protocol.ErrProtocolShuttingDown
+	}
+	return err
+}
+
+func (c *Client) release() error {
+	msg := NewMsgRelease()
+	if err := c.SendMessage(msg); err != nil {
+		return err
+	}
+	c.acquired = false
+	c.currentEra = -1
+	return nil
+}
+
+func (c *Client) runQuery(query any, result any) error {
+	msg := NewMsgQuery(query)
+	if !c.acquired {
+		if err := c.acquire(AcquireVolatileTip{}); err != nil {
+			return err
+		}
+	}
+	if err := c.SendMessage(msg); err != nil {
+		return err
+	}
+	resultCbor, ok := <-c.queryResultChan
+	if !ok {
+		return protocol.ErrProtocolShuttingDown
+	}
+	if _, err := cbor.Decode(resultCbor, result); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Helper function for getting the current era
+// The current era is needed for many other queries
+func (c *Client) getCurrentEra() (int, error) {
+	select {
+	case <-c.DoneChan():
+		return -1, protocol.ErrProtocolShuttingDown
+	default:
+	}
+	// Return cached era, if available
+	if c.currentEra > -1 {
+		return c.currentEra, nil
+	}
+	query := buildHardForkQuery(QueryTypeHardForkCurrentEra)
+	var result int
+	if err := c.runQuery(query, &result); err != nil {
+		return -1, err
+	}
+	c.currentEra = result
+	return result, nil
+}
