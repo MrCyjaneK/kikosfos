@@ -211,11 +211,51 @@ int KikoApi::walletDelete(int wallet, const QString &pin)
     return KIKO_wallet_delete(wallet, text.data());
 }
 
-int KikoApi::walletSend(int wallet, const QString &to, const QString &amount)
+QString KikoApi::walletQuote(int wallet, const QString &amount, const QString &unit)
 {
+    QByteArray amountUtf8 = utf8(amount);
+    QByteArray unitUtf8 = utf8(unit);
+    return takeKikoString(KIKO_wallet_quote(wallet, amountUtf8.data(), unitUtf8.data()));
+}
+
+void KikoApi::walletWarmEuro(int wallet)
+{
+    QPointer<KikoApi> self(this);
+    QtConcurrent::run([self, wallet]() {
+        const QMutexLocker lock(&requestGate);
+        KIKO_wallet_warm_euro(wallet);
+        if (!self)
+            return;
+        QMetaObject::invokeMethod(self.data(), "deliverEuro", Qt::QueuedConnection, Q_ARG(int, wallet));
+    });
+}
+
+void KikoApi::deliverEuro(int wallet)
+{
+    emit euroReady(wallet);
+}
+
+void KikoApi::walletSend(int wallet, const QString &to, const QString &amount)
+{
+    QPointer<KikoApi> self(this);
     QByteArray toUtf8 = utf8(to);
     QByteArray amountUtf8 = utf8(amount);
-    return KIKO_wallet_send(wallet, toUtf8.data(), amountUtf8.data());
+    QtConcurrent::run([self, wallet, toUtf8, amountUtf8]() mutable {
+        const QMutexLocker lock(&requestGate);
+        const int rc = KIKO_wallet_send(wallet, toUtf8.data(), amountUtf8.data());
+        QString message;
+        if (rc != 0)
+            message = takeKikoString(KIKO_last_error());
+        if (!self)
+            return;
+        QMetaObject::invokeMethod(self.data(), "deliverSend", Qt::QueuedConnection,
+                                  Q_ARG(int, wallet), Q_ARG(QString, message));
+    });
+}
+
+void KikoApi::deliverSend(int wallet, const QString &message)
+{
+    emit sendFinished(wallet, message);
 }
 
 QString KikoApi::lastError()

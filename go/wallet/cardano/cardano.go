@@ -2,7 +2,6 @@
 package cardano
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 
@@ -74,10 +73,6 @@ func encodeBech32(hrp string, payload []byte) (string, error) {
 		return "", err
 	}
 	return bech32.Encode(hrp, converted)
-}
-
-func Send(string, string) error {
-	return errors.New("sending is not available")
 }
 
 func IconPNG() []byte {

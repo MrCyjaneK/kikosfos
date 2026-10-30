@@ -50,18 +50,32 @@ func Fiat(address string) (string, error) {
 	return text, nil
 }
 
-func eurPerADA() (*big.Rat, error) {
+func cachedEurPerADA() (*big.Rat, bool) {
 	eurRateMu.Lock()
 	defer eurRateMu.Unlock()
-	if eurRate.price != nil && time.Now().Before(eurRate.until) {
-		return new(big.Rat).Set(eurRate.price), nil
+	if eurRate.price == nil || !time.Now().Before(eurRate.until) {
+		return nil, false
+	}
+	return new(big.Rat).Set(eurRate.price), true
+}
+
+// WarmEuro loads the ADA euro price into the cache.
+func WarmEuro() (*big.Rat, error) {
+	return eurPerADA()
+}
+
+func eurPerADA() (*big.Rat, error) {
+	if price, ok := cachedEurPerADA(); ok {
+		return price, nil
 	}
 	price, err := fetchEurPerADA()
 	if err != nil {
 		return nil, err
 	}
+	eurRateMu.Lock()
 	eurRate.price = price
 	eurRate.until = time.Now().Add(eurRateCacheTTL)
+	eurRateMu.Unlock()
 	return new(big.Rat).Set(price), nil
 }
 

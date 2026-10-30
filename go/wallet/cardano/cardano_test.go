@@ -84,12 +84,6 @@ func TestRestoreRejectsBadMnemonic(t *testing.T) {
 	}
 }
 
-func TestSendReturnsError(t *testing.T) {
-	if err := Send("addr1qqqq", "1"); err == nil {
-		t.Fatal("expected send error")
-	}
-}
-
 func TestIconIsPNG(t *testing.T) {
 	pngBytes := IconPNG()
 	if len(pngBytes) < 8 || string(pngBytes[:8]) != "\x89PNG\r\n\x1a\n" {

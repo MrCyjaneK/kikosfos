@@ -468,14 +468,35 @@ func WalletDelete(index int, pin string) error {
 	return s.Delete(c.ID())
 }
 
-// WalletSend calls the coin. Cardano returns an error.
+// WalletQuote formats an amount typed as ADA or lovelace.
+// It does not use the network. The euro text is empty until a price is cached.
+func WalletQuote(index int, amount, unit string) (string, string, string, error) {
+	c, err := coinAt(index)
+	if err != nil {
+		return "", "", "", err
+	}
+	return c.Quote(amount, unit)
+}
+
+// WalletWarmEuro fetches the euro price for a later quote.
+func WalletWarmEuro(index int) error {
+	c, err := coinAt(index)
+	if err != nil {
+		return err
+	}
+	return c.WarmEuro()
+}
+
+// WalletSend pays amount lovelace from the wallet and broadcasts the transaction.
+// The seed is read before any network call, and the file lock is not held while sending.
 func WalletSend(index int, to, amount string) error {
 	c, err := coinAt(index)
 	if err != nil {
 		return err
 	}
-	if _, err := sessionKey(); err != nil {
+	mnemonic, err := WalletMnemonic(index)
+	if err != nil {
 		return err
 	}
-	return c.Send(to, amount)
+	return c.Send(mnemonic, to, amount)
 }

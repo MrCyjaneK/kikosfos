@@ -50,7 +50,13 @@ type Coin interface {
 	RefreshActivity(address string) error
 	// Activities is the cached list and does not use the network.
 	Activities(address string) []Activity
-	Send(to, amount string) error
+	// Quote formats an amount typed as "ada" or "lovelace" without the network.
+	// The euro text is empty until a price is cached.
+	Quote(amount, unit string) (ada, lovelace, eur string, err error)
+	// WarmEuro fetches the euro price so a later Quote can show it.
+	WarmEuro() error
+	// Send pays amount lovelace to a payment address and broadcasts it.
+	Send(mnemonic, to, amount string) error
 }
 
 type cardanoCoin struct{}
@@ -114,8 +120,17 @@ func (cardanoCoin) Activities(address string) []Activity {
 	return out
 }
 
-func (cardanoCoin) Send(to, amount string) error {
-	return cardano.Send(to, amount)
+func (cardanoCoin) Quote(amount, unit string) (string, string, string, error) {
+	return cardano.Quote(amount, unit)
+}
+
+func (cardanoCoin) WarmEuro() error {
+	_, err := cardano.WarmEuro()
+	return err
+}
+
+func (cardanoCoin) Send(mnemonic, to, amount string) error {
+	return cardano.Send(mnemonic, to, amount)
 }
 
 func publicFrom(account cardano.Account) Public {

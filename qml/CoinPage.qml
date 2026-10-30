@@ -99,7 +99,10 @@ Page {
             MenuItem {
                 text: "Send"
                 visible: page.exists === 1
-                onClicked: pageStack.push(Qt.resolvedUrl("SendPage.qml"), { wallet: page.wallet })
+                onClicked: pageStack.push(Qt.resolvedUrl("SendPage.qml"), {
+                    wallet: page.wallet,
+                    coinPage: page
+                })
             }
             MenuItem {
                 text: "Settings"

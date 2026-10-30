@@ -105,7 +105,7 @@ func TestSetupUnlockCreate(t *testing.T) {
 	if err != nil || string(qr[:8]) != "\x89PNG\r\n\x1a\n" {
 		t.Fatal(err)
 	}
-	if err := WalletSend(0, address, "1"); err == nil {
+	if err := WalletSend(0, address, "0"); err == nil {
 		t.Fatal("expected send error")
 	}
 	if err := WalletDelete(0, "0000"); err == nil {

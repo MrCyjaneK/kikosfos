@@ -33,7 +33,9 @@ public:
     Q_INVOKABLE QString walletActivityAmount(int wallet, int row);
     Q_INVOKABLE QString walletActivityWhen(int wallet, int row);
     Q_INVOKABLE int walletDelete(int wallet, const QString &pin);
-    Q_INVOKABLE int walletSend(int wallet, const QString &to, const QString &amount);
+    Q_INVOKABLE QString walletQuote(int wallet, const QString &amount, const QString &unit);
+    Q_INVOKABLE void walletWarmEuro(int wallet);
+    Q_INVOKABLE void walletSend(int wallet, const QString &to, const QString &amount);
     Q_INVOKABLE QString lastError();
 
 signals:
@@ -41,11 +43,15 @@ signals:
     void pinRejected(const QString &message);
     void balanceReady(int wallet, const QString &amount, const QString &fiat, const QString &message);
     void activityReady(int wallet, const QString &message);
+    void euroReady(int wallet);
+    void sendFinished(int wallet, const QString &message);
 
 private slots:
     void deliverPin(int rc, const QString &message);
     void deliverBalance(int wallet, const QString &amount, const QString &fiat, const QString &message);
     void deliverActivity(int wallet, const QString &message);
+    void deliverEuro(int wallet);
+    void deliverSend(int wallet, const QString &message);
 
 private:
     void runPin(const QByteArray &pin, const QByteArray &again, bool setup);

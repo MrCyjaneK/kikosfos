@@ -322,6 +322,25 @@ func KIKO_wallet_delete(index C.int, pin *C.char) C.int {
 	return 0
 }
 
+//export KIKO_wallet_quote
+func KIKO_wallet_quote(index C.int, amount, unit *C.char) *C.char {
+	ada, lovelace, eur, err := wallet.WalletQuote(int(index), C.GoString(amount), C.GoString(unit))
+	if err != nil {
+		return cString("\n\n\n" + err.Error())
+	}
+	return cString(ada + "\n" + lovelace + "\n" + eur + "\n")
+}
+
+//export KIKO_wallet_warm_euro
+func KIKO_wallet_warm_euro(index C.int) C.int {
+	err := wallet.WalletWarmEuro(int(index))
+	setErr(err)
+	if err != nil {
+		return -1
+	}
+	return 0
+}
+
 //export KIKO_wallet_send
 func KIKO_wallet_send(index C.int, to, amount *C.char) C.int {
 	err := wallet.WalletSend(int(index), C.GoString(to), C.GoString(amount))
