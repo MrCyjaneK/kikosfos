@@ -10,8 +10,13 @@ Page {
     property string address
     property string errorText
     property string balance
+    property string fiat
     property string balanceMessage
     property int balanceState: 0
+    property int activityCount: 0
+    property int activityState: 0
+    property string activityMessage
+    property string shownAddress
 
     onStatusChanged: {
         if (status === PageStatus.Active)
@@ -27,18 +32,39 @@ Page {
                 errorText = kiko.lastError()
                 exists = -1
                 balance = ""
+                fiat = ""
                 balanceMessage = ""
                 balanceState = 0
+                activityCount = 0
+                activityMessage = ""
+                activityState = 0
+                shownAddress = ""
             } else {
+                if (address !== shownAddress) {
+                    shownAddress = address
+                    balance = ""
+                    fiat = ""
+                    activityCount = 0
+                    activityMessage = ""
+                    activityState = 0
+                }
                 if (balance === "")
                     balanceState = 0
+                if (activityCount === 0)
+                    activityState = 0
                 kiko.walletBalance(wallet)
+                kiko.walletActivity(wallet)
             }
         } else {
             address = ""
             balance = ""
+            fiat = ""
             balanceMessage = ""
             balanceState = 0
+            activityCount = 0
+            activityMessage = ""
+            activityState = 0
+            shownAddress = ""
             if (exists < 0)
                 errorText = kiko.lastError()
         }
@@ -51,7 +77,17 @@ Page {
                 return
             page.balanceState = message === "" ? 1 : -1
             page.balance = amount
+            if (fiat !== "")
+                page.fiat = fiat
             page.balanceMessage = message
+        }
+        onActivityReady: {
+            if (wallet !== page.wallet || page.exists !== 1)
+                return
+            page.activityMessage = message
+            page.activityState = 1
+            if (message === "")
+                page.activityCount = kiko.walletActivityCount(page.wallet)
         }
     }
 
@@ -60,6 +96,11 @@ Page {
         contentHeight: Math.max(column.height, height)
 
         PullDownMenu {
+            MenuItem {
+                text: "Send"
+                visible: page.exists === 1
+                onClicked: pageStack.push(Qt.resolvedUrl("SendPage.qml"), { wallet: page.wallet })
+            }
             MenuItem {
                 text: "Settings"
                 visible: page.exists === 1
@@ -141,6 +182,14 @@ Page {
                     }
 
                     Label {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        visible: page.fiat !== ""
+                        text: page.fiat
+                        color: Theme.secondaryColor
+                        font.pixelSize: Theme.fontSizeLarge
+                    }
+
+                    Label {
                         width: parent.width - 2 * Theme.horizontalPageMargin
                         anchors.horizontalCenter: parent.horizontalCenter
                         horizontalAlignment: Text.AlignHCenter
@@ -178,11 +227,78 @@ Page {
                     }
                 }
 
-                Button {
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    text: "Send"
-                    onClicked: pageStack.push(Qt.resolvedUrl("SendPage.qml"), { wallet: page.wallet })
+                Column {
+                    width: parent.width
+                    spacing: Theme.paddingSmall
+
+                    Label {
+                        x: Theme.horizontalPageMargin
+                        text: "Activity"
+                        color: Theme.highlightColor
+                        font.pixelSize: Theme.fontSizeLarge
+                    }
+
+                    BusyIndicator {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        running: page.activityState === 0
+                        visible: running
+                        width: Theme.itemSizeSmall
+                        height: width
+                    }
+
+                    Label {
+                        x: Theme.horizontalPageMargin
+                        visible: page.activityMessage !== ""
+                        width: parent.width - 2 * Theme.horizontalPageMargin
+                        wrapMode: Text.Wrap
+                        text: page.activityMessage
+                        color: Theme.highlightColor
+                        font.pixelSize: Theme.fontSizeSmall
+                    }
+
+                    Label {
+                        x: Theme.horizontalPageMargin
+                        visible: page.activityState === 1 && page.activityCount === 0 && page.activityMessage === ""
+                        text: "No transactions"
+                        color: Theme.secondaryColor
+                    }
                 }
+
+                Repeater {
+                    model: page.activityCount
+                    delegate: Column {
+                        width: parent.width
+                        spacing: Theme.paddingSmall
+
+                        Item {
+                            width: parent.width
+                            height: directionLabel.height
+
+                            Label {
+                                id: directionLabel
+                                x: Theme.horizontalPageMargin
+                                text: kiko.walletActivityDirection(page.wallet, index)
+                                color: Theme.primaryColor
+                            }
+
+                            Label {
+                                anchors.right: parent.right
+                                anchors.rightMargin: Theme.horizontalPageMargin
+                                anchors.verticalCenter: directionLabel.verticalCenter
+                                text: kiko.walletActivityAmount(page.wallet, index)
+                                color: Theme.highlightColor
+                            }
+                        }
+
+                        Label {
+                            x: Theme.horizontalPageMargin
+                            text: kiko.walletActivityWhen(page.wallet, index)
+                            color: Theme.secondaryColor
+                            font.pixelSize: Theme.fontSizeSmall
+                        }
+                    }
+                }
+
             }
         }
     }

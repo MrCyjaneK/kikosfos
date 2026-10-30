@@ -14,6 +14,8 @@ QByteArray utf8(const QString &text)
     return text.toUtf8();
 }
 
+QMutex requestGate;
+
 }
 
 QString takeKikoString(char *text)
@@ -136,25 +138,71 @@ void KikoApi::walletBalance(int wallet)
 {
     QPointer<KikoApi> self(this);
     QtConcurrent::run([self, wallet]() {
-        static QMutex gate;
-        const QMutexLocker lock(&gate);
+        const QMutexLocker lock(&requestGate);
         char *text = KIKO_wallet_balance(wallet);
         QString amount;
+        QString fiat;
         QString message;
-        if (text)
-            amount = takeKikoString(text);
-        else
+        if (!text) {
             message = takeKikoString(KIKO_last_error());
+        } else {
+            amount = takeKikoString(text);
+            char *fiatText = KIKO_wallet_fiat(wallet);
+            if (fiatText)
+                fiat = takeKikoString(fiatText);
+        }
         if (!self)
             return;
         QMetaObject::invokeMethod(self.data(), "deliverBalance", Qt::QueuedConnection,
-                                  Q_ARG(int, wallet), Q_ARG(QString, amount), Q_ARG(QString, message));
+                                  Q_ARG(int, wallet), Q_ARG(QString, amount),
+                                  Q_ARG(QString, fiat), Q_ARG(QString, message));
     });
 }
 
-void KikoApi::deliverBalance(int wallet, const QString &amount, const QString &message)
+void KikoApi::deliverBalance(int wallet, const QString &amount, const QString &fiat, const QString &message)
 {
-    emit balanceReady(wallet, amount, message);
+    emit balanceReady(wallet, amount, fiat, message);
+}
+
+void KikoApi::walletActivity(int wallet)
+{
+    QPointer<KikoApi> self(this);
+    QtConcurrent::run([self, wallet]() {
+        const QMutexLocker lock(&requestGate);
+        const int rc = KIKO_wallet_activity(wallet);
+        QString message;
+        if (rc != 0)
+            message = takeKikoString(KIKO_last_error());
+        if (!self)
+            return;
+        QMetaObject::invokeMethod(self.data(), "deliverActivity", Qt::QueuedConnection,
+                                  Q_ARG(int, wallet), Q_ARG(QString, message));
+    });
+}
+
+void KikoApi::deliverActivity(int wallet, const QString &message)
+{
+    emit activityReady(wallet, message);
+}
+
+int KikoApi::walletActivityCount(int wallet)
+{
+    return KIKO_wallet_activity_count(wallet);
+}
+
+QString KikoApi::walletActivityDirection(int wallet, int row)
+{
+    return takeKikoString(KIKO_wallet_activity_direction(wallet, row));
+}
+
+QString KikoApi::walletActivityAmount(int wallet, int row)
+{
+    return takeKikoString(KIKO_wallet_activity_amount(wallet, row));
+}
+
+QString KikoApi::walletActivityWhen(int wallet, int row)
+{
+    return takeKikoString(KIKO_wallet_activity_when(wallet, row));
 }
 
 int KikoApi::walletDelete(int wallet, const QString &pin)

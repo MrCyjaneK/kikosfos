@@ -18,6 +18,9 @@ var (
 		pin string
 		key []byte
 	}
+
+	activityMu   sync.Mutex
+	activityView = map[int][]Activity{}
 )
 
 // Init records the Sailjail directories for this process and creates them.
@@ -364,6 +367,89 @@ func WalletBalance(index int) (string, error) {
 		return "", err
 	}
 	return c.Balance(address)
+}
+
+// WalletFiat quotes the balance. A price failure is separate from the balance.
+func WalletFiat(index int) (string, error) {
+	c, err := coinAt(index)
+	if err != nil {
+		return "", err
+	}
+	address, err := WalletAddress(index)
+	if err != nil {
+		return "", err
+	}
+	return c.Fiat(address)
+}
+
+// WalletRefreshActivity updates the cached history, then keeps that list for the UI.
+func WalletRefreshActivity(index int) error {
+	c, err := coinAt(index)
+	if err != nil {
+		return err
+	}
+	address, err := WalletAddress(index)
+	if err != nil {
+		return err
+	}
+	if err := c.RefreshActivity(address); err != nil {
+		return err
+	}
+	rows := c.Activities(address)
+	activityMu.Lock()
+	activityView[index] = rows
+	activityMu.Unlock()
+	return nil
+}
+
+// WalletActivityCount is the length of the last refreshed list.
+func WalletActivityCount(index int) (int, error) {
+	if _, err := coinAt(index); err != nil {
+		return 0, err
+	}
+	activityMu.Lock()
+	defer activityMu.Unlock()
+	return len(activityView[index]), nil
+}
+
+func activityItem(index, row int) (Activity, error) {
+	if _, err := coinAt(index); err != nil {
+		return Activity{}, err
+	}
+	activityMu.Lock()
+	defer activityMu.Unlock()
+	rows := activityView[index]
+	if row < 0 || row >= len(rows) {
+		return Activity{}, errors.New("unknown activity")
+	}
+	return rows[row], nil
+}
+
+// WalletActivityDirection is Received or Sent for one cached row.
+func WalletActivityDirection(index, row int) (string, error) {
+	item, err := activityItem(index, row)
+	if err != nil {
+		return "", err
+	}
+	return item.Direction, nil
+}
+
+// WalletActivityAmount is the ADA amount for one cached row.
+func WalletActivityAmount(index, row int) (string, error) {
+	item, err := activityItem(index, row)
+	if err != nil {
+		return "", err
+	}
+	return item.Amount, nil
+}
+
+// WalletActivityWhen is the local time for one cached row.
+func WalletActivityWhen(index, row int) (string, error) {
+	item, err := activityItem(index, row)
+	if err != nil {
+		return "", err
+	}
+	return item.When, nil
 }
 
 // WalletDelete checks the PIN against the one held in this process, then removes the coin's files.

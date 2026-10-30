@@ -23,6 +23,13 @@ type Public struct {
 	Details []Detail
 }
 
+// Activity is one confirmed movement of the wallet's funds.
+type Activity struct {
+	Direction string
+	Amount    string
+	When      string
+}
+
 // Coin is one currency. Adding a coin means implementing this and appending it
 // to the registry.
 type Coin interface {
@@ -37,6 +44,12 @@ type Coin interface {
 	MultisigMaterial(mnemonic string) (string, error)
 	// Balance is the on-chain amount for an address, formatted for display.
 	Balance(address string) (string, error)
+	// Fiat quotes that balance. Empty when the coin has no euro price.
+	Fiat(address string) (string, error)
+	// RefreshActivity loads transactions that are not already cached.
+	RefreshActivity(address string) error
+	// Activities is the cached list and does not use the network.
+	Activities(address string) []Activity
 	Send(to, amount string) error
 }
 
@@ -82,6 +95,23 @@ func (cardanoCoin) MultisigMaterial(mnemonic string) (string, error) {
 
 func (cardanoCoin) Balance(address string) (string, error) {
 	return cardano.Balance(address)
+}
+
+func (cardanoCoin) Fiat(address string) (string, error) {
+	return cardano.Fiat(address)
+}
+
+func (cardanoCoin) RefreshActivity(address string) error {
+	return cardano.RefreshActivity(address)
+}
+
+func (cardanoCoin) Activities(address string) []Activity {
+	rows := cardano.Activities(address)
+	out := make([]Activity, len(rows))
+	for i, row := range rows {
+		out[i] = Activity{Direction: row.Direction, Amount: row.Amount, When: row.When}
+	}
+	return out
 }
 
 func (cardanoCoin) Send(to, amount string) error {

@@ -20,8 +20,9 @@ var balanceClient = &http.Client{Timeout: 20 * time.Second}
 const balanceCacheTTL = time.Minute
 
 type cachedBalance struct {
-	amount string
-	until  time.Time
+	lovelace string
+	amount   string
+	until    time.Time
 }
 
 var (
@@ -36,12 +37,26 @@ func Balance(address string) (string, error) {
 	if amount, ok := loadCachedBalance(address); ok {
 		return amount, nil
 	}
-	amount, err := fetchBalance(address)
+	lovelace, err := fetchBalance(address)
 	if err != nil {
 		return "", err
 	}
-	storeCachedBalance(address, amount)
+	amount, err := formatADA(lovelace)
+	if err != nil {
+		return "", fmt.Errorf("cardano: balance: %w", err)
+	}
+	storeCachedBalance(address, lovelace, amount)
 	return amount, nil
+}
+
+func loadCachedLovelace(address string) (string, bool) {
+	balanceCacheMu.Lock()
+	defer balanceCacheMu.Unlock()
+	entry, ok := balanceCache[address]
+	if !ok || time.Now().After(entry.until) {
+		return "", false
+	}
+	return entry.lovelace, true
 }
 
 func loadCachedBalance(address string) (string, bool) {
@@ -54,12 +69,13 @@ func loadCachedBalance(address string) (string, bool) {
 	return entry.amount, true
 }
 
-func storeCachedBalance(address, amount string) {
+func storeCachedBalance(address, lovelace, amount string) {
 	balanceCacheMu.Lock()
 	defer balanceCacheMu.Unlock()
 	balanceCache[address] = cachedBalance{
-		amount: amount,
-		until:  time.Now().Add(balanceCacheTTL),
+		lovelace: lovelace,
+		amount:   amount,
+		until:    time.Now().Add(balanceCacheTTL),
 	}
 }
 
@@ -95,17 +111,13 @@ func fetchBalance(address string) (string, error) {
 		return "", fmt.Errorf("cardano: balance: %w", err)
 	}
 	if len(rows) == 0 {
-		return formatADA("0")
+		return "0", nil
 	}
 	lovelace, err := lovelaceText(rows[0].Balance)
 	if err != nil {
 		return "", err
 	}
-	amount, err := formatADA(lovelace)
-	if err != nil {
-		return "", fmt.Errorf("cardano: balance: %w", err)
-	}
-	return amount, nil
+	return lovelace, nil
 }
 
 func lovelaceText(raw json.RawMessage) (string, error) {

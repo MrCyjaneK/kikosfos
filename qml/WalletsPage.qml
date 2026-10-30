@@ -42,7 +42,12 @@ Page {
                 onBalanceReady: {
                     if (wallet !== index || row.exists !== 1)
                         return
-                    row.balance = message !== "" ? message : amount
+                    if (message !== "")
+                        row.balance = message
+                    else if (fiat !== "")
+                        row.balance = amount + " · " + fiat
+                    else
+                        row.balance = amount
                 }
             }
 

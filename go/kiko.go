@@ -252,6 +252,66 @@ func KIKO_wallet_balance(index C.int) *C.char {
 	return cString(amount)
 }
 
+//export KIKO_wallet_fiat
+func KIKO_wallet_fiat(index C.int) *C.char {
+	amount, err := wallet.WalletFiat(int(index))
+	setErr(err)
+	if err != nil {
+		return nil
+	}
+	return cString(amount)
+}
+
+//export KIKO_wallet_activity
+func KIKO_wallet_activity(index C.int) C.int {
+	err := wallet.WalletRefreshActivity(int(index))
+	setErr(err)
+	if err != nil {
+		return -1
+	}
+	return 0
+}
+
+//export KIKO_wallet_activity_count
+func KIKO_wallet_activity_count(index C.int) C.int {
+	n, err := wallet.WalletActivityCount(int(index))
+	setErr(err)
+	if err != nil {
+		return -1
+	}
+	return C.int(n)
+}
+
+//export KIKO_wallet_activity_direction
+func KIKO_wallet_activity_direction(index, row C.int) *C.char {
+	text, err := wallet.WalletActivityDirection(int(index), int(row))
+	setErr(err)
+	if err != nil {
+		return nil
+	}
+	return cString(text)
+}
+
+//export KIKO_wallet_activity_amount
+func KIKO_wallet_activity_amount(index, row C.int) *C.char {
+	text, err := wallet.WalletActivityAmount(int(index), int(row))
+	setErr(err)
+	if err != nil {
+		return nil
+	}
+	return cString(text)
+}
+
+//export KIKO_wallet_activity_when
+func KIKO_wallet_activity_when(index, row C.int) *C.char {
+	text, err := wallet.WalletActivityWhen(int(index), int(row))
+	setErr(err)
+	if err != nil {
+		return nil
+	}
+	return cString(text)
+}
+
 //export KIKO_wallet_delete
 func KIKO_wallet_delete(index C.int, pin *C.char) C.int {
 	err := wallet.WalletDelete(int(index), C.GoString(pin))
