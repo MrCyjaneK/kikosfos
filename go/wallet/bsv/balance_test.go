@@ -3,6 +3,7 @@ package bsv
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -34,6 +35,39 @@ func TestFormatBSV(t *testing.T) {
 	}
 	if _, err := formatBSV("nope"); err == nil {
 		t.Fatal("expected bad amount")
+	}
+}
+
+func TestReceived(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if strings.Contains(r.URL.Path, "missing") {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"confirmed":250000000,"unconfirmed":99}`))
+	}))
+	defer srv.Close()
+	useChain(t, srv)
+
+	ok, err := Received(abandonAddress, "250000000")
+	if err != nil || !ok {
+		t.Fatalf("held = %v %v", ok, err)
+	}
+	ok, err = Received(abandonAddress, "250000001")
+	if err != nil || ok {
+		t.Fatalf("short = %v %v", ok, err)
+	}
+	ok, err = Received("missing", "1")
+	if err != nil || ok {
+		t.Fatalf("absent = %v %v", ok, err)
+	}
+	if hits != 3 {
+		t.Fatalf("requests = %d", hits)
+	}
+	if _, err := Received("", "1"); err == nil {
+		t.Fatal("expected a missing address to fail")
 	}
 }
 

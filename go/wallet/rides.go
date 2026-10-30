@@ -32,6 +32,8 @@ type driveOffer struct {
 	When         time.Time
 	StartLat     float64
 	StartLon     float64
+	EndLat       float64
+	EndLon       float64
 	Immediate    bool
 	Fare         uint64
 	Base         uint64
@@ -57,6 +59,7 @@ func resetDrives() {
 	driveReady = nil
 	driveOffers = nil
 	driveMu.Unlock()
+	clearHeld()
 }
 
 // registrationFailure is the home-screen line for a server error object.
@@ -237,6 +240,10 @@ type remoteRide struct {
 		Lat float64 `json:"lat"`
 		Lng float64 `json:"lng"`
 	} `json:"start"`
+	End struct {
+		Lat float64 `json:"lat"`
+		Lng float64 `json:"lng"`
+	} `json:"end"`
 	DistanceKm       float64 `json:"distance_km"`
 	PickupDistanceKm float64 `json:"pickup_distance_km"`
 	PickupTime       string  `json:"pickup_time"`
@@ -305,6 +312,8 @@ func ridesFrom(server readyServer, lat, lon, rangeKm float64, now time.Time) ([]
 			When:         when,
 			StartLat:     ride.Start.Lat,
 			StartLon:     ride.Start.Lng,
+			EndLat:       ride.End.Lat,
+			EndLon:       ride.End.Lng,
 			Immediate:    !when.After(now.Add(nowWindow)),
 			Fare:         fareLovelace(server.Base, server.PerKm, meters),
 			Base:         server.Base,
@@ -468,6 +477,22 @@ func DriveStartLon(index int) (string, error) {
 		return "", err
 	}
 	return strconv.FormatFloat(row.StartLon, 'f', 6, 64), nil
+}
+
+func DriveEndLat(index int) (string, error) {
+	row, err := driveAt(index)
+	if err != nil {
+		return "", err
+	}
+	return strconv.FormatFloat(row.EndLat, 'f', 6, 64), nil
+}
+
+func DriveEndLon(index int) (string, error) {
+	row, err := driveAt(index)
+	if err != nil {
+		return "", err
+	}
+	return strconv.FormatFloat(row.EndLon, 'f', 6, 64), nil
 }
 
 func whenDay(t, now time.Time) string {

@@ -39,6 +39,48 @@ func clearBalanceCache() {
 	balanceCacheMu.Unlock()
 }
 
+func TestReceived(t *testing.T) {
+	mainHits, preHits := 0, 0
+	mainSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mainHits++
+		_, _ = w.Write([]byte(`[{"balance":"100"}]`))
+	}))
+	defer mainSrv.Close()
+	preSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		preHits++
+		_, _ = w.Write([]byte(`[{"balance":"5000000"}]`))
+	}))
+	defer preSrv.Close()
+	prevMain, prevPre, prevClient := balanceEndpoint, preprodBalanceEndpoint, balanceClient
+	balanceEndpoint = mainSrv.URL
+	preprodBalanceEndpoint = preSrv.URL
+	balanceClient = &http.Client{}
+	t.Cleanup(func() {
+		balanceEndpoint = prevMain
+		preprodBalanceEndpoint = prevPre
+		balanceClient = prevClient
+	})
+
+	ok, err := Received("addr1qx", "100")
+	if err != nil || !ok || mainHits != 1 || preHits != 0 {
+		t.Fatalf("mainnet = %v %v hits %d %d", ok, err, mainHits, preHits)
+	}
+	ok, err = Received("addr1qx", "101")
+	if err != nil || ok {
+		t.Fatalf("short = %v %v", ok, err)
+	}
+	ok, err = Received("addr_test1qx", "5000000")
+	if err != nil || !ok || preHits != 1 {
+		t.Fatalf("preprod = %v %v hits %d", ok, err, preHits)
+	}
+	if _, err := Received("", "1"); err == nil {
+		t.Fatal("expected a missing address to fail")
+	}
+	if _, err := Received("addr1qx", "-1"); err == nil {
+		t.Fatal("expected a negative amount to fail")
+	}
+}
+
 func TestBalanceReadsIndexer(t *testing.T) {
 	clearBalanceCache()
 	t.Cleanup(clearBalanceCache)

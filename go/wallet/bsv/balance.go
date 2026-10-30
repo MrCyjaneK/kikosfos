@@ -78,6 +78,29 @@ func storeCachedBalance(address, satoshis, amount string) {
 	}
 }
 
+// Received is true when address holds at least satoshis.
+// The answer is not cached, so a payment that just confirmed can be seen.
+func Received(address, satoshis string) (bool, error) {
+	address = strings.TrimSpace(address)
+	satoshis = strings.TrimSpace(satoshis)
+	if address == "" {
+		return false, fmt.Errorf("bsv: payment: missing address")
+	}
+	want := new(big.Int)
+	if _, ok := want.SetString(satoshis, 10); !ok || want.Sign() < 0 {
+		return false, fmt.Errorf("bsv: payment: bad amount %q", satoshis)
+	}
+	gotText, err := fetchBalance(address)
+	if err != nil {
+		return false, err
+	}
+	got := new(big.Int)
+	if _, ok := got.SetString(strings.TrimSpace(gotText), 10); !ok || got.Sign() < 0 {
+		return false, fmt.Errorf("bsv: payment: bad amount %q", gotText)
+	}
+	return got.Cmp(want) >= 0, nil
+}
+
 func fetchBalance(address string) (string, error) {
 	body, err := getJSON("balance", addressPath(address, "balance"))
 	if errors.Is(err, errNotFound) {

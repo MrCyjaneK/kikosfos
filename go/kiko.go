@@ -725,6 +725,51 @@ func KIKO_drive_start_lon(index C.int) *C.char {
 	return driveText(index, wallet.DriveStartLon)
 }
 
+//export KIKO_drive_end_lat
+func KIKO_drive_end_lat(index C.int) *C.char {
+	return driveText(index, wallet.DriveEndLat)
+}
+
+//export KIKO_drive_end_lon
+func KIKO_drive_end_lon(index C.int) *C.char {
+	return driveText(index, wallet.DriveEndLon)
+}
+
+//export KIKO_drive_claim
+func KIKO_drive_claim(server, id, pickupKm *C.char) *C.char {
+	err := wallet.ClaimDrive(C.GoString(server), C.GoString(id), C.GoString(pickupKm))
+	setErr(err)
+	if err != nil {
+		return cString(err.Error())
+	}
+	return cString("")
+}
+
+//export KIKO_drive_verify
+func KIKO_drive_verify(server, id *C.char) *C.char {
+	paid, err := wallet.VerifyDrive(C.GoString(server), C.GoString(id))
+	setErr(err)
+	if err != nil {
+		return cString(err.Error())
+	}
+	if paid {
+		return cString("1")
+	}
+	return cString("0")
+}
+
+//export KIKO_drive_claimed
+func KIKO_drive_claimed(server, id *C.char) C.int {
+	setErr(nil)
+	return C.int(wallet.DriveClaimed(C.GoString(server), C.GoString(id)))
+}
+
+//export KIKO_drive_paid
+func KIKO_drive_paid(server, id *C.char) C.int {
+	setErr(nil)
+	return C.int(wallet.DrivePaid(C.GoString(server), C.GoString(id)))
+}
+
 //export KIKO_drive_navigate
 func KIKO_drive_navigate(lat, lon, title *C.char) *C.char {
 	err := wallet.StartNavigation(C.GoString(lat), C.GoString(lon), C.GoString(title))

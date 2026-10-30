@@ -68,6 +68,10 @@ type Coin interface {
 	AmountFromEUR(eur string) (string, error)
 	// Send pays amount lovelace to a payment address and broadcasts it.
 	Send(mnemonic, to, amount string) error
+	// Received is true when address holds at least amount atoms.
+	// amount is Atom (lovelace, satoshi). It asks the chain and skips the
+	// balance cache, so a fare that just landed is visible.
+	Received(address, amount string) (bool, error)
 }
 
 type cardanoCoin struct{}
@@ -154,6 +158,10 @@ func (cardanoCoin) Send(mnemonic, to, amount string) error {
 	return cardano.Send(mnemonic, to, amount)
 }
 
+func (cardanoCoin) Received(address, amount string) (bool, error) {
+	return cardano.Received(address, amount)
+}
+
 type bsvCoin struct{}
 
 func (bsvCoin) ID() string { return bsv.ID }
@@ -236,6 +244,10 @@ func (bsvCoin) AmountFromEUR(eur string) (string, error) {
 
 func (bsvCoin) Send(mnemonic, to, amount string) error {
 	return bsv.Send(mnemonic, to, amount)
+}
+
+func (bsvCoin) Received(address, amount string) (bool, error) {
+	return bsv.Received(address, amount)
 }
 
 func publicFrom(account cardano.Account) Public {

@@ -533,6 +533,16 @@ QString KikoApi::driveStartLon(int index)
     return takeKikoString(KIKO_drive_start_lon(index));
 }
 
+QString KikoApi::driveEndLat(int index)
+{
+    return takeKikoString(KIKO_drive_end_lat(index));
+}
+
+QString KikoApi::driveEndLon(int index)
+{
+    return takeKikoString(KIKO_drive_end_lon(index));
+}
+
 void KikoApi::driveNavigate(const QString &lat, const QString &lon, const QString &title)
 {
     QPointer<KikoApi> self(this);
@@ -552,6 +562,67 @@ void KikoApi::driveNavigate(const QString &lat, const QString &lon, const QStrin
 void KikoApi::deliverNavigate(const QString &message)
 {
     emit navigateFinished(message);
+}
+
+void KikoApi::driveClaim(const QString &server, const QString &id, const QString &pickupKm)
+{
+    QPointer<KikoApi> self(this);
+    QByteArray serverUtf8 = utf8(server);
+    QByteArray idUtf8 = utf8(id);
+    QByteArray kmUtf8 = utf8(pickupKm);
+    QtConcurrent::run([self, serverUtf8, idUtf8, kmUtf8]() mutable {
+        const QMutexLocker lock(&requestGate);
+        const QString message = takeKikoString(KIKO_drive_claim(serverUtf8.data(), idUtf8.data(), kmUtf8.data()));
+        if (!self)
+            return;
+        QMetaObject::invokeMethod(self.data(), "deliverDriveClaimed", Qt::QueuedConnection,
+                                  Q_ARG(QString, message));
+    });
+}
+
+void KikoApi::deliverDriveClaimed(const QString &message)
+{
+    emit claimFinished(message);
+}
+
+void KikoApi::driveVerify(const QString &server, const QString &id)
+{
+    QPointer<KikoApi> self(this);
+    QByteArray serverUtf8 = utf8(server);
+    QByteArray idUtf8 = utf8(id);
+    QtConcurrent::run([self, serverUtf8, idUtf8]() mutable {
+        const QMutexLocker lock(&requestGate);
+        const QString text = takeKikoString(KIKO_drive_verify(serverUtf8.data(), idUtf8.data()));
+        int seen = 0;
+        QString message;
+        if (text == QLatin1String("1"))
+            seen = 1;
+        else if (text != QLatin1String("0"))
+            message = text;
+        if (!self)
+            return;
+        QMetaObject::invokeMethod(self.data(), "deliverDriveVerified", Qt::QueuedConnection,
+                                  Q_ARG(int, seen), Q_ARG(QString, message));
+    });
+}
+
+void KikoApi::deliverDriveVerified(int seen, const QString &message)
+{
+    emit driveVerified(seen, message);
+}
+
+int KikoApi::driveClaimed(const QString &server, const QString &id)
+{
+    QByteArray serverUtf8 = utf8(server);
+    QByteArray idUtf8 = utf8(id);
+    return KIKO_drive_claimed(serverUtf8.data(), idUtf8.data());
+}
+
+int KikoApi::drivePaid(const QString &server, const QString &id)
+{
+    QByteArray serverUtf8 = utf8(server);
+    QByteArray idUtf8 = utf8(id);
+    return KIKO_drive_paid(serverUtf8.data(), idUtf8.data());
 }
 
 QString KikoApi::lastError()

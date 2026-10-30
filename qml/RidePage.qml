@@ -11,10 +11,13 @@ Page {
     property string pickupKm
     property string distanceKm
     property bool immediate
+    property string rideId
     property string whenDay
     property string whenClock
     property string startLat
     property string startLon
+    property string endLat
+    property string endLon
     property string fareLovelace
     property string baseLovelace
     property string perKmLovelace
@@ -25,10 +28,18 @@ Page {
     property string fareAmount
     property string fareEuro
     property bool euroTried
-    property bool starting
-    property string navigateText
+    property bool working
+    property bool claimed
+    property bool paid
+    property string notice
 
-    Component.onCompleted: refreshQuotes()
+    Component.onCompleted: {
+        refreshQuotes()
+        claimed = kiko.driveClaimed(server, rideId) === 1
+        paid = kiko.drivePaid(server, rideId) === 1
+        if (paid)
+            notice = "Paid"
+    }
 
     function quoteParts(lovelace) {
         if (lovelace === "")
@@ -57,12 +68,28 @@ Page {
         }
     }
 
-    function startRide() {
-        if (starting)
+    function openNav(lat, lon, title) {
+        if (working)
             return
-        starting = true
-        navigateText = ""
-        kiko.driveNavigate(startLat, startLon, startAddress)
+        working = true
+        notice = paid ? "Paid" : ""
+        kiko.driveNavigate(lat, lon, title)
+    }
+
+    function claimRide() {
+        if (working || claimed)
+            return
+        working = true
+        notice = ""
+        kiko.driveClaim(server, rideId, pickupKm)
+    }
+
+    function checkPayment() {
+        if (working || !claimed || paid)
+            return
+        working = true
+        notice = ""
+        kiko.driveVerify(server, rideId)
     }
 
     Connections {
@@ -72,8 +99,27 @@ Page {
                 page.refreshQuotes()
         }
         onNavigateFinished: {
-            page.starting = false
-            page.navigateText = message
+            page.working = false
+            if (message !== "")
+                page.notice = message
+            else if (page.paid)
+                page.notice = "Paid"
+        }
+        onClaimFinished: {
+            page.working = false
+            if (message === "")
+                page.claimed = true
+            else
+                page.notice = message
+        }
+        onDriveVerified: {
+            page.working = false
+            if (message !== "") {
+                page.notice = message
+                return
+            }
+            page.paid = seen === 1
+            page.notice = page.paid ? "Paid" : "Payment not seen yet"
         }
     }
 
@@ -202,28 +248,51 @@ Page {
 
         BusyIndicator {
             anchors.horizontalCenter: parent.horizontalCenter
-            running: page.starting
+            running: page.working
             visible: running
             width: Theme.itemSizeSmall
             height: width
         }
 
         Label {
-            visible: page.navigateText !== ""
+            visible: page.notice !== ""
             width: parent.width - 2 * Theme.horizontalPageMargin
             x: Theme.horizontalPageMargin
             wrapMode: Text.Wrap
             horizontalAlignment: Text.AlignHCenter
-            color: Theme.highlightColor
+            color: page.notice === "Paid" ? Theme.secondaryColor : Theme.highlightColor
             font.pixelSize: Theme.fontSizeSmall
-            text: page.navigateText
+            text: page.notice
         }
 
         Button {
             anchors.horizontalCenter: parent.horizontalCenter
-            text: "Start"
-            enabled: !page.starting
-            onClicked: page.startRide()
+            visible: !page.claimed
+            text: "Claim"
+            enabled: !page.working
+            onClicked: page.claimRide()
+        }
+
+        Button {
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: "To pickup"
+            enabled: !page.working
+            onClicked: page.openNav(startLat, startLon, startAddress)
+        }
+
+        Button {
+            anchors.horizontalCenter: parent.horizontalCenter
+            visible: page.claimed && !page.paid
+            text: "Check payment"
+            enabled: !page.working
+            onClicked: page.checkPayment()
+        }
+
+        Button {
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: "To destination"
+            enabled: !page.working
+            onClicked: page.openNav(endLat, endLon, endAddress)
         }
 
         Item {

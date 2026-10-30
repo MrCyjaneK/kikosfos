@@ -143,8 +143,11 @@ Page {
             property bool immediate
             property string whenDay
             property string whenClock
+            property string rideId
             property string startLat
             property string startLon
+            property string endLat
+            property string endLon
             property bool showSection
             property string fareLovelace
             property string baseLovelace
@@ -162,8 +165,11 @@ Page {
                 immediate = kiko.driveImmediate(index) === 1
                 whenDay = kiko.driveWhenDay(index)
                 whenClock = kiko.driveWhenClock(index)
+                rideId = kiko.driveId(index)
                 startLat = kiko.driveStartLat(index)
                 startLon = kiko.driveStartLon(index)
+                endLat = kiko.driveEndLat(index)
+                endLon = kiko.driveEndLon(index)
                 showSection = index === 0 || kiko.driveImmediate(index - 1) !== kiko.driveImmediate(index)
                 fareLovelace = kiko.driveFareLovelace(index)
                 baseLovelace = kiko.driveBaseLovelace(index)
@@ -210,8 +216,11 @@ Page {
                     immediate: row.immediate,
                     whenDay: row.whenDay,
                     whenClock: row.whenClock,
+                    rideId: row.rideId,
                     startLat: row.startLat,
                     startLon: row.startLon,
+                    endLat: row.endLat,
+                    endLon: row.endLon,
                     fareLovelace: row.fareLovelace,
                     baseLovelace: row.baseLovelace,
                     perKmLovelace: row.perKmLovelace

@@ -308,6 +308,110 @@ func TestRegisterDriversServerError(t *testing.T) {
 	}
 }
 
+func TestClaimAndVerify(t *testing.T) {
+	setupTest(t)
+	var etaMin int
+	var etaKm float64
+	var gotKey, gotPath string
+	serveKiko(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/v1/currency" && r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`{"currency":"cardano"}`))
+		case r.URL.Path == "/api/v1/driver" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/driver/drive/taken":
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":"ride is no longer available"}`))
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/v1/driver/drive/"):
+			gotPath = r.URL.Path
+			gotKey = r.Header.Get("X-Driver-Key")
+			var body struct {
+				EtaMinutes int     `json:"eta_minutes"`
+				EtaKm      float64 `json:"eta_km"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Error(err)
+				return
+			}
+			etaMin = body.EtaMinutes
+			etaKm = body.EtaKm
+			_, _ = w.Write([]byte(`{"status":"accepted","pay_to":"addr_test1qx","fare_lovelace":2800000}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	if err := SetupPin("42", "42"); err != nil {
+		t.Fatal(err)
+	}
+	if err := WalletCreate(0); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveCar("VW", "ID.3", "white", "B-KK 402", "2024"); err != nil {
+		t.Fatal(err)
+	}
+	if err := AddServer("ready.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveServerFees(0, "2", "0.5", "ada"); err != nil {
+		t.Fatal(err)
+	}
+	if msg, err := RegisterDrivers(); err != nil || msg != "" {
+		t.Fatalf("register: %q %v", msg, err)
+	}
+	if _, err := VerifyDrive("ready.example.com", "9f2c01"); err == nil || err.Error() != "claim the ride first" {
+		t.Fatalf("before claim: %v", err)
+	}
+	if err := ClaimDrive("ready.example.com", "taken", "1.2"); err == nil || !strings.Contains(err.Error(), "no longer available") {
+		t.Fatalf("taken: %v", err)
+	}
+	if DriveClaimed("ready.example.com", "taken") != 0 {
+		t.Fatal("rejected claim was stored")
+	}
+	if err := ClaimDrive("ready.example.com", "9f2c01", "0.4"); err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/api/v1/driver/drive/9f2c01" || etaMin != 1 || math.Abs(etaKm-0.4) > 1e-9 {
+		t.Fatalf("accept = %s %d %v", gotPath, etaMin, etaKm)
+	}
+	material, err := WalletMultisigMaterial(0)
+	if err != nil || gotKey != material {
+		t.Fatalf("key = %s %v", gotKey, err)
+	}
+	if DriveClaimed("Ready.example.com", "9f2c01") != 1 || DrivePaid("ready.example.com", "9f2c01") != 0 {
+		t.Fatal("claimed state")
+	}
+	prev := paymentSeen
+	t.Cleanup(func() { paymentSeen = prev })
+	var addr, amount string
+	paymentSeen = func(c Coin, address, atoms string) (bool, error) {
+		if c.ID() != "cardano" {
+			t.Fatalf("coin = %s", c.ID())
+		}
+		addr, amount = address, atoms
+		return false, nil
+	}
+	paid, err := VerifyDrive("ready.example.com", "9f2c01")
+	if err != nil || paid || addr != "addr_test1qx" || amount != "2800000" {
+		t.Fatalf("unpaid = %v %v %s %s", paid, err, addr, amount)
+	}
+	paymentSeen = func(Coin, string, string) (bool, error) { return true, nil }
+	paid, err = VerifyDrive("ready.example.com", "9f2c01")
+	if err != nil || !paid || DrivePaid("ready.example.com", "9f2c01") != 1 {
+		t.Fatalf("paid = %v %v", paid, err)
+	}
+	calls := 0
+	paymentSeen = func(Coin, string, string) (bool, error) {
+		calls++
+		return false, nil
+	}
+	paid, err = VerifyDrive("ready.example.com", "9f2c01")
+	if err != nil || !paid || calls != 0 {
+		t.Fatalf("remembered = %v %v calls %d", paid, err, calls)
+	}
+}
+
 type sampleRide struct {
 	id, start, end string
 	after          time.Duration
@@ -326,6 +430,8 @@ func (ride sampleRide) payload(now time.Time) remoteRide {
 	}
 	row.Start.Lat = ride.lat
 	row.Start.Lng = ride.lng
+	row.End.Lat = ride.lat + 0.01
+	row.End.Lng = ride.lng + 0.01
 	return row
 }
 

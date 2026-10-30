@@ -15,6 +15,9 @@ import (
 // Mainnet public indexer. The balance is lovelace, shown as ADA.
 var balanceEndpoint = "https://api.koios.rest/api/v1/address_info"
 
+// preprodBalanceEndpoint is Koios for addr_test ride addresses.
+var preprodBalanceEndpoint = "https://preprod.koios.rest/api/v1/address_info"
+
 var balanceClient = &http.Client{Timeout: 20 * time.Second}
 
 const balanceCacheTTL = time.Minute
@@ -80,13 +83,45 @@ func storeCachedBalance(address, lovelace, amount string) {
 }
 
 func fetchBalance(address string) (string, error) {
+	return fetchBalanceAt(balanceEndpoint, address)
+}
+
+// Received is true when address holds at least lovelace.
+// A testnet address (addr_test) is read from preprod Koios. The wallet's own
+// balance stays on mainnet. The answer is not cached.
+func Received(address, lovelace string) (bool, error) {
+	address = strings.TrimSpace(address)
+	lovelace = strings.TrimSpace(lovelace)
+	if address == "" {
+		return false, fmt.Errorf("cardano: payment: missing address")
+	}
+	want := new(big.Int)
+	if _, ok := want.SetString(lovelace, 10); !ok || want.Sign() < 0 {
+		return false, fmt.Errorf("cardano: payment: bad amount %q", lovelace)
+	}
+	endpoint := balanceEndpoint
+	if strings.HasPrefix(address, "addr_test") {
+		endpoint = preprodBalanceEndpoint
+	}
+	gotText, err := fetchBalanceAt(endpoint, address)
+	if err != nil {
+		return false, err
+	}
+	got := new(big.Int)
+	if _, ok := got.SetString(strings.TrimSpace(gotText), 10); !ok || got.Sign() < 0 {
+		return false, fmt.Errorf("cardano: payment: bad amount %q", gotText)
+	}
+	return got.Cmp(want) >= 0, nil
+}
+
+func fetchBalanceAt(endpoint, address string) (string, error) {
 	payload, err := json.Marshal(map[string][]string{
 		"_addresses": {address},
 	})
 	if err != nil {
 		return "", fmt.Errorf("cardano: balance: %w", err)
 	}
-	req, err := http.NewRequest(http.MethodPost, balanceEndpoint, bytes.NewReader(payload))
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return "", fmt.Errorf("cardano: balance: %w", err)
 	}
