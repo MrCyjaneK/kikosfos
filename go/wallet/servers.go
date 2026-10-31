@@ -1,6 +1,7 @@
 package wallet
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -10,23 +11,86 @@ import (
 
 var errIncompatible = errors.New("server is incompatible")
 
-// discoverCurrency reads GET /api/v1/currency. The value is the coin id,
-// such as "cardano".
-func discoverCurrency(host string) (string, error) {
+// discoverCurrencies reads GET /api/v1/currency. The value is one coin id
+// or a list of them, such as "cardano" or ["cardano", "bsv"].
+func discoverCurrencies(host string) ([]string, error) {
 	status, body, err := kikoDo(http.MethodGet, host, "/api/v1/currency", nil, nil)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if status != http.StatusOK {
-		return "", errors.New(host + ": " + apiError(status, body))
+		return nil, errors.New(host + ": " + apiError(status, body))
 	}
 	var payload struct {
-		Currency string `json:"currency"`
+		Currency json.RawMessage `json:"currency"`
 	}
-	if json.Unmarshal(body, &payload) != nil || strings.TrimSpace(payload.Currency) == "" {
-		return "", errors.New(host + " did not name a currency")
+	if json.Unmarshal(body, &payload) != nil {
+		return nil, errors.New(host + " did not name a currency")
 	}
-	return payload.Currency, nil
+	raw := bytes.TrimSpace(payload.Currency)
+	if len(raw) == 0 {
+		return nil, errors.New(host + " did not name a currency")
+	}
+	var names []string
+	switch raw[0] {
+	case '"':
+		var one string
+		if json.Unmarshal(raw, &one) != nil || strings.TrimSpace(one) == "" {
+			return nil, errors.New(host + " did not name a currency")
+		}
+		names = []string{one}
+	case '[':
+		if json.Unmarshal(raw, &names) != nil || len(names) == 0 {
+			return nil, errors.New(host + " did not name a currency")
+		}
+	default:
+		return nil, errors.New(host + " did not name a currency")
+	}
+	return names, nil
+}
+
+// chainsFor keeps the coins this app knows, in the order the server named them.
+func chainsFor(names []string) ([]chainFees, error) {
+	var chains []chainFees
+	seen := map[string]bool{}
+	for _, name := range names {
+		name = strings.ToLower(strings.TrimSpace(name))
+		if name == "" || seen[name] {
+			continue
+		}
+		if _, _, ok := coinByID(name); !ok {
+			continue
+		}
+		seen[name] = true
+		chains = append(chains, chainFees{Currency: name})
+	}
+	if len(chains) == 0 {
+		return nil, errIncompatible
+	}
+	return chains, nil
+}
+
+// mergeChains keeps fees for coins the host still offers and adds an empty
+// slot for a coin it newly names.
+func mergeChains(prev, next []chainFees) []chainFees {
+	out := make([]chainFees, len(next))
+	for i, chain := range next {
+		if old, ok := chainByCurrency(prev, chain.Currency); ok {
+			chain.BaseFee = old.BaseFee
+			chain.FeePerKm = old.FeePerKm
+		}
+		out[i] = chain
+	}
+	return out
+}
+
+func chainByCurrency(chains []chainFees, currency string) (chainFees, bool) {
+	for _, chain := range chains {
+		if chain.Currency == currency {
+			return chain, true
+		}
+	}
+	return chainFees{}, false
 }
 
 func normalizeHost(host string) (string, error) {
@@ -90,7 +154,17 @@ func ServerCurrency(index int) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return server.Currency, nil
+	if len(server.Chains) == 0 {
+		return "", nil
+	}
+	return server.Chains[0].Currency, nil
+}
+
+func firstChain(server serverRecord) chainFees {
+	if len(server.Chains) == 0 {
+		return chainFees{}
+	}
+	return server.Chains[0]
 }
 
 func walletForCurrency(currency string) (int, Coin, error) {
@@ -113,14 +187,16 @@ func ServerCompatible(index int) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	_, _, err = walletForCurrency(server.Currency)
-	if errors.Is(err, errIncompatible) {
-		return false, nil
+	for _, chain := range server.Chains {
+		_, _, err = walletForCurrency(chain.Currency)
+		if err == nil {
+			return true, nil
+		}
+		if !errors.Is(err, errIncompatible) {
+			return false, err
+		}
 	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
+	return false, nil
 }
 
 func ServerWalletName(index int) (string, error) {
@@ -128,14 +204,16 @@ func ServerWalletName(index int) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	_, c, err := walletForCurrency(server.Currency)
-	if errors.Is(err, errIncompatible) {
-		return "", nil
+	for _, chain := range server.Chains {
+		_, c, err := walletForCurrency(chain.Currency)
+		if err == nil {
+			return c.Name(), nil
+		}
+		if !errors.Is(err, errIncompatible) {
+			return "", err
+		}
 	}
-	if err != nil {
-		return "", err
-	}
-	return c.Name(), nil
+	return "", nil
 }
 
 func AddServer(host string) error {
@@ -143,7 +221,11 @@ func AddServer(host string) error {
 	if err != nil {
 		return err
 	}
-	currency, err := discoverCurrency(host)
+	names, err := discoverCurrencies(host)
+	if err != nil {
+		return err
+	}
+	chains, err := chainsFor(names)
 	if err != nil {
 		return err
 	}
@@ -151,7 +233,7 @@ func AddServer(host string) error {
 		if hostTaken(doc.Servers, host, -1) {
 			return errors.New("server already exists")
 		}
-		doc.Servers = append(doc.Servers, serverRecord{Host: host, Currency: currency})
+		doc.Servers = append(doc.Servers, serverRecord{Host: host, Chains: chains})
 		return nil
 	})
 }
@@ -161,7 +243,11 @@ func UpdateServer(index int, host string) error {
 	if err != nil {
 		return err
 	}
-	currency, err := discoverCurrency(host)
+	names, err := discoverCurrencies(host)
+	if err != nil {
+		return err
+	}
+	chains, err := chainsFor(names)
 	if err != nil {
 		return err
 	}
@@ -173,28 +259,117 @@ func UpdateServer(index int, host string) error {
 			return errors.New("server already exists")
 		}
 		prev := doc.Servers[index]
-		if prev.Currency != currency {
-			prev.BaseFee = ""
-			prev.FeePerKm = ""
-		}
-		doc.Servers[index] = serverRecord{
-			Host:     host,
-			Currency: currency,
-			BaseFee:  prev.BaseFee,
-			FeePerKm: prev.FeePerKm,
-		}
+		doc.Servers[index] = serverRecord{Host: host, Chains: mergeChains(prev.Chains, chains)}
 		return nil
 	})
 }
 
-// ServerCoin is the wallet index for this server's currency.
+// RefreshServers re-reads each host's currencies. Fees for a coin that remains
+// are kept. A new coin gets an empty price. A coin the host no longer names
+// is dropped. A host that cannot be reached keeps the chains already stored.
+func RefreshServers() error {
+	doc, err := loadProfile()
+	if err != nil {
+		return err
+	}
+	type change struct {
+		index  int
+		chains []chainFees
+	}
+	var changes []change
+	var lines []string
+	for i, server := range doc.Servers {
+		names, err := discoverCurrencies(server.Host)
+		if err != nil {
+			lines = append(lines, err.Error())
+			continue
+		}
+		chains, err := chainsFor(names)
+		if err != nil {
+			lines = append(lines, server.Host+": "+err.Error())
+			continue
+		}
+		changes = append(changes, change{i, mergeChains(server.Chains, chains)})
+	}
+	if len(changes) > 0 {
+		err = updateProfile(func(doc *profileFile) error {
+			for _, item := range changes {
+				if item.index < 0 || item.index >= len(doc.Servers) {
+					return errors.New("servers changed")
+				}
+				doc.Servers[item.index].Chains = item.chains
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	if len(lines) > 0 {
+		return errors.New(strings.Join(lines, "\n"))
+	}
+	return nil
+}
+
+// chainView is one chain as the server page and the server list read it.
+type chainView struct {
+	Currency string `json:"currency"`
+	Coin     int    `json:"coin"`
+	Name     string `json:"name"`
+	Ticker   string `json:"ticker"`
+	Whole    string `json:"whole"`
+	Atom     string `json:"atom"`
+	Wallet   bool   `json:"wallet"`
+	BaseFee  string `json:"base_fee"`
+	FeePerKm string `json:"fee_per_km"`
+}
+
+func ServerChains(index int) (string, error) {
+	server, err := serverAt(index)
+	if err != nil {
+		return "", err
+	}
+	views := make([]chainView, len(server.Chains))
+	for i, chain := range server.Chains {
+		views[i] = viewChain(chain)
+	}
+	body, err := json.Marshal(views)
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
+}
+
+func viewChain(chain chainFees) chainView {
+	view := chainView{
+		Currency: chain.Currency,
+		Coin:     -1,
+		BaseFee:  chain.BaseFee,
+		FeePerKm: chain.FeePerKm,
+	}
+	index, c, ok := coinByID(chain.Currency)
+	if !ok {
+		view.Name = chain.Currency
+		return view
+	}
+	view.Coin = index
+	view.Name = c.Name()
+	view.Ticker = c.Ticker()
+	view.Whole = c.Whole()
+	view.Atom = c.Atom()
+	exists, err := WalletExists(index)
+	view.Wallet = err == nil && exists
+	return view
+}
+
+// ServerCoin is the wallet index for this server's first chain.
 // It is -1 when the app has no such coin. The wallet does not need to exist.
 func ServerCoin(index int) (int, error) {
 	server, err := serverAt(index)
 	if err != nil {
 		return 0, err
 	}
-	coin, _, ok := coinByID(server.Currency)
+	coin, _, ok := coinByID(firstChain(server).Currency)
 	if !ok {
 		return -1, nil
 	}
@@ -206,7 +381,7 @@ func ServerFeeBase(index int) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return server.BaseFee, nil
+	return firstChain(server).BaseFee, nil
 }
 
 func ServerFeePerKm(index int) (string, error) {
@@ -214,7 +389,7 @@ func ServerFeePerKm(index int) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return server.FeePerKm, nil
+	return firstChain(server).FeePerKm, nil
 }
 
 // feeFromEUR converts one euro amount for a coin.
@@ -223,8 +398,17 @@ var feeFromEUR = func(c Coin, eur string) (string, error) {
 	return c.AmountFromEUR(eur)
 }
 
-// ApplyFeesEUR sets every server's prices from euro amounts.
-// Each server uses its own currency. A failed conversion writes nothing.
+// pricedChain is one chain's fees after a euro conversion, before they are stored.
+type pricedChain struct {
+	server   int
+	currency string
+	base     string
+	perKm    string
+}
+
+// ApplyFeesEUR sets every chain's prices from euro amounts.
+// A chain with no wallet is skipped. A failed conversion writes nothing.
+// If every chain is skipped, nothing is written.
 func ApplyFeesEUR(baseEUR, perKmEUR string) error {
 	doc, err := loadProfile()
 	if err != nil {
@@ -233,78 +417,211 @@ func ApplyFeesEUR(baseEUR, perKmEUR string) error {
 	if len(doc.Servers) == 0 {
 		return errors.New("no servers")
 	}
-	bases := make([]string, len(doc.Servers))
-	perKms := make([]string, len(doc.Servers))
+	var priced []pricedChain
+	var skipped int
 	for i, server := range doc.Servers {
-		_, c, ok := coinByID(server.Currency)
-		if !ok {
+		for _, chain := range server.Chains {
+			_, c, err := walletForCurrency(chain.Currency)
+			if errors.Is(err, errIncompatible) {
+				skipped++
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			base, err := feeFromEUR(c, baseEUR)
+			if err != nil {
+				return err
+			}
+			perKm, err := feeFromEUR(c, perKmEUR)
+			if err != nil {
+				return err
+			}
+			priced = append(priced, pricedChain{i, chain.Currency, base, perKm})
+		}
+	}
+	if len(priced) == 0 {
+		if skipped > 0 {
 			return errIncompatible
 		}
-		base, err := feeFromEUR(c, baseEUR)
-		if err != nil {
-			return err
-		}
-		perKm, err := feeFromEUR(c, perKmEUR)
-		if err != nil {
-			return err
-		}
-		bases[i] = base
-		perKms[i] = perKm
+		return errors.New("no servers")
 	}
 	return updateProfile(func(doc *profileFile) error {
-		if len(doc.Servers) != len(bases) {
-			return errors.New("servers changed")
-		}
-		for i := range doc.Servers {
-			doc.Servers[i].BaseFee = bases[i]
-			doc.Servers[i].FeePerKm = perKms[i]
+		for _, item := range priced {
+			if item.server < 0 || item.server >= len(doc.Servers) {
+				return errors.New("servers changed")
+			}
+			chains := doc.Servers[item.server].Chains
+			found := false
+			for i := range chains {
+				if chains[i].Currency == item.currency {
+					chains[i].BaseFee = item.base
+					chains[i].FeePerKm = item.perKm
+					found = true
+				}
+			}
+			if !found {
+				return errors.New("servers changed")
+			}
+			doc.Servers[item.server].Chains = chains
 		}
 		return nil
 	})
 }
 
-// SaveServerFees stores this server's prices in its currency's smallest unit.
-// unit is "ada" or "lovelace". Other servers are left unchanged.
-// Empty text for both prices clears them.
+// SaveServerFees stores one chain's prices in its smallest unit.
+// A server with one chain uses that chain. Otherwise unit selects the chain
+// ("ada", "lovelace", "bsv" or "satoshi"). Empty text for both prices clears them.
 func SaveServerFees(index int, base, perKm, unit string) error {
 	base = strings.TrimSpace(base)
 	perKm = strings.TrimSpace(perKm)
+	server, err := serverAt(index)
+	if err != nil {
+		return err
+	}
+	at, c, err := chainForUnit(server, unit)
+	if err != nil {
+		return err
+	}
 	if base == "" && perKm == "" {
-		return updateProfile(func(doc *profileFile) error {
-			if index < 0 || index >= len(doc.Servers) {
-				return errors.New("unknown server")
-			}
-			doc.Servers[index].BaseFee = ""
-			doc.Servers[index].FeePerKm = ""
-			return nil
-		})
+		return writeChainFees(index, server.Chains[at].Currency, "", "")
 	}
 	if base == "" || perKm == "" {
+		return errors.New("enter both prices")
+	}
+	_, baseAtoms, _, err := c.Quote(base, unit)
+	if err != nil {
+		return err
+	}
+	_, perAtoms, _, err := c.Quote(perKm, unit)
+	if err != nil {
+		return err
+	}
+	return writeChainFees(index, server.Chains[at].Currency, baseAtoms, perAtoms)
+}
+
+type chainFeeInput struct {
+	Currency string `json:"currency"`
+	Base     string `json:"base"`
+	PerKm    string `json:"per_km"`
+	Unit     string `json:"unit"`
+}
+
+// SaveChainFees stores every editable chain on one server.
+// A chain with no wallet is left as stored. Empty amounts clear that chain.
+func SaveChainFees(index int, raw string) error {
+	var inputs []chainFeeInput
+	if json.Unmarshal([]byte(raw), &inputs) != nil {
 		return errors.New("enter both prices")
 	}
 	server, err := serverAt(index)
 	if err != nil {
 		return err
 	}
-	_, c, ok := coinByID(server.Currency)
-	if !ok {
-		return errIncompatible
+	type stored struct {
+		currency string
+		base     string
+		perKm    string
 	}
-	_, baseLove, _, err := c.Quote(base, unit)
-	if err != nil {
-		return err
-	}
-	_, perLove, _, err := c.Quote(perKm, unit)
-	if err != nil {
-		return err
+	var next []stored
+	for _, input := range inputs {
+		chain, ok := chainByCurrency(server.Chains, input.Currency)
+		if !ok {
+			return errors.New("unknown server")
+		}
+		_, c, err := walletForCurrency(chain.Currency)
+		if errors.Is(err, errIncompatible) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		base := strings.TrimSpace(input.Base)
+		perKm := strings.TrimSpace(input.PerKm)
+		if base == "" && perKm == "" {
+			next = append(next, stored{chain.Currency, "", ""})
+			continue
+		}
+		if base == "" || perKm == "" {
+			return errors.New("enter both prices")
+		}
+		unit := strings.TrimSpace(input.Unit)
+		_, baseAtoms, _, err := c.Quote(base, unit)
+		if err != nil {
+			return err
+		}
+		_, perAtoms, _, err := c.Quote(perKm, unit)
+		if err != nil {
+			return err
+		}
+		next = append(next, stored{chain.Currency, baseAtoms, perAtoms})
 	}
 	return updateProfile(func(doc *profileFile) error {
 		if index < 0 || index >= len(doc.Servers) {
 			return errors.New("unknown server")
 		}
-		doc.Servers[index].BaseFee = baseLove
-		doc.Servers[index].FeePerKm = perLove
+		chains := doc.Servers[index].Chains
+		for _, item := range next {
+			found := false
+			for i := range chains {
+				if chains[i].Currency == item.currency {
+					chains[i].BaseFee = item.base
+					chains[i].FeePerKm = item.perKm
+					found = true
+				}
+			}
+			if !found {
+				return errors.New("unknown server")
+			}
+		}
+		doc.Servers[index].Chains = chains
 		return nil
+	})
+}
+
+func chainForUnit(server serverRecord, unit string) (int, Coin, error) {
+	if len(server.Chains) == 0 {
+		return 0, nil, errIncompatible
+	}
+	if len(server.Chains) == 1 {
+		_, c, err := walletForCurrency(server.Chains[0].Currency)
+		if err != nil {
+			return 0, nil, err
+		}
+		return 0, c, nil
+	}
+	unit = strings.TrimSpace(unit)
+	for i, chain := range server.Chains {
+		_, c, ok := coinByID(chain.Currency)
+		if !ok {
+			continue
+		}
+		if unit == c.Whole() || unit == c.Atom() {
+			_, c, err := walletForCurrency(chain.Currency)
+			if err != nil {
+				return 0, nil, err
+			}
+			return i, c, nil
+		}
+	}
+	return 0, nil, errIncompatible
+}
+
+func writeChainFees(index int, currency, base, perKm string) error {
+	return updateProfile(func(doc *profileFile) error {
+		if index < 0 || index >= len(doc.Servers) {
+			return errors.New("unknown server")
+		}
+		chains := doc.Servers[index].Chains
+		for i := range chains {
+			if chains[i].Currency == currency {
+				chains[i].BaseFee = base
+				chains[i].FeePerKm = perKm
+				doc.Servers[index].Chains = chains
+				return nil
+			}
+		}
+		return errors.New("unknown server")
 	})
 }
 

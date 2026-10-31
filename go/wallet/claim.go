@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"kiko-sfos/wallet/bsv"
 	"kiko-sfos/wallet/cardano"
 )
 
@@ -69,14 +70,40 @@ func dropOffer(server, id string) {
 	driveOffers = next
 }
 
-func readyFor(host string) (readyServer, error) {
+// readyFor finds the registered chain for this host.
+// coin < 0 means the host has one chain. A host with several chains needs the coin.
+func readyFor(host string, coin int) (readyServer, error) {
 	host = strings.TrimSpace(host)
+	var found []readyServer
 	for _, server := range readyCopy() {
-		if strings.EqualFold(server.Host, host) {
-			return server, nil
+		if !strings.EqualFold(server.Host, host) {
+			continue
+		}
+		if coin < 0 || server.Coin == coin {
+			found = append(found, server)
 		}
 	}
-	return readyServer{}, errors.New("unknown server")
+	if coin < 0 && len(found) == 1 {
+		return found[0], nil
+	}
+	if coin >= 0 && len(found) == 1 {
+		return found[0], nil
+	}
+	if len(found) == 0 {
+		return readyServer{}, errors.New("unknown server")
+	}
+	return readyServer{}, errors.New("unknown ride")
+}
+
+func offerCoin(server, id string) int {
+	driveMu.Lock()
+	defer driveMu.Unlock()
+	for _, row := range driveOffers {
+		if strings.EqualFold(row.Server, server) && row.ID == id {
+			return row.Coin
+		}
+	}
+	return -1
 }
 
 func rememberHeld(ride heldRide) {
@@ -142,7 +169,7 @@ func ClaimDrive(server, id, pickupKm string) error {
 	if id == "" {
 		return errors.New("unknown ride")
 	}
-	ready, err := readyFor(server)
+	ready, err := readyFor(server, offerCoin(server, id))
 	if err != nil {
 		return err
 	}
@@ -157,9 +184,7 @@ func ClaimDrive(server, id, pickupKm string) error {
 	if err != nil {
 		return err
 	}
-	status, resp, err := kikoDo(http.MethodPost, ready.Host, "/api/v1/driver/drive/"+url.PathEscape(id), body, map[string]string{
-		"X-Driver-Key": ready.Key,
-	})
+	status, resp, err := driverDo(http.MethodPost, ready.Host, "/api/v1/driver/drive/"+url.PathEscape(id), body, ready.Coin, true)
 	if err != nil {
 		return err
 	}
@@ -167,7 +192,7 @@ func ClaimDrive(server, id, pickupKm string) error {
 		return errors.New(ready.Host + ": " + apiError(status, resp))
 	}
 	view, err := parseRideView(resp)
-	if err != nil || view.PayTo == "" || view.Fare == 0 {
+	if err != nil || view.PayTo == "" || view.atoms() == 0 {
 		return errors.New(ready.Host + ": bad ride")
 	}
 	dropOffer(ready.Host, id)
@@ -193,7 +218,8 @@ type rideView struct {
 	DistanceKm   float64  `json:"distance_km"`
 	PickupTime   string   `json:"pickup_time"`
 	PayTo        string   `json:"pay_to"`
-	Fare         uint64   `json:"fare_lovelace"`
+	Fare         uint64   `json:"fare"`
+	FareLovelace uint64   `json:"fare_lovelace"`
 	EtaKm        *float64 `json:"eta_km"`
 	AddressIndex *uint32  `json:"address_index"`
 	Script       string   `json:"script"`
@@ -205,6 +231,13 @@ func parseRideView(body []byte) (rideView, error) {
 		return rideView{}, err
 	}
 	return view, nil
+}
+
+func (v rideView) atoms() uint64 {
+	if v.Fare != 0 {
+		return v.Fare
+	}
+	return v.FareLovelace
 }
 
 func heldFromView(ready readyServer, id string, pickupKm float64, status string, view rideView) heldRide {
@@ -230,7 +263,7 @@ func heldFromView(ready readyServer, id string, pickupKm float64, status string,
 			EndLat:       view.End.Lat,
 			EndLon:       view.End.Lng,
 			Immediate:    !when.After(time.Now().Add(nowWindow)),
-			Fare:         view.Fare,
+			Fare:         view.atoms(),
 			Base:         ready.Base,
 			PerKm:        ready.PerKm,
 		},
@@ -260,6 +293,9 @@ func VerifyDrive(server, id string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	if c.ID() == bsv.ID {
+		return verifyRideStatus(server, id, ride)
+	}
 	paid, err := paymentSeen(c, ride.PayTo, strconv.FormatUint(ride.Offer.Fare, 10))
 	if err != nil || !paid {
 		return false, err
@@ -285,18 +321,27 @@ func CashOutDrive(server, id string) error {
 	if err != nil {
 		return err
 	}
-	if c.ID() != cardano.ID {
-		return errors.New("cash out is only available for cardano")
-	}
 	mnemonic, err := WalletMnemonic(ride.Offer.Coin)
 	if err != nil {
 		return err
 	}
-	signed, err := buildPayout(mnemonic, ride.PayTo, ride.Script, ride.Index)
+	var signed string
+	switch c.ID() {
+	case cardano.ID:
+		signed, err = buildPayout(mnemonic, ride.PayTo, ride.Script, ride.Index)
+	case bsv.ID:
+		script := ride.Script
+		if script == "" {
+			script = ride.PayTo
+		}
+		signed, err = bsv.Payout(mnemonic, script, ride.Index)
+	default:
+		return errors.New("cash out is only available for cardano")
+	}
 	if err != nil {
 		return err
 	}
-	ready, err := readyFor(server)
+	ready, err := readyFor(server, ride.Offer.Coin)
 	if err != nil {
 		return err
 	}
@@ -306,9 +351,7 @@ func CashOutDrive(server, id string) error {
 	if err != nil {
 		return err
 	}
-	status, resp, err := kikoDo(http.MethodPost, ready.Host, "/api/v1/driver/drive/"+url.PathEscape(ride.Offer.ID)+"/payout", body, map[string]string{
-		"X-Driver-Key": ready.Key,
-	})
+	status, resp, err := driverDo(http.MethodPost, ready.Host, "/api/v1/driver/drive/"+url.PathEscape(ride.Offer.ID)+"/payout", body, ready.Coin, true)
 	if err != nil {
 		return err
 	}
@@ -355,11 +398,7 @@ func reloadSaved() {
 	}
 	var gone []savedRide
 	for _, row := range doc.Rides {
-		ready, err := readyFor(row.Server)
-		if err != nil {
-			continue
-		}
-		if err := fetchHeld(ready, row.ID); errors.Is(err, errRideGone) {
+		if err := fetchAnyHeld(row.Server, row.ID); errors.Is(err, errRideGone) {
 			gone = append(gone, row)
 		}
 	}
@@ -369,10 +408,51 @@ func reloadSaved() {
 	}
 }
 
+func verifyRideStatus(server, id string, ride heldRide) (bool, error) {
+	ready, err := readyFor(server, ride.Offer.Coin)
+	if err != nil {
+		return false, err
+	}
+	if err := fetchHeld(ready, id); err != nil {
+		if errors.Is(err, errRideGone) {
+			return false, nil
+		}
+		return false, err
+	}
+	updated, ok := heldFor(server, id)
+	if !ok {
+		return false, nil
+	}
+	return updated.Paid, nil
+}
+
+// fetchAnyHeld asks each registered chain of host. The ride is gone only
+// when every chain reports that.
+func fetchAnyHeld(host, id string) error {
+	var matched, gone int
+	for _, ready := range readyCopy() {
+		if !strings.EqualFold(ready.Host, host) {
+			continue
+		}
+		matched++
+		err := fetchHeld(ready, id)
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, errRideGone) {
+			gone++
+			continue
+		}
+		return err
+	}
+	if matched > 0 && gone == matched {
+		return errRideGone
+	}
+	return nil
+}
+
 func fetchHeld(ready readyServer, id string) error {
-	status, resp, err := kikoDo(http.MethodGet, ready.Host, "/api/v1/driver/drive/"+url.PathEscape(id), nil, map[string]string{
-		"X-Driver-Key": ready.Key,
-	})
+	status, resp, err := driverDo(http.MethodGet, ready.Host, "/api/v1/driver/drive/"+url.PathEscape(id), nil, ready.Coin, true)
 	if err != nil {
 		return err
 	}

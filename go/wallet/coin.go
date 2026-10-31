@@ -49,7 +49,11 @@ type Coin interface {
 	PrivateKey(mnemonic string) (string, error)
 	// MultisigMaterial is the shareable key for a multisig setup.
 	// Each coin picks its own encoding. Cardano uses acct_shared_xvk.
+	// BSV uses the account xpub at m/48'/236'/0'.
 	MultisigMaterial(mnemonic string) (string, error)
+	// SignMessage signs a driver request with the account key behind
+	// MultisigMaterial. The result is hex.
+	SignMessage(mnemonic string, msg []byte) (string, error)
 	// Balance is the on-chain amount for an address, formatted for display.
 	Balance(address string) (string, error)
 	// Fiat quotes that balance. Empty when the coin has no euro price.
@@ -118,6 +122,10 @@ func (cardanoCoin) MultisigMaterial(mnemonic string) (string, error) {
 		return "", err
 	}
 	return account.AccountSharedXVK, nil
+}
+
+func (cardanoCoin) SignMessage(mnemonic string, msg []byte) (string, error) {
+	return cardano.SignMessage(mnemonic, msg)
 }
 
 func (cardanoCoin) Balance(address string) (string, error) {
@@ -201,11 +209,11 @@ func (bsvCoin) PrivateKey(mnemonic string) (string, error) {
 }
 
 func (bsvCoin) MultisigMaterial(mnemonic string) (string, error) {
-	account, err := bsv.Restore(mnemonic)
-	if err != nil {
-		return "", err
-	}
-	return account.AccountXPub, nil
+	return bsv.DriverXPub(mnemonic)
+}
+
+func (bsvCoin) SignMessage(mnemonic string, msg []byte) (string, error) {
+	return bsv.SignMessage(mnemonic, msg)
 }
 
 func (bsvCoin) Balance(address string) (string, error) {

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"kiko-sfos/gps"
+	"kiko-sfos/wallet/bsv"
 )
 
 // A pickup inside this window is a ride for now. Later pickups are scheduled.
@@ -97,26 +98,28 @@ func RegisterDrivers() (string, error) {
 	}
 	var lines []string
 	var ready []readyServer
-	for i, server := range doc.Servers {
-		resp, err := RegisterDriver(server.Host)
-		if err != nil {
-			if skipRegister(err) {
+	for _, server := range doc.Servers {
+		for _, chain := range server.Chains {
+			resp, err := registerChain(server.Host, chain.Currency)
+			if err != nil {
+				if skipRegister(err) {
+					continue
+				}
+				return "", err
+			}
+			if line, ok := registrationFailure(server.Host, resp); ok {
+				lines = append(lines, line)
 				continue
 			}
-			return "", err
-		}
-		if line, ok := registrationFailure(server.Host, resp); ok {
-			lines = append(lines, line)
-			continue
-		}
-		priced, err := rememberServer(i, server.Host)
-		if err != nil {
-			if skipRegister(err) {
-				continue
+			priced, err := rememberChain(server.Host, chain)
+			if err != nil {
+				if skipRegister(err) {
+					continue
+				}
+				return "", err
 			}
-			return "", err
+			ready = append(ready, priced)
 		}
-		ready = append(ready, priced)
 	}
 	driveMu.Lock()
 	driveReady = ready
@@ -125,32 +128,21 @@ func RegisterDrivers() (string, error) {
 	return strings.Join(lines, "\n"), nil
 }
 
-func rememberServer(index int, host string) (readyServer, error) {
-	baseText, err := ServerFeeBase(index)
-	if err != nil {
-		return readyServer{}, err
-	}
-	perText, err := ServerFeePerKm(index)
-	if err != nil {
-		return readyServer{}, err
-	}
-	if baseText == "" || perText == "" {
+func rememberChain(host string, chain chainFees) (readyServer, error) {
+	if chain.BaseFee == "" || chain.FeePerKm == "" {
 		return readyServer{}, errors.New("fees are not set")
 	}
-	base, err := strconv.ParseUint(baseText, 10, 64)
+	base, err := strconv.ParseUint(chain.BaseFee, 10, 64)
 	if err != nil {
 		return readyServer{}, errors.New("fees are not set")
 	}
-	perKm, err := strconv.ParseUint(perText, 10, 64)
+	perKm, err := strconv.ParseUint(chain.FeePerKm, 10, 64)
 	if err != nil {
 		return readyServer{}, errors.New("fees are not set")
 	}
-	coin, err := ServerCoin(index)
+	coin, _, err := walletForCurrency(chain.Currency)
 	if err != nil {
 		return readyServer{}, err
-	}
-	if coin < 0 {
-		return readyServer{}, errIncompatible
 	}
 	key, err := WalletMultisigMaterial(coin)
 	if err != nil {
@@ -159,20 +151,29 @@ func rememberServer(index int, host string) (readyServer, error) {
 	return readyServer{Host: host, Coin: coin, Base: base, PerKm: perKm, Key: key}, nil
 }
 
-// fareLovelace is max(base + ceil(perKm * km), 1_000_000).
+// fareAtoms is max(base + ceil(perKm * km), floor).
 // meters is the trip length. ceil is exact for whole meters.
-func fareLovelace(base, perKm, meters uint64) uint64 {
+// floor is 1_000_000 lovelace on Cardano and 1 satoshi on BSV.
+func fareAtoms(base, perKm, meters, floor uint64) uint64 {
 	extra := new(big.Int).Mul(new(big.Int).SetUint64(perKm), new(big.Int).SetUint64(meters))
 	extra.Add(extra, big.NewInt(999))
 	extra.Quo(extra, big.NewInt(1000))
 	sum := extra.Add(extra, new(big.Int).SetUint64(base))
-	if sum.Cmp(big.NewInt(1000000)) < 0 {
-		return 1000000
+	if sum.Cmp(new(big.Int).SetUint64(floor)) < 0 {
+		return floor
 	}
 	if !sum.IsUint64() {
 		return math.MaxUint64
 	}
 	return sum.Uint64()
+}
+
+func minFare(coin int) uint64 {
+	c, err := coinAt(coin)
+	if err == nil && c.ID() == bsv.ID {
+		return 1
+	}
+	return 1000000
 }
 
 // RefreshDrives loads requested rides from each registered server.
@@ -279,9 +280,7 @@ func ridesFrom(server readyServer, lat, lon, rangeKm float64, now time.Time) ([]
 	query := url.Values{}
 	query.Set("location", strconv.FormatFloat(lat, 'f', -1, 64)+","+strconv.FormatFloat(lon, 'f', -1, 64))
 	query.Set("range", strconv.FormatFloat(rangeKm, 'f', -1, 64))
-	status, body, err := kikoDo(http.MethodGet, server.Host, "/api/v1/driver/drive/available?"+query.Encode(), nil, map[string]string{
-		"X-Driver-Key": server.Key,
-	})
+	status, body, err := driverDo(http.MethodGet, server.Host, "/api/v1/driver/drive/available?"+query.Encode(), nil, server.Coin, true)
 	if err != nil {
 		return nil, err
 	}
@@ -316,7 +315,7 @@ func ridesFrom(server readyServer, lat, lon, rangeKm float64, now time.Time) ([]
 			EndLat:       ride.End.Lat,
 			EndLon:       ride.End.Lng,
 			Immediate:    !when.After(now.Add(nowWindow)),
-			Fare:         fareLovelace(server.Base, server.PerKm, meters),
+			Fare:         fareAtoms(server.Base, server.PerKm, meters, minFare(server.Coin)),
 			Base:         server.Base,
 			PerKm:        server.PerKm,
 		})

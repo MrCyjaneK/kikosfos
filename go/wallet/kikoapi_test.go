@@ -1,11 +1,14 @@
 package wallet
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -152,26 +155,32 @@ func TestRegisterDriverConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	posts := 0
+	var signedErr string
+	var signedMu sync.Mutex
+	note := func(r *http.Request, body []byte, wantKey bool) {
+		if err := verifySigned(r, body, 0, wantKey); err != nil {
+			signedMu.Lock()
+			signedErr = err.Error()
+			signedMu.Unlock()
+		}
+	}
 	serveKiko(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		body, _ := io.ReadAll(r.Body)
 		switch r.URL.Path {
 		case "/api/v1/currency":
 			_, _ = w.Write([]byte(`{"currency":"cardano"}`))
 		case "/api/v1/driver":
 			posts++
+			note(r, body, false)
 			if posts > 1 {
-				w.WriteHeader(http.StatusConflict)
-				_, _ = w.Write([]byte(`{"error":"a driver with this public_key is already registered"}`))
-				return
+				w.WriteHeader(http.StatusOK)
+			} else {
+				w.WriteHeader(http.StatusCreated)
 			}
-			w.WriteHeader(http.StatusCreated)
-			_, _ = io.Copy(w, r.Body)
+			_, _ = w.Write(body)
 		case "/api/v1/driver/drive/available":
-			if r.Header.Get("X-Driver-Key") == "" {
-				w.WriteHeader(http.StatusUnauthorized)
-				_, _ = w.Write([]byte(`{"error":"missing key"}`))
-				return
-			}
+			note(r, body, true)
 			_, _ = w.Write([]byte("[]"))
 		default:
 			http.NotFound(w, r)
@@ -189,12 +198,53 @@ func TestRegisterDriverConflict(t *testing.T) {
 	}
 	msg, err = RegisterDrivers()
 	if err != nil || msg != "" {
-		t.Fatalf("already registered: %q %v", msg, err)
+		t.Fatalf("update: %q %v", msg, err)
+	}
+	if posts != 2 {
+		t.Fatalf("posts = %d", posts)
+	}
+	signedMu.Lock()
+	errText := signedErr
+	signedMu.Unlock()
+	if errText != "" {
+		t.Fatal(errText)
 	}
 	if err := RefreshDrives(5); err != nil {
 		t.Fatal(err)
 	}
+	signedMu.Lock()
+	errText = signedErr
+	signedMu.Unlock()
+	if errText != "" {
+		t.Fatal(errText)
+	}
 	if n := DriveCount(); n != 0 {
 		t.Fatalf("count = %d", n)
 	}
+}
+
+func verifySigned(r *http.Request, body []byte, coin int, wantKey bool) error {
+	if wantKey {
+		if r.Header.Get("X-Driver-Key") == "" {
+			return fmt.Errorf("%s sent no driver key", r.URL.Path)
+		}
+	} else if r.Header.Get("X-Driver-Key") != "" {
+		return fmt.Errorf("%s sent a driver key", r.URL.Path)
+	}
+	ts, err := strconv.ParseInt(r.Header.Get("X-Driver-Timestamp"), 10, 64)
+	if err != nil {
+		return fmt.Errorf("%s timestamp: %w", r.URL.Path, err)
+	}
+	sig := r.Header.Get("X-Driver-Signature")
+	if sig == "" {
+		return fmt.Errorf("%s sent no signature", r.URL.Path)
+	}
+	got, err := signDriver(coin, driverMessage(ts, r.Method, r.URL.RequestURI(), body))
+	if err != nil {
+		return err
+	}
+	if got != sig {
+		return fmt.Errorf("%s signature does not match", r.URL.Path)
+	}
+	return nil
 }

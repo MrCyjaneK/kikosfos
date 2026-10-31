@@ -368,6 +368,22 @@ int KikoApi::serverSaveFees(int index, const QString &base, const QString &perKm
     return KIKO_server_save_fees(index, baseUtf8.data(), perUtf8.data(), unitUtf8.data());
 }
 
+int KikoApi::serverRefresh()
+{
+    return KIKO_server_refresh();
+}
+
+QString KikoApi::serverChains(int index)
+{
+    return takeKikoString(KIKO_server_chains(index));
+}
+
+int KikoApi::serverSaveChains(int index, const QString &fees)
+{
+    QByteArray feesUtf8 = utf8(fees);
+    return KIKO_server_save_chains(index, feesUtf8.data());
+}
+
 void KikoApi::applyFeesEur(const QString &base, const QString &perKm)
 {
     QPointer<KikoApi> self(this);

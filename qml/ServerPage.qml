@@ -1,22 +1,13 @@
 import QtQuick 2.6
 import Sailfish.Silica 1.0
+import "components"
 
 Page {
     id: page
     property int index: -1
     property string host
     property string errorText
-    property int coin: -1
-    property string whole
-    property string atom
-    property string ticker
-    property string feeUnit: "ada"
-    property bool euroTried
-    property string baseEurLabel
-    property string perKmEurLabel
-    property string baseQuoteMessage
-    property string perKmQuoteMessage
-    property bool compatible: true
+    property var chains: []
 
     Component.onCompleted: load()
 
@@ -24,85 +15,60 @@ Page {
         if (index < 0)
             return
         hostField.text = host
-        coin = kiko.serverCoin(index)
-        compatible = kiko.serverCompatible(index) === 1
-        if (coin >= 0) {
-            whole = kiko.walletWhole(coin)
-            atom = kiko.walletAtom(coin)
-            ticker = kiko.walletTicker(coin)
-            feeUnit = whole
+        var text = kiko.serverChains(index)
+        if (text === "") {
+            chains = []
+            if (kiko.lastError() !== "")
+                errorText = kiko.lastError()
+            return
         }
-        baseCrypto.text = fieldFromLovelace(kiko.serverFeeBase(index))
-        perKmCrypto.text = fieldFromLovelace(kiko.serverFeePerKm(index))
-        if (kiko.lastError() !== "")
+        try {
+            chains = JSON.parse(text)
+        } catch (e) {
+            chains = []
+            errorText = "Could not read this server"
+        }
+    }
+
+    function save() {
+        errorText = ""
+        if (index < 0) {
+            if (kiko.serverAdd(hostField.text) !== 0)
+                errorText = kiko.lastError()
+            else
+                pageStack.pop()
+            return
+        }
+        var drafts = []
+        for (var i = 0; i < chainRepeater.count; i++) {
+            var row = chainRepeater.itemAt(i).feePayload()
+            if (row)
+                drafts.push(row)
+        }
+        if (kiko.serverUpdate(index, hostField.text) !== 0) {
             errorText = kiko.lastError()
-    }
-
-    function stripTicker(text) {
-        var suffix = " " + ticker
-        if (ticker !== "" && text.length >= suffix.length && text.slice(-suffix.length) === suffix)
-            return text.slice(0, text.length - suffix.length)
-        return text
-    }
-
-    function fieldFromLovelace(lovelace) {
-        if (lovelace === "" || coin < 0)
-            return lovelace
-        var parts = kiko.walletQuote(coin, lovelace, atom).split("\n")
-        if (parts.length > 3 && parts[3] !== "")
-            return lovelace
-        if (feeUnit === atom)
-            return parts[1]
-        return stripTicker(parts[0])
-    }
-
-    function converted(text, fromUnit, toUnit) {
-        if (text.trim() === "" || coin < 0)
-            return text
-        var parts = kiko.walletQuote(coin, text, fromUnit).split("\n")
-        if (parts.length > 3 && parts[3] !== "")
-            return text
-        if (toUnit === atom)
-            return parts[1]
-        return stripTicker(parts[0])
-    }
-
-    function quoteInto(text, unit, which) {
-        var eur = ""
-        var message = ""
-        if (text.trim() !== "" && coin >= 0) {
-            var parts = kiko.walletQuote(coin, text, unit).split("\n")
-            message = parts.length > 3 ? parts[3] : ""
-            if (message === "")
-                eur = parts[2]
-            var lovelace = parts.length > 1 ? parts[1] : ""
-            if (message === "" && eur === "" && lovelace !== "" && lovelace !== "0" && !euroTried) {
-                euroTried = true
-                kiko.walletWarmEuro(coin)
+            return
+        }
+        var text = kiko.serverChains(index)
+        var offered = []
+        try {
+            offered = JSON.parse(text)
+        } catch (e) {
+            errorText = kiko.lastError() !== "" ? kiko.lastError() : "Could not read this server"
+            return
+        }
+        var payload = []
+        for (var c = 0; c < offered.length; c++) {
+            for (var d = 0; d < drafts.length; d++) {
+                if (drafts[d].currency === offered[c].currency)
+                    payload.push(drafts[d])
             }
         }
-        if (which === "base") {
-            baseQuoteMessage = message
-            baseEurLabel = eur
-        } else {
-            perKmQuoteMessage = message
-            perKmEurLabel = eur
-        }
-    }
-
-    function refreshQuotes() {
-        if (!baseCrypto)
+        if (kiko.serverSaveChains(index, JSON.stringify(payload)) !== 0) {
+            errorText = kiko.lastError()
             return
-        quoteInto(baseCrypto.text, feeUnit, "base")
-        quoteInto(perKmCrypto.text, feeUnit, "perKm")
-    }
-
-    Connections {
-        target: kiko
-        onEuroReady: {
-            if (wallet === page.coin)
-                page.refreshQuotes()
         }
+        pageStack.pop()
     }
 
     SilicaFlickable {
@@ -133,113 +99,27 @@ Page {
                 inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhUrlCharactersOnly
             }
 
-            Label {
-                visible: page.index >= 0 && !page.compatible
-                width: parent.width - 2 * Theme.horizontalPageMargin
-                x: Theme.horizontalPageMargin
-                wrapMode: Text.Wrap
-                text: "No matching wallet for this server"
-                color: Theme.highlightColor
-                font.pixelSize: Theme.fontSizeSmall
-            }
+            Repeater {
+                id: chainRepeater
+                model: page.index < 0 ? 0 : page.chains.length
 
-            Column {
-                width: parent.width
-                spacing: Theme.paddingLarge
-                visible: page.index >= 0
-
-                SectionHeader { text: "Price" }
-
-                TextSwitch {
-                    id: atomSwitch
-                    width: parent.width
-                    text: page.atom.charAt(0).toUpperCase() + page.atom.slice(1)
-                    description: checked ? "Amounts in " + page.atom : "Amounts in " + page.ticker
-                    onCheckedChanged: {
-                        var next = checked ? page.atom : page.whole
-                        if (next === "" || next === page.feeUnit)
-                            return
-                        var base = page.converted(baseCrypto.text, page.feeUnit, next)
-                        var perKm = page.converted(perKmCrypto.text, page.feeUnit, next)
-                        page.feeUnit = next
-                        baseCrypto.text = base
-                        perKmCrypto.text = perKm
-                    }
-                }
-
-                TextField {
-                    id: baseCrypto
-                    width: parent.width
-                    label: "Base fee"
-                    placeholderText: page.feeUnit === page.atom ? atomSwitch.text : page.ticker
-                    inputMethodHints: page.feeUnit === page.atom ? Qt.ImhDigitsOnly : Qt.ImhFormattedNumbersOnly
-                    onTextChanged: page.quoteInto(text, page.feeUnit, "base")
-                }
-
-                Label {
-                    visible: page.baseEurLabel !== ""
-                    x: Theme.horizontalPageMargin
-                    text: page.baseEurLabel
-                    color: Theme.secondaryColor
-                    font.pixelSize: Theme.fontSizeLarge
-                }
-
-                Label {
-                    visible: page.baseQuoteMessage !== ""
-                    width: parent.width - 2 * Theme.horizontalPageMargin
-                    x: Theme.horizontalPageMargin
-                    wrapMode: Text.Wrap
-                    color: Theme.highlightColor
-                    text: page.baseQuoteMessage
-                }
-
-                TextField {
-                    id: perKmCrypto
-                    width: parent.width
-                    label: "Per km"
-                    placeholderText: page.feeUnit === page.atom ? atomSwitch.text : page.ticker
-                    inputMethodHints: page.feeUnit === page.atom ? Qt.ImhDigitsOnly : Qt.ImhFormattedNumbersOnly
-                    onTextChanged: page.quoteInto(text, page.feeUnit, "perKm")
-                }
-
-                Label {
-                    visible: page.perKmEurLabel !== ""
-                    x: Theme.horizontalPageMargin
-                    text: page.perKmEurLabel
-                    color: Theme.secondaryColor
-                    font.pixelSize: Theme.fontSizeLarge
-                }
-
-                Label {
-                    visible: page.perKmQuoteMessage !== ""
-                    width: parent.width - 2 * Theme.horizontalPageMargin
-                    x: Theme.horizontalPageMargin
-                    wrapMode: Text.Wrap
-                    color: Theme.highlightColor
-                    text: page.perKmQuoteMessage
+                ChainPrice {
+                    currency: page.chains[index].currency
+                    coin: page.chains[index].coin
+                    coinName: page.chains[index].name
+                    whole: page.chains[index].whole
+                    atom: page.chains[index].atom
+                    ticker: page.chains[index].ticker
+                    hasWallet: page.chains[index].wallet
+                    baseFee: page.chains[index].base_fee
+                    perKmFee: page.chains[index].fee_per_km
                 }
             }
 
             Button {
                 anchors.horizontalCenter: parent.horizontalCenter
                 text: page.index < 0 ? "Add" : "Save"
-                onClicked: {
-                    var rc = page.index < 0
-                            ? kiko.serverAdd(hostField.text)
-                            : kiko.serverUpdate(page.index, hostField.text)
-                    if (rc !== 0) {
-                        page.errorText = kiko.lastError()
-                        return
-                    }
-                    if (page.index >= 0) {
-                        rc = kiko.serverSaveFees(page.index, baseCrypto.text, perKmCrypto.text, page.feeUnit)
-                        if (rc !== 0) {
-                            page.errorText = kiko.lastError()
-                            return
-                        }
-                    }
-                    pageStack.pop()
-                }
+                onClicked: page.save()
             }
 
             Button {

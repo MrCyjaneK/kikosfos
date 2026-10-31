@@ -23,8 +23,12 @@ type driverCar struct {
 	Year         int    `json:"year"`
 }
 
-// DriverRequest is the JSON body for POST /api/v1/driver.
+// DriverRequest is the JSON body for POST /api/v1/driver on the server's first chain.
 func DriverRequest(host string) ([]byte, error) {
+	return driverRequest(host, "")
+}
+
+func driverRequest(host, currency string) ([]byte, error) {
 	host, err := normalizeHost(host)
 	if err != nil {
 		return nil, err
@@ -45,21 +49,29 @@ func DriverRequest(host string) ([]byte, error) {
 	if !found {
 		return nil, errors.New("unknown server")
 	}
-	index, _, err := walletForCurrency(server.Currency)
+	chain := firstChain(server)
+	if currency != "" {
+		var ok bool
+		chain, ok = server.chain(currency)
+		if !ok {
+			return nil, errors.New("unknown server")
+		}
+	}
+	index, _, err := walletForCurrency(chain.Currency)
 	if err != nil {
 		return nil, err
 	}
 	if !carComplete(doc.Car) {
 		return nil, errors.New("car is incomplete")
 	}
-	if server.BaseFee == "" || server.FeePerKm == "" {
+	if chain.BaseFee == "" || chain.FeePerKm == "" {
 		return nil, errors.New("fees are not set")
 	}
-	base, err := strconv.ParseUint(server.BaseFee, 10, 64)
+	base, err := strconv.ParseUint(chain.BaseFee, 10, 64)
 	if err != nil {
 		return nil, errors.New("fees are not set")
 	}
-	perKm, err := strconv.ParseUint(server.FeePerKm, 10, 64)
+	perKm, err := strconv.ParseUint(chain.FeePerKm, 10, 64)
 	if err != nil {
 		return nil, errors.New("fees are not set")
 	}
@@ -90,10 +102,15 @@ func carComplete(car Car) bool {
 		car.Year > 0
 }
 
-// RegisterDriver posts the driver to POST /api/v1/driver.
-// A driver who is already registered is success: the server has no update.
+// RegisterDriver posts the server's first chain to POST /api/v1/driver.
+// Posting again replaces that driver's fees and car. The signature is the
+// account key in the body, so the request carries no X-Driver-Key.
 func RegisterDriver(host string) ([]byte, error) {
-	body, err := DriverRequest(host)
+	return registerChain(host, "")
+}
+
+func registerChain(host, currency string) ([]byte, error) {
+	body, err := driverRequest(host, currency)
 	if err != nil {
 		return nil, err
 	}
@@ -101,12 +118,26 @@ func RegisterDriver(host string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	status, resp, err := kikoDo(http.MethodPost, host, "/api/v1/driver", body, nil)
+	chainCurrency := currency
+	if chainCurrency == "" {
+		doc, err := loadProfile()
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range doc.Servers {
+			if strings.EqualFold(item.Host, host) {
+				chainCurrency = firstChain(item).Currency
+				break
+			}
+		}
+	}
+	coin, _, err := walletForCurrency(chainCurrency)
 	if err != nil {
 		return nil, err
 	}
-	if status == http.StatusConflict {
-		return []byte("{}"), nil
+	status, resp, err := driverDo(http.MethodPost, host, "/api/v1/driver", body, coin, false)
+	if err != nil {
+		return nil, err
 	}
 	if status != http.StatusCreated && status != http.StatusOK {
 		return errorObject(status, resp), nil

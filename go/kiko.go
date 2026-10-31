@@ -554,6 +554,36 @@ func KIKO_server_save_fees(index C.int, base, perKm, unit *C.char) C.int {
 	return 0
 }
 
+//export KIKO_server_refresh
+func KIKO_server_refresh() C.int {
+	err := wallet.RefreshServers()
+	setErr(err)
+	if err != nil {
+		return -1
+	}
+	return 0
+}
+
+//export KIKO_server_chains
+func KIKO_server_chains(index C.int) *C.char {
+	text, err := wallet.ServerChains(int(index))
+	setErr(err)
+	if err != nil {
+		return nil
+	}
+	return cString(text)
+}
+
+//export KIKO_server_save_chains
+func KIKO_server_save_chains(index C.int, fees *C.char) C.int {
+	err := wallet.SaveChainFees(int(index), C.GoString(fees))
+	setErr(err)
+	if err != nil {
+		return -1
+	}
+	return 0
+}
+
 //export KIKO_apply_fees_eur
 func KIKO_apply_fees_eur(base, perKm *C.char) C.int {
 	err := wallet.ApplyFeesEUR(C.GoString(base), C.GoString(perKm))

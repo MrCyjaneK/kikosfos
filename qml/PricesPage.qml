@@ -21,7 +21,7 @@ Page {
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 x: Theme.horizontalPageMargin
                 wrapMode: Text.Wrap
-                text: "Sets the base fee and the price per kilometre on every server, in that server's currency."
+                text: "Writes these amounts onto every chain of every server, in that chain's currency."
                 color: Theme.secondaryColor
                 font.pixelSize: Theme.fontSizeSmall
             }

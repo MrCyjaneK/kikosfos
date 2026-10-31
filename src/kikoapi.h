@@ -56,6 +56,9 @@ public:
     Q_INVOKABLE QString serverFeeBase(int index);
     Q_INVOKABLE QString serverFeePerKm(int index);
     Q_INVOKABLE int serverSaveFees(int index, const QString &base, const QString &perKm, const QString &unit);
+    Q_INVOKABLE int serverRefresh();
+    Q_INVOKABLE QString serverChains(int index);
+    Q_INVOKABLE int serverSaveChains(int index, const QString &fees);
     Q_INVOKABLE void applyFeesEur(const QString &base, const QString &perKm);
     Q_INVOKABLE QString gpsDriver();
     Q_INVOKABLE int gpsSetDriver(const QString &kind);

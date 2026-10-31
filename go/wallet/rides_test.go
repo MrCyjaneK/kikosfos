@@ -16,14 +16,20 @@ func TestFareLovelace(t *testing.T) {
 	if got := kmToMeters(3.01); got != 3010 {
 		t.Fatalf("meters = %d", got)
 	}
-	if got := fareLovelace(2000000, 500000, 3010); got != 3505000 {
+	if got := fareAtoms(2000000, 500000, 3010, 1000000); got != 3505000 {
 		t.Fatalf("fare = %d", got)
 	}
-	if got := fareLovelace(1000000, 1, 1100); got != 1000002 {
+	if got := fareAtoms(1000000, 1, 1100, 1000000); got != 1000002 {
 		t.Fatalf("ceil fare = %d", got)
 	}
-	if got := fareLovelace(1, 1, 1); got != 1000000 {
+	if got := fareAtoms(1, 1, 1, 1000000); got != 1000000 {
 		t.Fatalf("floor fare = %d", got)
+	}
+	if got := fareAtoms(1, 1, 1, 1); got != 2 {
+		t.Fatalf("satoshi fare = %d", got)
+	}
+	if got := fareAtoms(0, 0, 0, 1); got != 1 {
+		t.Fatalf("satoshi floor = %d", got)
 	}
 }
 
@@ -338,7 +344,7 @@ func TestClaimAndVerify(t *testing.T) {
 			}
 			etaMin = body.EtaMinutes
 			etaKm = body.EtaKm
-			_, _ = w.Write([]byte(`{"status":"accepted","pay_to":"addr_test1qx","fare_lovelace":2800000,"start_address":"Prielmayerstraße","end_address":"Karlsplatz","start":{"lat":48.140833,"lng":11.555},"end":{"lat":48.150833,"lng":11.565},"distance_km":1.6,"pickup_time":"2026-11-01T09:00:00Z"}`))
+			_, _ = w.Write([]byte(`{"status":"accepted","pay_to":"addr_test1qx","fare":2800000,"start_address":"Prielmayerstraße","end_address":"Karlsplatz","start":{"lat":48.140833,"lng":11.555},"end":{"lat":48.150833,"lng":11.565},"distance_km":1.6,"pickup_time":"2026-11-01T09:00:00Z"}`))
 		default:
 			http.NotFound(w, r)
 		}

@@ -3,10 +3,13 @@ package wallet
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestGPSDriver(t *testing.T) {
@@ -69,6 +72,22 @@ func TestProfileRoundTrip(t *testing.T) {
 	}
 	if err := SaveCar("VW", "ID.3", "white", "B-KK 402", "nope"); err == nil {
 		t.Fatal("expected bad year")
+	}
+	maxYear := time.Now().Year() + 1
+	if err := SaveCar("VW", "ID.3", "white", "B-KK 402", "1899"); err == nil || err.Error() != "enter a year from 1900 to "+strconv.Itoa(maxYear) {
+		t.Fatalf("year 1899: %v", err)
+	}
+	if err := SaveCar("VW", "ID.3", "white", "B-KK 402", strconv.Itoa(maxYear+1)); err == nil || err.Error() != "enter a year from 1900 to "+strconv.Itoa(maxYear) {
+		t.Fatalf("year %d: %v", maxYear+1, err)
+	}
+	if err := SaveCar("VW", "ID.3", "white", "B-KK 402", "1900"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveCar("VW", "ID.3", "white", "B-KK 402", strconv.Itoa(maxYear)); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveCar("VW", "ID.3", "white", "B-KK 402", "2024"); err != nil {
+		t.Fatal(err)
 	}
 	car, err = ProfileCar()
 	if err != nil || car.Year != 2024 {
@@ -306,4 +325,170 @@ func TestServersFeesAndDriver(t *testing.T) {
 	if err := ApplyFeesEUR("1", "1"); err == nil || err.Error() != "no servers" {
 		t.Fatalf("apply without servers: %v", err)
 	}
+}
+
+func TestLegacyServerMigrates(t *testing.T) {
+	setupTest(t)
+	if err := SetupPin("42", "42"); err != nil {
+		t.Fatal(err)
+	}
+	key, err := sessionKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := openStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := []byte(`{"car":{"brand":"","model":"","color":"","license_plate_number":"","year":0},"servers":[{"host":"ride.example.com","currency":"cardano","base_fee":"2000000","fee_per_km":"500000"}]}`)
+	blob, err := encodeProfile(key, plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.profilePath(), blob, 0600); err != nil {
+		t.Fatal(err)
+	}
+	base, err := ServerFeeBase(0)
+	per, err2 := ServerFeePerKm(0)
+	currency, err3 := ServerCurrency(0)
+	if err != nil || err2 != nil || err3 != nil || base != "2000000" || per != "500000" || currency != "cardano" {
+		t.Fatalf("legacy = %s %s %s %v %v %v", base, per, currency, err, err2, err3)
+	}
+	doc, err := loadProfile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.writeProfile(key, doc); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(store.profilePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := decodeProfile(key, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved profileFile
+	if err := json.Unmarshal(decoded, &saved); err != nil {
+		t.Fatal(err)
+	}
+	if len(saved.Servers) != 1 || saved.Servers[0].Currency != "" || len(saved.Servers[0].Chains) != 1 {
+		t.Fatalf("rewritten = %+v", saved.Servers)
+	}
+	chain := saved.Servers[0].Chains[0]
+	if chain.Currency != "cardano" || chain.BaseFee != "2000000" || chain.FeePerKm != "500000" {
+		t.Fatalf("chain = %+v", chain)
+	}
+}
+
+func TestChainPrices(t *testing.T) {
+	setupTest(t)
+	currencies := `["cardano","bsv","nope"]`
+	serveKiko(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/v1/currency" {
+			_, _ = w.Write([]byte(`{"currency":` + currencies + `}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	if err := SetupPin("42", "42"); err != nil {
+		t.Fatal(err)
+	}
+	if err := AddServer("ride.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	n, err := ServerCount()
+	if err != nil || n != 1 {
+		t.Fatalf("count = %d %v", n, err)
+	}
+	chains := mustChains(t, 0)
+	if len(chains) != 2 || chains[0].Currency != "cardano" || chains[1].Currency != "bsv" {
+		t.Fatalf("chains = %+v", chains)
+	}
+	if chains[0].Wallet || chains[1].Wallet || chains[0].BaseFee != "" || chains[1].BaseFee != "" {
+		t.Fatalf("empty chains = %+v", chains)
+	}
+	if err := ApplyFeesEUR("1", "1"); !errors.Is(err, errIncompatible) {
+		t.Fatalf("apply without wallets: %v", err)
+	}
+	if err := WalletCreate(0); err != nil {
+		t.Fatal(err)
+	}
+	if err := WalletCreate(1); err != nil {
+		t.Fatal(err)
+	}
+	raw := `[{"currency":"cardano","base":"2000000","per_km":"500000","unit":"lovelace"},{"currency":"bsv","base":"1000","per_km":"100","unit":"satoshi"}]`
+	if err := SaveChainFees(0, raw); err != nil {
+		t.Fatal(err)
+	}
+	chains = mustChains(t, 0)
+	if chains[0].BaseFee != "2000000" || chains[0].FeePerKm != "500000" || chains[1].BaseFee != "1000" || chains[1].FeePerKm != "100" {
+		t.Fatalf("saved = %+v", chains)
+	}
+	if err := SaveChainFees(0, `[{"currency":"cardano","base":"","per_km":""}]`); err != nil {
+		t.Fatal(err)
+	}
+	chains = mustChains(t, 0)
+	if chains[0].BaseFee != "" || chains[0].FeePerKm != "" || chains[1].BaseFee != "1000" || chains[1].FeePerKm != "100" {
+		t.Fatalf("cleared = %+v", chains)
+	}
+	orig := feeFromEUR
+	t.Cleanup(func() { feeFromEUR = orig })
+	feeFromEUR = func(c Coin, eur string) (string, error) {
+		switch c.Ticker() {
+		case "ADA":
+			if eur == "1" {
+				return "4000000", nil
+			}
+			if eur == "0.5" {
+				return "2000000", nil
+			}
+		case "BSV":
+			if eur == "1" {
+				return "5000", nil
+			}
+			if eur == "0.5" {
+				return "2500", nil
+			}
+		}
+		return "", errors.New("unexpected " + c.Ticker() + " " + eur)
+	}
+	if err := ApplyFeesEUR("1", "0.5"); err != nil {
+		t.Fatal(err)
+	}
+	chains = mustChains(t, 0)
+	if chains[0].BaseFee != "4000000" || chains[0].FeePerKm != "2000000" || chains[1].BaseFee != "5000" || chains[1].FeePerKm != "2500" {
+		t.Fatalf("applied = %+v", chains)
+	}
+	currencies = `["cardano"]`
+	if err := RefreshServers(); err != nil {
+		t.Fatal(err)
+	}
+	chains = mustChains(t, 0)
+	if len(chains) != 1 || chains[0].Currency != "cardano" || chains[0].BaseFee != "4000000" {
+		t.Fatalf("dropped bsv = %+v", chains)
+	}
+	currencies = `["bsv","cardano"]`
+	if err := RefreshServers(); err != nil {
+		t.Fatal(err)
+	}
+	chains = mustChains(t, 0)
+	if len(chains) != 2 || chains[0].Currency != "bsv" || chains[0].BaseFee != "" || chains[1].Currency != "cardano" || chains[1].BaseFee != "4000000" {
+		t.Fatalf("restored = %+v", chains)
+	}
+}
+
+func mustChains(t *testing.T, index int) []chainView {
+	t.Helper()
+	text, err := ServerChains(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chains []chainView
+	if err := json.Unmarshal([]byte(text), &chains); err != nil {
+		t.Fatal(err)
+	}
+	return chains
 }

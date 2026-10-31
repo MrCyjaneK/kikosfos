@@ -61,7 +61,8 @@ Page {
             return { amount: "", euro: "" }
         if (coin < 0)
             return { amount: lovelace, euro: "" }
-        var parts = kiko.walletQuote(coin, lovelace, "lovelace").split("\n")
+        var unit = coin >= 0 ? kiko.walletAtom(coin) : "lovelace"
+        var parts = kiko.walletQuote(coin, lovelace, unit).split("\n")
         if (parts.length > 3 && parts[3] !== "")
             return { amount: lovelace, euro: "" }
         return { amount: parts[0], euro: parts[2] }
@@ -254,7 +255,9 @@ Page {
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 x: Theme.horizontalPageMargin
                 wrapMode: Text.Wrap
-                text: page.server
+                text: page.coin >= 0 && kiko.walletName(page.coin) !== ""
+                      ? page.server + " · " + kiko.walletName(page.coin)
+                      : page.server
                 font.pixelSize: Theme.fontSizeSmall
                 color: Theme.secondaryColor
             }

@@ -84,10 +84,20 @@ Page {
             return { amount: "", euro: "" }
         if (coin < 0)
             return { amount: lovelace, euro: "" }
-        var parts = kiko.walletQuote(coin, lovelace, "lovelace").split("\n")
+        var unit = coin >= 0 ? kiko.walletAtom(coin) : "lovelace"
+        var parts = kiko.walletQuote(coin, lovelace, unit).split("\n")
         if (parts.length > 3 && parts[3] !== "")
             return { amount: lovelace, euro: "" }
         return { amount: parts[0], euro: parts[2] }
+    }
+
+    function serverLine(host, coin) {
+        var name = coin >= 0 ? kiko.walletName(coin) : ""
+        if (!host)
+            host = ""
+        if (name === "")
+            return host
+        return host + " · " + name
     }
 
     function warmEuros() {
@@ -266,7 +276,7 @@ Page {
                                 distanceKm: activeRow.ride.distance_km || ""
                                 fare: activeRow.fare
                                 euro: activeRow.euro
-                                server: activeRow.ride.server || ""
+                                server: page.serverLine(activeRow.ride.server, activeRow.ride.coin)
                             }
                         }
                     }
@@ -390,7 +400,7 @@ Page {
                     distanceKm: row.distanceKm
                     fare: row.fare
                     euro: row.euro
-                    server: row.server
+                    server: page.serverLine(row.server, row.coin)
                 }
             }
         }

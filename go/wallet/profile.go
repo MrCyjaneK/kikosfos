@@ -3,10 +3,12 @@ package wallet
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Car is the driver profile stored with the servers and fees.
@@ -18,9 +20,20 @@ type Car struct {
 	Year         int    `json:"year"`
 }
 
-type serverRecord struct {
-	Host     string `json:"host"`
+// chainFees is one chain's prices on a server. Empty fees mean the driver
+// does not take rides on that chain.
+type chainFees struct {
 	Currency string `json:"currency"`
+	BaseFee  string `json:"base_fee,omitempty"`
+	FeePerKm string `json:"fee_per_km,omitempty"`
+}
+
+type serverRecord struct {
+	Host   string      `json:"host"`
+	Chains []chainFees `json:"chains,omitempty"`
+	// Currency, BaseFee and FeePerKm are the shape written before a server
+	// could offer more than one chain. They are read once and stored as chains.
+	Currency string `json:"currency,omitempty"`
 	BaseFee  string `json:"base_fee,omitempty"`
 	FeePerKm string `json:"fee_per_km,omitempty"`
 }
@@ -47,6 +60,34 @@ func normalizeDoc(doc *profileFile) {
 	if doc.Servers == nil {
 		doc.Servers = []serverRecord{}
 	}
+	for i := range doc.Servers {
+		doc.Servers[i].migrate()
+	}
+}
+
+func (s *serverRecord) migrate() {
+	if len(s.Chains) == 0 && s.Currency != "" {
+		s.Chains = []chainFees{{
+			Currency: s.Currency,
+			BaseFee:  s.BaseFee,
+			FeePerKm: s.FeePerKm,
+		}}
+	}
+	if s.Chains == nil {
+		s.Chains = []chainFees{}
+	}
+	s.Currency = ""
+	s.BaseFee = ""
+	s.FeePerKm = ""
+}
+
+func (s serverRecord) chain(currency string) (chainFees, bool) {
+	for _, chain := range s.Chains {
+		if chain.Currency == currency {
+			return chain, true
+		}
+	}
+	return chainFees{}, false
 }
 
 func (s *Store) profilePath() string {
@@ -215,8 +256,9 @@ func parseYear(text string) (int, error) {
 		return 0, nil
 	}
 	year, err := strconv.Atoi(text)
-	if err != nil || year < 0 || year > 9999 {
-		return 0, errors.New("enter a year")
+	maxYear := time.Now().Year() + 1
+	if err != nil || year < 1900 || year > maxYear {
+		return 0, fmt.Errorf("enter a year from 1900 to %d", maxYear)
 	}
 	return year, nil
 }
