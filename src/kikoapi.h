@@ -86,7 +86,7 @@ public:
     Q_INVOKABLE QString driveEndLat(int index);
     Q_INVOKABLE QString driveEndLon(int index);
     Q_INVOKABLE void driveNavigate(const QString &lat, const QString &lon, const QString &title);
-    Q_INVOKABLE void driveClaim(const QString &server, const QString &id, const QString &pickupKm);
+    Q_INVOKABLE void driveClaim(const QString &server, const QString &id, const QString &pickupKm, int coin);
     Q_INVOKABLE void driveVerify(const QString &server, const QString &id);
     Q_INVOKABLE void driveCashOut(const QString &server, const QString &id);
     Q_INVOKABLE int driveClaimed(const QString &server, const QString &id);

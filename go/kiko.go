@@ -766,8 +766,8 @@ func KIKO_drive_end_lon(index C.int) *C.char {
 }
 
 //export KIKO_drive_claim
-func KIKO_drive_claim(server, id, pickupKm *C.char) *C.char {
-	err := wallet.ClaimDrive(C.GoString(server), C.GoString(id), C.GoString(pickupKm))
+func KIKO_drive_claim(server, id, pickupKm *C.char, coin C.int) *C.char {
+	err := wallet.ClaimDrive(C.GoString(server), C.GoString(id), C.GoString(pickupKm), int(coin))
 	setErr(err)
 	if err != nil {
 		return cString(err.Error())

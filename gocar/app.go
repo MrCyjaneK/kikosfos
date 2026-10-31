@@ -412,7 +412,7 @@ func (h *hud) primary() {
 		var err error
 		switch label {
 		case "Accept":
-			err = api.Claim(trip.Server, trip.ID, trip.PickupKm)
+			err = api.Claim(trip.Server, trip.ID, trip.PickupKm, trip.Coin)
 		case "Cash out":
 			err = api.CashOut(trip.Server, trip.ID)
 		}

@@ -370,13 +370,13 @@ func TestClaimAndVerify(t *testing.T) {
 	if _, err := VerifyDrive("ready.example.com", "9f2c01"); err == nil || err.Error() != "claim the ride first" {
 		t.Fatalf("before claim: %v", err)
 	}
-	if err := ClaimDrive("ready.example.com", "taken", "1.2"); err == nil || !strings.Contains(err.Error(), "no longer available") {
+	if err := ClaimDrive("ready.example.com", "taken", "1.2", 0); err == nil || !strings.Contains(err.Error(), "no longer available") {
 		t.Fatalf("taken: %v", err)
 	}
 	if DriveClaimed("ready.example.com", "taken") != 0 || ActiveCount() != 0 {
 		t.Fatal("rejected claim was stored")
 	}
-	if err := ClaimDrive("ready.example.com", "9f2c01", "0.4"); err != nil {
+	if err := ClaimDrive("ready.example.com", "9f2c01", "0.4", 0); err != nil {
 		t.Fatal(err)
 	}
 	if gotPath != "/api/v1/driver/drive/9f2c01" || etaMin != 1 || math.Abs(etaKm-0.4) > 1e-9 {
@@ -445,6 +445,175 @@ func TestClaimAndVerify(t *testing.T) {
 	}
 }
 
+func TestClaimKeepsSelectedChain(t *testing.T) {
+	setupTest(t)
+	var gotKey string
+	ride := `[{"id":"9f2c01","start_address":"Prielmayerstraße","end_address":"Karlsplatz","start":{"lat":48.14,"lng":11.55},"end":{"lat":48.15,"lng":11.56},"distance_km":1.6,"pickup_distance_km":0.4,"pickup_time":"2026-11-01T09:00:00Z"}]`
+	serveKiko(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/v1/currency" && r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`{"currency":["cardano","bsv"]}`))
+		case r.URL.Path == "/api/v1/driver" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/driver/drive/available":
+			_, _ = w.Write([]byte(ride))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/driver/drive/9f2c01":
+			gotKey = r.Header.Get("X-Driver-Key")
+			_, _ = w.Write([]byte(`{"status":"accepted","pay_to":"script","fare":1160,"start_address":"Prielmayerstraße","end_address":"Karlsplatz","start":{"lat":48.14,"lng":11.55},"end":{"lat":48.15,"lng":11.56},"distance_km":1.6,"pickup_time":"2026-11-01T09:00:00Z"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	if err := SetupPin("42", "42"); err != nil {
+		t.Fatal(err)
+	}
+	if err := WalletCreate(0); err != nil {
+		t.Fatal(err)
+	}
+	if err := WalletCreate(1); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveCar("VW", "ID.3", "white", "B-KK 402", "2024"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetGPSDriver("mock"); err != nil {
+		t.Fatal(err)
+	}
+	if err := AddServer("ready.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	fees := `[{"currency":"cardano","base":"2000000","per_km":"500000","unit":"lovelace"},{"currency":"bsv","base":"1000","per_km":"100","unit":"satoshi"}]`
+	if err := SaveChainFees(0, fees); err != nil {
+		t.Fatal(err)
+	}
+	if msg, err := RegisterDrivers(); err != nil || msg != "" {
+		t.Fatalf("register: %q %v", msg, err)
+	}
+	if err := RefreshDrives(5); err != nil {
+		t.Fatal(err)
+	}
+	if n := DriveCount(); n != 2 {
+		t.Fatalf("offers = %d", n)
+	}
+	coin0, err := DriveCoin(0)
+	if err != nil || coin0 != 0 {
+		t.Fatalf("first coin = %d %v", coin0, err)
+	}
+	coin1, err := DriveCoin(1)
+	if err != nil || coin1 != 1 {
+		t.Fatalf("second coin = %d %v", coin1, err)
+	}
+	id0, err := DriveID(0)
+	id1, err2 := DriveID(1)
+	if err != nil || err2 != nil || id0 != "9f2c01" || id1 != id0 {
+		t.Fatalf("ids = %s %s %v %v", id0, id1, err, err2)
+	}
+	ada, err := DriveFareLovelace(0)
+	bsvFare, err2 := DriveFareLovelace(1)
+	if err != nil || err2 != nil || ada != "2800000" || bsvFare != "1160" {
+		t.Fatalf("fares = %s %s %v %v", ada, bsvFare, err, err2)
+	}
+	if err := ClaimDrive("ready.example.com", id1, "0.4", coin1); err != nil {
+		t.Fatal(err)
+	}
+	adaKey, err := WalletMultisigMaterial(0)
+	bsvKey, err2 := WalletMultisigMaterial(1)
+	if err != nil || err2 != nil || gotKey != bsvKey || gotKey == adaKey {
+		t.Fatalf("accepted with %s ada %s bsv %s", gotKey, adaKey, bsvKey)
+	}
+	raw, err := ActiveRide(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var shown struct {
+		Coin int    `json:"coin"`
+		Fare string `json:"fare_lovelace"`
+	}
+	if err := json.Unmarshal([]byte(raw), &shown); err != nil {
+		t.Fatal(err)
+	}
+	if shown.Coin != 1 || shown.Fare != "1160" {
+		t.Fatalf("held = %+v", shown)
+	}
+}
+
+func TestOffersOncePerChain(t *testing.T) {
+	setupTest(t)
+	var hits int
+	one := `[{"id":"9f2c01","start_address":"THE CLOUD","end_address":"Munich Airport","start":{"lat":48.35,"lng":11.78},"end":{"lat":48.35,"lng":11.79},"distance_km":28,"pickup_distance_km":4.03,"pickup_time":"2026-11-01T09:00:00Z"}]`
+	two := `[{"id":"aaaa","start_address":"A","end_address":"B","start":{"lat":48.1,"lng":11.5},"end":{"lat":48.2,"lng":11.6},"distance_km":2,"pickup_distance_km":1,"pickup_time":"2026-11-01T09:00:00Z"},{"id":"bbbb","start_address":"C","end_address":"D","start":{"lat":48.3,"lng":11.7},"end":{"lat":48.4,"lng":11.8},"distance_km":3,"pickup_distance_km":2,"pickup_time":"2026-11-01T10:00:00Z"}]`
+	body := one
+	serveKiko(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/api/v1/driver/drive/available" {
+			hits++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(body))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	if err := SetupPin("42", "42"); err != nil {
+		t.Fatal(err)
+	}
+	if err := WalletCreate(0); err != nil {
+		t.Fatal(err)
+	}
+	if err := WalletCreate(1); err != nil {
+		t.Fatal(err)
+	}
+	ready := []readyServer{
+		{Host: "ready.example.com", Coin: 0, Base: 1, PerKm: 1},
+		{Host: "ready.example.com", Coin: 1, Base: 1, PerKm: 1},
+		{Host: "ready.example.com:443", Coin: 1, Base: 1, PerKm: 1},
+	}
+	rows, err := offersFrom(ready, 48.35, 11.78, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].Coin != 0 || rows[1].Coin != 1 || rows[0].ID != "9f2c01" || rows[1].ID != rows[0].ID {
+		t.Fatalf("one ride = %+v", rows)
+	}
+	if hits != 2 {
+		t.Fatalf("queries = %d", hits)
+	}
+
+	hits = 0
+	body = two
+	rows, err = offersFrom(ready, 48.35, 11.78, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ada, bsv := 0, 0
+	for _, row := range rows {
+		if row.Coin == 0 {
+			ada++
+		}
+		if row.Coin == 1 {
+			bsv++
+		}
+	}
+	if len(rows) != 4 || ada != 2 || bsv != 2 || hits != 2 {
+		t.Fatalf("two rides = %d ada %d bsv %d queries %d", len(rows), ada, bsv, hits)
+	}
+}
+
+func TestDuplicateChainCollapses(t *testing.T) {
+	s := serverRecord{Chains: []chainFees{
+		{Currency: "cardano", BaseFee: "1", FeePerKm: "2"},
+		{Currency: "bsv", BaseFee: "3", FeePerKm: "4"},
+		{Currency: "BSV", BaseFee: "9", FeePerKm: "9"},
+	}}
+	s.migrate()
+	if len(s.Chains) != 2 || s.Chains[0].Currency != "cardano" || s.Chains[1].Currency != "bsv" || s.Chains[1].BaseFee != "3" {
+		t.Fatalf("chains = %+v", s.Chains)
+	}
+	if hostTaken([]serverRecord{{Host: "ready.example.com"}}, "ready.example.com:443", -1) != true {
+		t.Fatal("port 443 is a second server")
+	}
+}
+
 func TestCashOutAndReload(t *testing.T) {
 	setupTest(t)
 	var payoutBody string
@@ -458,9 +627,9 @@ func TestCashOutAndReload(t *testing.T) {
 			w.WriteHeader(http.StatusCreated)
 			_, _ = w.Write([]byte(`{}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/driver/drive/9f2c01":
-			_, _ = w.Write([]byte(`{"status":"accepted","pay_to":"addr1qy","fare_lovelace":2800000,"start_address":"Prielmayerstraße","end_address":"Karlsplatz","start":{"lat":48.14,"lng":11.55},"end":{"lat":48.15,"lng":11.56},"distance_km":1.6,"pickup_time":"2026-11-01T09:00:00Z","address_index":4,"script":"aabb"}`))
+			_, _ = w.Write([]byte(`{"status":"accepted","pay_to":"addr1qy","fare_lovelace":2800000,"start_address":"Prielmayerstraße","end_address":"Karlsplatz","start":{"lat":48.14,"lng":11.55},"end":{"lat":48.15,"lng":11.56},"distance_km":1.6,"pickup_time":"2020-01-01T00:00:00Z","address_index":4,"script":"aabb"}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/driver/drive/9f2c01":
-			_, _ = w.Write([]byte(`{"status":"paid","pay_to":"addr1qy","fare_lovelace":2800000,"start_address":"Prielmayerstraße","end_address":"Karlsplatz","start":{"lat":48.14,"lng":11.55},"end":{"lat":48.15,"lng":11.56},"distance_km":1.6,"pickup_time":"2026-11-01T09:00:00Z","eta_km":0.4,"address_index":4,"script":"aabb"}`))
+			_, _ = w.Write([]byte(`{"status":"paid","pay_to":"addr1qy","fare_lovelace":2800000,"start_address":"Prielmayerstraße","end_address":"Karlsplatz","start":{"lat":48.14,"lng":11.55},"end":{"lat":48.15,"lng":11.56},"distance_km":1.6,"pickup_time":"2020-01-01T00:00:00Z","eta_km":0.4,"address_index":4,"script":"aabb"}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/driver/drive/9f2c01/payout":
 			payoutKey = r.Header.Get("X-Driver-Key")
 			raw, _ := io.ReadAll(r.Body)
@@ -488,7 +657,7 @@ func TestCashOutAndReload(t *testing.T) {
 	if msg, err := RegisterDrivers(); err != nil || msg != "" {
 		t.Fatalf("register: %q %v", msg, err)
 	}
-	if err := ClaimDrive("ready.example.com", "9f2c01", "0.4"); err != nil {
+	if err := ClaimDrive("ready.example.com", "9f2c01", "0.4", 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := CashOutDrive("ready.example.com", "9f2c01"); err == nil || err.Error() != "the ride is not paid" {
@@ -521,7 +690,7 @@ func TestCashOutAndReload(t *testing.T) {
 		t.Fatal("cashed-out ride is still active")
 	}
 
-	if err := ClaimDrive("ready.example.com", "9f2c01", "0.4"); err != nil {
+	if err := ClaimDrive("ready.example.com", "9f2c01", "0.4", 0); err != nil {
 		t.Fatal(err)
 	}
 	clearHeld()
@@ -548,6 +717,64 @@ func TestCashOutAndReload(t *testing.T) {
 	}
 	if shown.Status != "paid" || shown.Paid != 1 || shown.PickupKm != "0.4" {
 		t.Fatalf("reloaded = %+v", shown)
+	}
+}
+
+func TestCashOutWaitsForPickup(t *testing.T) {
+	setupTest(t)
+	serveKiko(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/v1/currency" && r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`{"currency":"cardano"}`))
+		case r.URL.Path == "/api/v1/driver" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/driver/drive/9f2c01":
+			_, _ = w.Write([]byte(`{"status":"accepted","pay_to":"addr1qy","fare":2800000,"start_address":"Prielmayerstraße","end_address":"Karlsplatz","start":{"lat":48.14,"lng":11.55},"end":{"lat":48.15,"lng":11.56},"distance_km":1.6,"pickup_time":"2099-01-01T00:00:00Z","address_index":4,"script":"aabb"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	if err := SetupPin("42", "42"); err != nil {
+		t.Fatal(err)
+	}
+	if err := WalletCreate(0); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveCar("VW", "ID.3", "white", "B-KK 402", "2024"); err != nil {
+		t.Fatal(err)
+	}
+	if err := AddServer("ready.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveServerFees(0, "2", "0.5", "ada"); err != nil {
+		t.Fatal(err)
+	}
+	if msg, err := RegisterDrivers(); err != nil || msg != "" {
+		t.Fatalf("register: %q %v", msg, err)
+	}
+	if err := ClaimDrive("ready.example.com", "9f2c01", "0.4", 0); err != nil {
+		t.Fatal(err)
+	}
+	prevPay := paymentSeen
+	prevBuild := buildPayout
+	t.Cleanup(func() {
+		paymentSeen = prevPay
+		buildPayout = prevBuild
+	})
+	paymentSeen = func(Coin, string, string) (bool, error) { return true, nil }
+	built := false
+	buildPayout = func(string, string, string, uint32) (string, error) {
+		built = true
+		return "abcd", nil
+	}
+	if paid, err := VerifyDrive("ready.example.com", "9f2c01"); err != nil || !paid {
+		t.Fatal(err)
+	}
+	err := CashOutDrive("ready.example.com", "9f2c01")
+	if err == nil || err.Error() != "ride cannot be paid out before its pickup time" || built {
+		t.Fatalf("early cash out: %v built %v", err, built)
 	}
 }
 

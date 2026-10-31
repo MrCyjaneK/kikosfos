@@ -64,6 +64,14 @@ static char *kiko_call_ss(void *f, char *a, char *b) {
 static char *kiko_call_sss(void *f, char *a, char *b, char *c) {
 	return ((char *(*)(char *, char *, char *))f)(a, b, c);
 }
+
+static char *kiko_call_sssi(void *f, char *a, char *b, char *c, int i) {
+	return ((char *(*)(char *, char *, char *, int))f)(a, b, c, i);
+}
+
+static unsigned char *kiko_call_icon(void *f, int i, int *n) {
+	return ((unsigned char *(*)(int, int *))f)(i, n);
+}
 */
 import "C"
 
@@ -87,7 +95,9 @@ type kikoLib struct {
 	unlock      unsafe.Pointer
 	quote       unsafe.Pointer
 	atom        unsafe.Pointer
+	icon        unsafe.Pointer
 	warm        unsafe.Pointer
+	icons       map[int][]byte
 	register    unsafe.Pointer
 	refresh     unsafe.Pointer
 	driveCount  unsafe.Pointer
@@ -164,6 +174,7 @@ func (k *kikoLib) bind() error {
 	bind("KIKO_unlock", &k.unlock)
 	bind("KIKO_wallet_quote", &k.quote)
 	bind("KIKO_wallet_atom", &k.atom)
+	bind("KIKO_wallet_icon", &k.icon)
 	bind("KIKO_wallet_warm_euro", &k.warm)
 	bind("KIKO_drive_register", &k.register)
 	bind("KIKO_drive_refresh", &k.refresh)
@@ -448,13 +459,21 @@ func (k *kikoLib) callSS(fn unsafe.Pointer, a, b string) string {
 	return k.take(C.kiko_call_ss(fn, ca, cb))
 }
 
-func (k *kikoLib) Claim(server, id, pickupKm string) error {
+func (k *kikoLib) Claim(server, id, pickupKm string, coin int) error {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	if msg := k.callSSS(k.claim, server, id, pickupKm); msg != "" {
+	if msg := k.callSSSI(k.claim, server, id, pickupKm, coin); msg != "" {
 		return errors.New(msg)
 	}
 	return nil
+}
+
+func (k *kikoLib) callSSSI(fn unsafe.Pointer, a, b, c string, i int) string {
+	ca, cb, cc := C.CString(a), C.CString(b), C.CString(c)
+	defer C.free(unsafe.Pointer(ca))
+	defer C.free(unsafe.Pointer(cb))
+	defer C.free(unsafe.Pointer(cc))
+	return k.take(C.kiko_call_sssi(fn, ca, cb, cc, C.int(i)))
 }
 
 func (k *kikoLib) CashOut(server, id string) error {
@@ -536,5 +555,32 @@ func (k *kikoLib) decorate(rows []ride) {
 			raw = k.Quote(rows[i].Coin, rows[i].FareLovelace)
 		}
 		rows[i].FareAmount, rows[i].FareEuro = quoteParts(rows[i].Coin, rows[i].FareLovelace, raw)
+		rows[i].Icon = k.coinIcon(rows[i].Coin)
 	}
+}
+
+// coinIcon is the wallet PNG for a coin index. The bytes are kept so the
+// offer list does not ask the library again on every refresh.
+func (k *kikoLib) coinIcon(index int) []byte {
+	if index < 0 {
+		return nil
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if png, ok := k.icons[index]; ok {
+		return png
+	}
+	if k.icons == nil {
+		k.icons = map[int][]byte{}
+	}
+	var n C.int
+	p := C.kiko_call_icon(k.icon, C.int(index), &n)
+	if p == nil || n <= 0 {
+		k.icons[index] = nil
+		return nil
+	}
+	buf := C.GoBytes(unsafe.Pointer(p), n)
+	C.kiko_call_free(k.free, unsafe.Pointer(p))
+	k.icons[index] = buf
+	return buf
 }

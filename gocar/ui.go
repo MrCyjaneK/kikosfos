@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"image/color"
+	"strconv"
 	"strings"
 
 	"fyne.io/fyne/v2"
@@ -133,23 +134,24 @@ func (h *hud) buildTrip(s snap) fyne.CanvasObject {
 		h.meterCap.Alignment = fyne.TextAlignCenter
 		meter = container.New(vstack{0}, h.drivenLbl, h.meterCap)
 	} else {
-		fare := newText(shorten(s.trip.fareText(), 18), 40, colLime, true)
-		fare.Alignment = fyne.TextAlignCenter
+		fare := fareMark(shorten(s.trip.fareText(), 18), s.trip.Coin, s.trip.Icon, 40, 36, colLime, true)
 		cap := newText("FARE", 13, colMuted, true)
 		cap.Alignment = fyne.TextAlignCenter
-		meter = container.New(vstack{0}, fare, cap)
+		meter = container.New(vstack{0}, container.NewCenter(fare), cap)
 	}
 
 	away, awayUnit := measure(s.trip.PickupKm)
 	tripKm, tripUnit := measure(s.trip.DistanceKm)
 	third, thirdUnit, thirdCap := shorten(s.trip.fareText(), 14), "", "fare"
+	fareCoin, fareIcon := s.trip.Coin, s.trip.Icon
 	if !s.trip.Claimed {
 		third, thirdUnit, thirdCap = shorten(s.trip.whenText(), 14), "", "when"
+		fareCoin, fareIcon = -1, nil
 	}
 	stats := container.NewGridWithColumns(3,
-		statCol(away, awayUnit, "away"),
-		statCol(tripKm, tripUnit, "trip"),
-		statCol(third, thirdUnit, thirdCap),
+		statCol(away, awayUnit, "away", -1, nil),
+		statCol(tripKm, tripUnit, "trip", -1, nil),
+		statCol(third, thirdUnit, thirdCap, fareCoin, fareIcon),
 	)
 
 	info := []fyne.CanvasObject{
@@ -320,12 +322,21 @@ func sectionLabel(s string) fyne.CanvasObject {
 	return newText(s, 12, colMuted, true)
 }
 
-func statCol(value, unit, cap string) fyne.CanvasObject {
+func statCol(value, unit, cap string, coin int, png []byte) fyne.CanvasObject {
 	n := newText(value, 18, colFG, true)
 	var top fyne.CanvasObject = n
-	if unit != "" {
-		u := newText(unit, 12, colMuted, true)
-		top = container.New(hstack{4}, n, u)
+	if unit != "" || len(png) > 0 {
+		parts := []fyne.CanvasObject{}
+		if img := coinImage(coin, png, 18); img != nil {
+			parts = append(parts, img)
+		}
+		parts = append(parts, n)
+		if unit != "" {
+			parts = append(parts, newText(unit, 12, colMuted, true))
+		}
+		if len(parts) > 1 {
+			top = container.New(hstack{4}, parts...)
+		}
 	}
 	c := newText(strings.ToUpper(cap), 11, colMuted, true)
 	c.Alignment = fyne.TextAlignCenter
@@ -727,19 +738,38 @@ type rideCard struct {
 
 func newRideCard(r ride, tap func()) *rideCard {
 	c := &rideCard{accent: r.Claimed, tap: tap}
+	fare := fareMark(shorten(r.fareText(), 14), r.Coin, r.Icon, 16, 22, colLime, true)
 	c.lines = []fyne.CanvasObject{
-		splitLine(r.cardTitle(), shorten(r.fareText(), 14), colLime, colLime, 16),
+		splitLine(r.cardTitle(), fare, colLime, 16),
 		cardRoute(r),
 	}
 	c.ExtendBaseWidget(c)
 	return c
 }
 
-func splitLine(left, right string, lc, rc color.Color, size float32) fyne.CanvasObject {
+// fareMark is the euro (or coin amount) with that chain's icon beside it.
+func fareMark(text string, coin int, png []byte, textSize, iconSize float32, c color.Color, bold bool) fyne.CanvasObject {
+	label := newText(text, textSize, c, bold)
+	img := coinImage(coin, png, iconSize)
+	if img == nil {
+		return label
+	}
+	return container.New(hstack{6}, img, label)
+}
+
+func coinImage(coin int, png []byte, side float32) fyne.CanvasObject {
+	if coin < 0 || len(png) == 0 || side < 1 {
+		return nil
+	}
+	img := canvas.NewImageFromResource(fyne.NewStaticResource("coin-"+strconv.Itoa(coin)+".png", png))
+	img.FillMode = canvas.ImageFillContain
+	img.SetMinSize(fyne.NewSquareSize(side))
+	return img
+}
+
+func splitLine(left string, right fyne.CanvasObject, lc color.Color, size float32) fyne.CanvasObject {
 	l := newText(left, size, lc, true)
-	rt := newText(right, size, rc, true)
-	rt.Alignment = fyne.TextAlignTrailing
-	return container.NewBorder(nil, nil, l, rt, spacer())
+	return container.NewBorder(nil, nil, l, right, spacer())
 }
 
 func (c *rideCard) Tapped(*fyne.PointEvent) {

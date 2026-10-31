@@ -76,9 +76,27 @@ func (s *serverRecord) migrate() {
 	if s.Chains == nil {
 		s.Chains = []chainFees{}
 	}
+	s.Chains = uniqueChains(s.Chains)
 	s.Currency = ""
 	s.BaseFee = ""
 	s.FeePerKm = ""
+}
+
+// uniqueChains keeps the first fees for each coin. A chain stored twice
+// would ask the server twice and show the same ride twice.
+func uniqueChains(in []chainFees) []chainFees {
+	out := make([]chainFees, 0, len(in))
+	seen := map[string]bool{}
+	for _, chain := range in {
+		name := strings.ToLower(strings.TrimSpace(chain.Currency))
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		chain.Currency = name
+		out = append(out, chain)
+	}
+	return out
 }
 
 func (s serverRecord) chain(currency string) (chainFees, bool) {

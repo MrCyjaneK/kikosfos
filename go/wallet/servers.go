@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -110,12 +111,24 @@ func normalizeHost(host string) (string, error) {
 	return host, nil
 }
 
+// canonicalHost folds the default https port into the bare name, so
+// example.com and example.com:443 are one server. A loopback port stays,
+// because that is a local http listener.
+func canonicalHost(host string) string {
+	host = strings.ToLower(strings.TrimSpace(host))
+	name, port, err := net.SplitHostPort(host)
+	if err != nil || port != "443" || name == "localhost" || name == "127.0.0.1" {
+		return host
+	}
+	return name
+}
+
 func hostTaken(servers []serverRecord, host string, skip int) bool {
 	for i, server := range servers {
 		if i == skip {
 			continue
 		}
-		if strings.EqualFold(server.Host, host) {
+		if canonicalHost(server.Host) == canonicalHost(host) {
 			return true
 		}
 	}

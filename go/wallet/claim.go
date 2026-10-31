@@ -164,12 +164,18 @@ func etaMinutes(km float64) int {
 
 // ClaimDrive accepts the ride on its server.
 // pickupKm is how far the driver is from the pickup, sent as the ETA.
-func ClaimDrive(server, id, pickupKm string) error {
+// coin is the chain the driver picked. A custodial ride is listed once
+// per chain, so the first row is not the one they opened.
+// coin < 0 uses that first row.
+func ClaimDrive(server, id, pickupKm string, coin int) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return errors.New("unknown ride")
 	}
-	ready, err := readyFor(server, offerCoin(server, id))
+	if coin < 0 {
+		coin = offerCoin(server, id)
+	}
+	ready, err := readyFor(server, coin)
 	if err != nil {
 		return err
 	}
@@ -313,6 +319,9 @@ func CashOutDrive(server, id string) error {
 	}
 	if !ride.Paid {
 		return errors.New("the ride is not paid")
+	}
+	if time.Now().Before(ride.Offer.When) {
+		return errors.New("ride cannot be paid out before its pickup time")
 	}
 	if !ride.Ready || ride.Script == "" {
 		return errors.New("this ride has no payout script")

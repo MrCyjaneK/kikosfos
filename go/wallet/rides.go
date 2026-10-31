@@ -121,6 +121,7 @@ func RegisterDrivers() (string, error) {
 			ready = append(ready, priced)
 		}
 	}
+	ready = uniqueReady(ready)
 	driveMu.Lock()
 	driveReady = ready
 	driveMu.Unlock()
@@ -251,18 +252,46 @@ type remoteRide struct {
 	PickupTime       string  `json:"pickup_time"`
 }
 
+// uniqueReady keeps the first registration of each host and chain.
+func uniqueReady(in []readyServer) []readyServer {
+	out := make([]readyServer, 0, len(in))
+	seen := map[string]bool{}
+	for _, server := range in {
+		key := canonicalHost(server.Host) + "\n" + strconv.Itoa(server.Coin)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, server)
+	}
+	return out
+}
+
 func offersFrom(ready []readyServer, lat, lon, rangeKm float64) ([]driveOffer, error) {
+	ready = uniqueReady(ready)
 	if len(ready) == 0 {
 		return nil, nil
 	}
 	now := time.Now()
+	seen := map[string]bool{}
 	var rows []driveOffer
 	for _, server := range ready {
 		part, err := ridesFrom(server, lat, lon, rangeKm, now)
 		if err != nil {
 			return nil, err
 		}
-		rows = append(rows, part...)
+		for _, row := range part {
+			// One requested ride is one card per chain, even when two saved
+			// hosts reach the same server and both return that ride.
+			key := row.ID + "\n" + strconv.Itoa(row.Coin)
+			if row.ID != "" && seen[key] {
+				continue
+			}
+			if row.ID != "" {
+				seen[key] = true
+			}
+			rows = append(rows, row)
+		}
 	}
 	for i := 1; i < len(rows); i++ {
 		row := rows[i]

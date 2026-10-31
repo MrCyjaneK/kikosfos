@@ -27,6 +27,7 @@ type ride struct {
 	Claimed      bool   `json:"-"`
 	FareAmount   string `json:"-"`
 	FareEuro     string `json:"-"`
+	Icon         []byte `json:"-"`
 }
 
 func (r *ride) normalize() {

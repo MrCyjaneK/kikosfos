@@ -97,7 +97,7 @@ Page {
             return
         working = true
         notice = ""
-        kiko.driveClaim(server, rideId, pickupKm)
+        kiko.driveClaim(server, rideId, pickupKm, coin)
     }
 
     function cashOut() {

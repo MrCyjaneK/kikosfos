@@ -580,15 +580,15 @@ void KikoApi::deliverNavigate(const QString &message)
     emit navigateFinished(message);
 }
 
-void KikoApi::driveClaim(const QString &server, const QString &id, const QString &pickupKm)
+void KikoApi::driveClaim(const QString &server, const QString &id, const QString &pickupKm, int coin)
 {
     QPointer<KikoApi> self(this);
     QByteArray serverUtf8 = utf8(server);
     QByteArray idUtf8 = utf8(id);
     QByteArray kmUtf8 = utf8(pickupKm);
-    QtConcurrent::run([self, serverUtf8, idUtf8, kmUtf8]() mutable {
+    QtConcurrent::run([self, serverUtf8, idUtf8, kmUtf8, coin]() mutable {
         const QMutexLocker lock(&requestGate);
-        const QString message = takeKikoString(KIKO_drive_claim(serverUtf8.data(), idUtf8.data(), kmUtf8.data()));
+        const QString message = takeKikoString(KIKO_drive_claim(serverUtf8.data(), idUtf8.data(), kmUtf8.data(), coin));
         if (!self)
             return;
         QMetaObject::invokeMethod(self.data(), "deliverDriveClaimed", Qt::QueuedConnection,
