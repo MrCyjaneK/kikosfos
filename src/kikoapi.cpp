@@ -428,6 +428,16 @@ void KikoApi::gpsRelease()
     KIKO_gps_release();
 }
 
+double KikoApi::driveRange()
+{
+    return KIKO_drive_range();
+}
+
+int KikoApi::driveSetRange(double km)
+{
+    return KIKO_drive_set_range(km);
+}
+
 void KikoApi::driveRegister()
 {
     QPointer<KikoApi> self(this);

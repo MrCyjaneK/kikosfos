@@ -64,6 +64,8 @@ public:
     Q_INVOKABLE int gpsSetDriver(const QString &kind);
     Q_INVOKABLE QString gpsPosition();
     Q_INVOKABLE void gpsRelease();
+    Q_INVOKABLE double driveRange();
+    Q_INVOKABLE int driveSetRange(double km);
     Q_INVOKABLE void driveRegister();
     Q_INVOKABLE void driveRefresh(double rangeKm);
     Q_INVOKABLE int driveCount();

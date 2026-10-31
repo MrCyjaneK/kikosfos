@@ -100,6 +100,13 @@ Page {
         return host + " · " + name
     }
 
+    function offerKm() {
+        var km = kiko.driveRange()
+        if (!(km > 0))
+            km = 5
+        return km
+    }
+
     function warmEuros() {
         var seen = {}
         for (var i = 0; i < count; i++) {
@@ -116,7 +123,7 @@ Page {
         onDriveRegistered: {
             page.registerText = message
             page.reloadActive()
-            kiko.driveRefresh(5)
+            kiko.driveRefresh(page.offerKm())
         }
         onCashOutFinished: page.reloadActive()
         onClaimFinished: {
@@ -126,7 +133,7 @@ Page {
                 page.count = n < 0 ? 0 : n
                 page.stamp++
                 page.syncing = true
-                kiko.driveRefresh(5)
+                kiko.driveRefresh(page.offerKm())
             }
         }
         onDrivesReady: {

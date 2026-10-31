@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -45,10 +46,18 @@ type savedRide struct {
 	ID     string `json:"id"`
 }
 
+// Distances the driver can choose when looking for pickups, in kilometres.
+const (
+	defaultOfferKm = 5
+	minOfferKm     = 1
+	maxOfferKm     = 50
+)
+
 type profileFile struct {
 	Car     Car            `json:"car"`
 	Servers []serverRecord `json:"servers"`
 	GPS     string         `json:"gps,omitempty"`
+	RangeKm int            `json:"range_km,omitempty"`
 	Rides   []savedRide    `json:"rides,omitempty"`
 }
 
@@ -264,6 +273,30 @@ func SaveCar(brand, model, color, plate, yearText string) error {
 	}
 	return updateProfile(func(doc *profileFile) error {
 		doc.Car = car
+		return nil
+	})
+}
+
+// DriveRangeKm is how far to look for pickups. An empty profile value is 5 km.
+func DriveRangeKm() (float64, error) {
+	doc, err := loadProfile()
+	if err != nil {
+		return 0, err
+	}
+	if doc.RangeKm < minOfferKm || doc.RangeKm > maxOfferKm {
+		return defaultOfferKm, nil
+	}
+	return float64(doc.RangeKm), nil
+}
+
+// SetDriveRangeKm stores the pickup radius in kilometres.
+func SetDriveRangeKm(km float64) error {
+	n := int(math.Round(km))
+	if n < minOfferKm || n > maxOfferKm {
+		return fmt.Errorf("enter a distance from %d to %d km", minOfferKm, maxOfferKm)
+	}
+	return updateProfile(func(doc *profileFile) error {
+		doc.RangeKm = n
 		return nil
 	})
 }

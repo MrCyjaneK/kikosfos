@@ -44,6 +44,45 @@ func TestGPSDriver(t *testing.T) {
 	}
 }
 
+func TestDriveRange(t *testing.T) {
+	setupTest(t)
+	if err := SetupPin("42", "42"); err != nil {
+		t.Fatal(err)
+	}
+	km, err := DriveRangeKm()
+	if err != nil || km != 5 {
+		t.Fatalf("range %v %v", km, err)
+	}
+	if err := SetDriveRangeKm(12.6); err != nil {
+		t.Fatal(err)
+	}
+	km, err = DriveRangeKm()
+	if err != nil || km != 13 {
+		t.Fatalf("range %v %v", km, err)
+	}
+	if err := SetDriveRangeKm(0); err == nil || err.Error() != "enter a distance from 1 to 50 km" {
+		t.Fatalf("short: %v", err)
+	}
+	if err := SetDriveRangeKm(51); err == nil || err.Error() != "enter a distance from 1 to 50 km" {
+		t.Fatalf("long: %v", err)
+	}
+	km, err = DriveRangeKm()
+	if err != nil || km != 13 {
+		t.Fatalf("unchanged %v %v", km, err)
+	}
+	if err := SetGPSDriver("mock"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetDriveRangeKm(8); err != nil {
+		t.Fatal(err)
+	}
+	kind, err := GPSDriver()
+	km, err2 := DriveRangeKm()
+	if err != nil || err2 != nil || kind != "mock" || km != 8 {
+		t.Fatalf("gps %q range %v %v %v", kind, km, err, err2)
+	}
+}
+
 func TestProfileRoundTrip(t *testing.T) {
 	setupTest(t)
 	if _, err := ProfileBrand(); err == nil {

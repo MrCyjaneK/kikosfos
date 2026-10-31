@@ -57,6 +57,10 @@ static char *kiko_call_refresh(void *f, double km) {
 	return ((char *(*)(double))f)(km);
 }
 
+static double kiko_call_f64(void *f) {
+	return ((double (*)(void))f)();
+}
+
 static char *kiko_call_ss(void *f, char *a, char *b) {
 	return ((char *(*)(char *, char *))f)(a, b);
 }
@@ -99,6 +103,7 @@ type kikoLib struct {
 	warm        unsafe.Pointer
 	icons       map[int][]byte
 	register    unsafe.Pointer
+	offerKm     unsafe.Pointer
 	refresh     unsafe.Pointer
 	driveCount  unsafe.Pointer
 	driveID     unsafe.Pointer
@@ -177,6 +182,7 @@ func (k *kikoLib) bind() error {
 	bind("KIKO_wallet_icon", &k.icon)
 	bind("KIKO_wallet_warm_euro", &k.warm)
 	bind("KIKO_drive_register", &k.register)
+	bind("KIKO_drive_range", &k.offerKm)
 	bind("KIKO_drive_refresh", &k.refresh)
 	bind("KIKO_drive_count", &k.driveCount)
 	bind("KIKO_drive_id", &k.driveID)
@@ -323,6 +329,17 @@ func (k *kikoLib) Register() (string, error) {
 		return "", errors.New(hard)
 	}
 	return msg, nil
+}
+
+// OfferKm is the saved pickup radius. A missing or empty value is 5 km.
+func (k *kikoLib) OfferKm() float64 {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	km := float64(C.kiko_call_f64(k.offerKm))
+	if km <= 0 {
+		return 5
+	}
+	return km
 }
 
 func (k *kikoLib) Refresh(rangeKm float64) error {

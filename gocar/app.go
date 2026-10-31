@@ -305,7 +305,7 @@ func (h *hud) syncBody(register bool) {
 			hint = regMsg
 		}
 	}
-	if err := api.Refresh(5); err != nil {
+	if err := api.Refresh(api.OfferKm()); err != nil {
 		if hint == "" {
 			hint = err.Error()
 		} else {

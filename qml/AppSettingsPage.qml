@@ -40,10 +40,22 @@ Page {
         errorText = ""
         ready = false
         gpsBox.currentIndex = kiko.gpsDriver() === "mock" ? 1 : 0
+        var km = kiko.driveRange()
+        if (!(km >= 1))
+            km = 5
+        rangeSlider.value = km
         if (kiko.lastError() !== "")
             errorText = kiko.lastError()
         ready = true
         refreshPlace()
+    }
+
+    function saveRange() {
+        var km = Math.round(rangeSlider.value)
+        if (kiko.driveSetRange(km) !== 0)
+            errorText = kiko.lastError()
+        else
+            errorText = ""
     }
 
     SilicaFlickable {
@@ -75,6 +87,26 @@ Page {
                     else
                         page.errorText = ""
                     page.refreshPlace()
+                }
+            }
+
+            Slider {
+                id: rangeSlider
+                width: parent.width
+                minimumValue: 1
+                maximumValue: 50
+                stepSize: 1
+                label: "Look for offers"
+                valueText: Math.round(value) + " km"
+                onValueChanged: {
+                    if (!page.ready || down)
+                        return
+                    page.saveRange()
+                }
+                onDownChanged: {
+                    if (down || !page.ready)
+                        return
+                    page.saveRange()
                 }
             }
 

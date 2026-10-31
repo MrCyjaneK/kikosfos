@@ -649,6 +649,26 @@ func KIKO_drive_register() *C.char {
 	return cString(text)
 }
 
+//export KIKO_drive_range
+func KIKO_drive_range() C.double {
+	km, err := wallet.DriveRangeKm()
+	setErr(err)
+	if err != nil {
+		return -1
+	}
+	return C.double(km)
+}
+
+//export KIKO_drive_set_range
+func KIKO_drive_set_range(km C.double) C.int {
+	err := wallet.SetDriveRangeKm(float64(km))
+	setErr(err)
+	if err != nil {
+		return -1
+	}
+	return 0
+}
+
 //export KIKO_drive_refresh
 func KIKO_drive_refresh(rangeKm C.double) *C.char {
 	err := wallet.RefreshDrives(float64(rangeKm))

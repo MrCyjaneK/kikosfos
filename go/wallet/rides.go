@@ -178,12 +178,14 @@ func minFare(coin int) uint64 {
 }
 
 // RefreshDrives loads requested rides from each registered server.
-// rangeKm <= 0 means 5. The server keeps pickups inside that radius.
+// rangeKm <= 0 means defaultOfferKm. Callers pass DriveRangeKm so the
+// distance chosen in settings is the radius that is searched.
+// The server keeps pickups inside that radius.
 // The list is empty when no server registered. No fix, or a server that
 // does not answer, clears the list and returns that error.
 func RefreshDrives(rangeKm float64) error {
 	if rangeKm <= 0 {
-		rangeKm = 5
+		rangeKm = defaultOfferKm
 	}
 	text, err := GPSPosition()
 	if err != nil {
