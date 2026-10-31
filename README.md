@@ -16,8 +16,14 @@ Inside of this magnificent work you can find
 4) Fully decentralized solution, based on multisig and federated servers
 
 
+## Build instructions
+
+Install [sfosbuild](https://github.com/MrCyjaneK/sfosbuild).
+
 ```
-sfosbuild 5.1.0.11 aarch64 ./rpm/kiko-sfos.spec
+$ sfosbuild 5.1.0.11 all ./rpm/kiko-sfos.spec
 ```
 
-Hackathon entry for TUM Blockchain Conference in Munich.
+rpms are in rpms/* directory.
+
+> Hackathon entry for TUM Blockchain Conference in Munich.
