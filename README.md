@@ -21,7 +21,7 @@ Inside of this magnificent work you can find
 Install [sfosbuild](https://github.com/MrCyjaneK/sfosbuild).
 
 ```
-$ sfosbuild 5.1.0.11 all ./rpm/kiko-sfos.spec
+$ sfosbuild 5.1.0.11 aarch64 ./rpm/kiko-sfos.spec
 ```
 
 rpms are in rpms/* directory.

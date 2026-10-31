@@ -86,6 +86,7 @@ type kikoLib struct {
 	setupPin    unsafe.Pointer
 	unlock      unsafe.Pointer
 	quote       unsafe.Pointer
+	atom        unsafe.Pointer
 	warm        unsafe.Pointer
 	register    unsafe.Pointer
 	refresh     unsafe.Pointer
@@ -162,6 +163,7 @@ func (k *kikoLib) bind() error {
 	bind("KIKO_setup_pin", &k.setupPin)
 	bind("KIKO_unlock", &k.unlock)
 	bind("KIKO_wallet_quote", &k.quote)
+	bind("KIKO_wallet_atom", &k.atom)
 	bind("KIKO_wallet_warm_euro", &k.warm)
 	bind("KIKO_drive_register", &k.register)
 	bind("KIKO_drive_refresh", &k.refresh)
@@ -276,10 +278,19 @@ func (k *kikoLib) Unlock(pin string) error {
 func (k *kikoLib) Quote(index int, amount string) string {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	ca, cb := C.CString(amount), C.CString("lovelace")
+	ca, cb := C.CString(amount), C.CString(k.atomUnit(index))
 	defer C.free(unsafe.Pointer(ca))
 	defer C.free(unsafe.Pointer(cb))
 	return k.take(C.kiko_call_quote(k.quote, C.int(index), ca, cb))
+}
+
+// atomUnit is the coin's smallest unit. Fares are stored in that unit:
+// lovelace on Cardano, satoshi on BSV.
+func (k *kikoLib) atomUnit(index int) string {
+	if text := k.take(C.kiko_call_si(k.atom, C.int(index))); text != "" {
+		return text
+	}
+	return "lovelace"
 }
 
 func (k *kikoLib) WarmEuro(index int) error {
